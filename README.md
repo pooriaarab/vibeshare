@@ -47,9 +47,9 @@ Send them the `share` URL. They spectate read-only; with `--invite` they can req
 
 `vibeshare --version` · `vibeshare --help` · `vibeshare mcp`
 
-## Your own domain, not vibe.live
+## Share links
 
-The share URL reads `vibeshare.stream/s/<id>` — **vibeshare's own domain** (available $4/yr), not `vibe.live`. The link is a capability URL: the id is the only thing that grants access (122 bits of entropy), so it's unguessable. Optional `--pass` adds a second factor.
+The share URL reads like `your-host/s/<id>`. The link is a capability URL: the id is the only thing that grants access (122 bits of entropy), so it's unguessable. Optional `--pass` adds a second factor.
 
 The actual live stream runs over the local/LAN WebSocket relay that vibelive starts on your machine. The `vibeshare.stream` URL is the identity layer; the bytes flow over a self-hostable relay.
 
