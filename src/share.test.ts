@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createConsentLedger } from '@pooriaarab/vibe-core';
-import { createRelay, createWriteArbiter, SHARE_SESSION_SCOPE } from '@pooriaarab/vibelive';
-import type { RelayHandle } from '@pooriaarab/vibelive';
+import { createRelay, createWriteArbiter, SHARE_SESSION_SCOPE } from 'vibelive-cli';
+import type { RelayHandle } from 'vibelive-cli';
 import { ConsentError, createShare, parseExpiry } from './share.js';
 import { buildShareUrl, parseShareUrl } from './url.js';
 

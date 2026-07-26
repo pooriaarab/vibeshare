@@ -2,7 +2,7 @@
  * @pooriaarab/vibeshare — share your live agent coding session by URL.
  *
  * vibeshare is the **URL / access / identity layer** on top of
- * [`@pooriaarab/vibelive`](https://www.npmjs.com/package/@pooriaarab/vibelive):
+ * [`vibelive-cli`](https://www.npmjs.com/package/vibelive-cli):
  * it mints a capability URL for a running vibelive session, sets an access policy
  * (spectate read-only ↔ invite to collaborate), optional expiry + passphrase, and
  * enforces that **spectators can never drive the wrapped agent**.
@@ -11,7 +11,7 @@
  * vibelive's. vibeshare owns the link + the gate. See `docs/spec.md`.
  *
  * ```ts
- * import { createHost, createRelay } from '@pooriaarab/vibelive';
+ * import { createHost, createRelay } from 'vibelive-cli';
  * import { createShare } from '@pooriaarab/vibeshare';
  *
  * const host = createHost({ command: ['claude'] });

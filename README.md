@@ -11,9 +11,9 @@ Part of the **Vibe Suite** — companion tools for agentic coding CLIs (Claude C
 ## Install
 
 ```bash
-npm install -g @pooriaarab/vibeshare
+npm install -g vibeshare-live
 # or use it inline:
-npx @pooriaarab/vibeshare -- claude
+npx vibeshare-live -- claude
 ```
 
 It pulls in `@pooriaarab/vibelive` (the multiplayer engine) and `@pooriaarab/vibe-core` (the consent ledger).
@@ -61,7 +61,7 @@ The session stream runs **peer-to-peer / via a dumb e2e-encrypted relay** that f
 
 ```ts
 import { createHost, createRelay } from '@pooriaarab/vibelive';
-import { createShare } from '@pooriaarab/vibeshare';
+import { createShare } from 'vibeshare-live';
 
 const host = createHost({ command: ['claude'] });
 const relay = await createRelay({ port: 0, hostHandle: host, initialDriver: 'host' });
