@@ -1,0 +1,38 @@
+{
+  "name": "@pooriaarab/vibeshare",
+  "version": "0.1.0",
+  "description": "Share your live agent coding session by URL — spectate read-only or invite into the vibelive multiplayer engine. Open source, CLI-first, e2e p2p. Local-first.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Pooria Arab",
+  "bin": { "vibeshare": "./dist/cli.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup src/index.ts src/cli.ts src/mcp.ts --format esm --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@pooriaarab/vibe-core": "^0.1.0",
+    "@pooriaarab/vibelive": "^0.1.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "homepage": "https://github.com/pooriaarab/vibeshare#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/pooriaarab/vibeshare.git" },
+  "bugs": { "url": "https://github.com/pooriaarab/vibeshare/issues" },
+  "keywords": ["vibe-suite", "vibeshare", "claude-code", "codex", "multiplayer", "cli", "mcp", "share", "local-first"],
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=18" }
+}
