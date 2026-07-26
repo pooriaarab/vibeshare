@@ -21,7 +21,7 @@
  * This module is pure logic over an injected arbiter — no IO, no network — so the
  * invariant is fully unit-testable.
  */
-import type { ControlState, WriteArbiter } from 'vibelive-cli';
+import type { ControlState, WriteArbiter } from 'vibelive';
 
 /** Who a share link lets its holders do. */
 export type AccessMode = 'spectate' | 'invite';
