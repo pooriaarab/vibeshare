@@ -1,5 +1,5 @@
 {
-  "name": "@pooriaarab/vibeshare",
+  "name": "vibeshare-live",
   "version": "0.1.0",
   "description": "Share your live agent coding session by URL — spectate read-only or invite into the vibelive multiplayer engine. Open source, CLI-first, e2e p2p. Local-first.",
   "type": "module",
@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@pooriaarab/vibe-core": "^0.1.0",
-    "@pooriaarab/vibelive": "^0.1.0",
+    "vibelive-cli": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "ws": "^8.16.0"
   },

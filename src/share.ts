@@ -13,8 +13,8 @@
  * mint a share unless that grant is present (the CLI grants it; a bare library
  * caller must too), which is the same local-first enforcement vibelive uses.
  */
-import type { RelayHandle, Participant } from '@pooriaarab/vibelive';
-import { SHARE_SESSION_SCOPE as VIBELIVE_SHARE_SCOPE } from '@pooriaarab/vibelive';
+import type { RelayHandle, Participant } from 'vibelive-cli';
+import { SHARE_SESSION_SCOPE as VIBELIVE_SHARE_SCOPE } from 'vibelive-cli';
 import type { ConsentLedger } from '@pooriaarab/vibe-core';
 import type { AccessMode } from './access.js';
 import { createAccessGate, type AccessGate, type ViewerRole } from './access.js';

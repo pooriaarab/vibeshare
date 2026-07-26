@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createWriteArbiter } from '@pooriaarab/vibelive';
+import { createWriteArbiter } from 'vibelive-cli';
 import { createAccessGate } from './access.js';
 
 /**
