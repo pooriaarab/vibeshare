@@ -18,8 +18,8 @@
 import { createInterface } from 'node:readline';
 import { networkInterfaces } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { createHost, createRelay, SHARE_SESSION_SCOPE } from '@pooriaarab/vibelive';
-import type { RelayHandle } from '@pooriaarab/vibelive';
+import { createHost, createRelay, SHARE_SESSION_SCOPE } from 'vibelive-cli';
+import type { RelayHandle } from 'vibelive-cli';
 import { createShare } from './share.js';
 import type { ExpirySpec } from './share.js';
 import type { AccessMode } from './access.js';
