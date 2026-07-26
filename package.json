@@ -5,11 +5,20 @@
   "type": "module",
   "license": "MIT",
   "author": "Pooria Arab",
-  "bin": { "vibeshare": "./dist/cli.js" },
+  "bin": {
+    "vibeshare": "./dist/cli.js"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup src/index.ts src/cli.ts src/mcp.ts --format esm --dts --clean",
     "typecheck": "tsc --noEmit",
@@ -18,9 +27,9 @@
   },
   "dependencies": {
     "@pooriaarab/vibe-core": "^0.1.0",
-    "vibelive-cli": "^0.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "vibelive": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
@@ -30,9 +39,28 @@
     "vitest": "^1.6.0"
   },
   "homepage": "https://github.com/pooriaarab/vibeshare#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/pooriaarab/vibeshare.git" },
-  "bugs": { "url": "https://github.com/pooriaarab/vibeshare/issues" },
-  "keywords": ["vibe-suite", "vibeshare", "claude-code", "codex", "multiplayer", "cli", "mcp", "share", "local-first"],
-  "publishConfig": { "access": "public" },
-  "engines": { "node": ">=18" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pooriaarab/vibeshare.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pooriaarab/vibeshare/issues"
+  },
+  "keywords": [
+    "vibe-suite",
+    "vibeshare",
+    "claude-code",
+    "codex",
+    "multiplayer",
+    "cli",
+    "mcp",
+    "share",
+    "local-first"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }

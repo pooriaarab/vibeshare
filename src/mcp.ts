@@ -15,8 +15,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { createHost, createRelay, SHARE_SESSION_SCOPE } from 'vibelive-cli';
-import type { RelayHandle } from 'vibelive-cli';
+import { createHost, createRelay, SHARE_SESSION_SCOPE } from 'vibelive';
+import type { RelayHandle } from 'vibelive';
 import { createShare } from './share.js';
 import type { ShareHandle } from './share.js';
 import { VERSION } from './version.js';
