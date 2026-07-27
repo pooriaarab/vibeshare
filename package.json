@@ -1,6 +1,6 @@
 {
-  "name": "vibeshare",
-  "version": "0.1.0",
+  "name": "vibeshare-live",
+  "version": "0.2.0",
   "description": "Share your live agent coding session by URL — spectate read-only or invite into the session. Local-first: runs on your machine, nothing readable leaves without consent. Part of the Vibe Suite.",
   "license": "MIT",
   "type": "module",
@@ -35,7 +35,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@pooriaarab/vibe-core": "^0.2.0"
+    "@pooriaarab/vibe-core": "^0.2.0",
+    "vibelive": "^0.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
