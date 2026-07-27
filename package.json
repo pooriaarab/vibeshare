@@ -1,12 +1,15 @@
 {
-  "name": "vibeshare-live",
-  "version": "0.1.1",
-  "description": "Share your live agent coding session by URL — spectate read-only or invite into the vibelive multiplayer engine. Open source, CLI-first, e2e p2p. Local-first.",
-  "type": "module",
+  "name": "vibeshare",
+  "version": "0.1.0",
+  "description": "Share your live agent coding session by URL — spectate read-only or invite into the session. Local-first: runs on your machine, nothing readable leaves without consent. Part of the Vibe Suite.",
   "license": "MIT",
-  "author": "Pooria Arab",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "bin": {
-    "vibeshare": "./dist/cli.js"
+    "vibeshare": "./dist/cli.js",
+    "vibeshare-mcp": "./dist/mcp.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -14,53 +17,39 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "docs",
+    "README.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts src/cli.ts src/mcp.ts --format esm --dts --clean",
+    "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@pooriaarab/vibe-core": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "ws": "^8.16.0",
-    "vibelive": "^0.1.0"
+    "@pooriaarab/vibe-core": "^0.2.0"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
-    "@types/ws": "^8.5.0",
-    "tsup": "^8.0.0",
-    "typescript": "^5.4.0",
-    "vitest": "^1.6.0"
-  },
-  "homepage": "https://github.com/pooriaarab/vibeshare#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/pooriaarab/vibeshare.git"
-  },
-  "bugs": {
-    "url": "https://github.com/pooriaarab/vibeshare/issues"
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
   },
   "keywords": [
     "vibe-suite",
-    "vibeshare",
-    "claude-code",
-    "codex",
-    "multiplayer",
+    "pair-programming",
+    "live-share",
+    "agentic-coding",
     "cli",
     "mcp",
-    "share",
     "local-first"
-  ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+  ]
 }

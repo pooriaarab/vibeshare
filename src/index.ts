@@ -1,64 +1,89 @@
 /**
- * @pooriaarab/vibeshare — share your live agent coding session by URL.
- *
- * vibeshare is the **URL / access / identity layer** on top of
- * [`vibelive`](https://www.npmjs.com/package/vibelive):
- * it mints a capability URL for a running vibelive session, sets an access policy
- * (spectate read-only ↔ invite to collaborate), optional expiry + passphrase, and
- * enforces that **spectators can never drive the wrapped agent**.
- *
- * The engine — transport, presence, ordered output fan-out, write-arbitration — is
- * vibelive's. vibeshare owns the link + the gate. See `docs/spec.md`.
+ * vibeshare — npm library surface.
  *
  * ```ts
- * import { createHost, createRelay } from 'vibelive';
- * import { createShare } from '@pooriaarab/vibeshare';
+ * import { createShare, grantConsent } from 'vibeshare';
  *
- * const host = createHost({ command: ['claude'] });
- * const relay = await createRelay({ port: 0, hostHandle: host, initialDriver: 'host' });
- * const share = createShare({ session: relay, access: 'spectate', expiry: '1h' });
- * console.log(share.url); // https://vibeshare.stream/s/<id>
+ * grantConsent('share this session from my app');   // once, recorded locally
+ * const { url, feed, viewers, revoke } = await createShare({
+ *   session: 'npm test',
+ *   access: 'spectate',
+ *   expiry: '1h',
+ * });
+ * feed.publish('tests starting…');
+ * await revoke();
  * ```
+ *
+ * Consent is enforced by the vibe-core ledger: no `share:session` grant →
+ * `createShare` throws `ConsentRequiredError`. The default transport serves
+ * the spectator view + stream from this machine; the relay/p2p seam is the
+ * `ShareTransport` interface (see transport.ts).
  */
+import { type ConsentLedger } from '@pooriaarab/vibe-core';
+import { loadLedger } from './consent.js';
+import { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.js';
+import { ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
+import type { CreateShareOptions } from './types.js';
+
+export { FileConsentStore, loadLedger, vibeHome } from './consent.js';
+export { SessionFeed, type PublishOptions } from './feed.js';
+export { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.js';
+export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, type ShareManagerDeps } from './manager.js';
+export { ViewerRegistry } from './registry.js';
+export { spectatorPage } from './spectatorPage.js';
+export type { ShareTransport } from './transport.js';
+export {
+  ShareError,
+  type CreateShareOptions,
+  type FeedEntry,
+  type JoinRequestStatus,
+  type Share,
+  type ShareAccess,
+  type ShareErrorCode,
+  type ShareState,
+  type Viewer,
+  type ViewerRole,
+} from './types.js';
+export { hashPassphrase, newShareId, newToken, parseExpiry, verifyPassphrase } from './utils.js';
 export { VERSION } from './version.js';
 
-// url layer
-export {
-  SHARE_ORIGIN,
-  SHARE_PATH_PREFIX,
-  ShareUrlParseError,
-  buildShareUrl,
-  newShareId,
-  parseShareUrl,
-} from './url.js';
+let defaultManager: ShareManager | null = null;
 
-// access gate
-export {
-  DEFAULT_ACCESS,
-  createAccessGate,
-} from './access.js';
-export type {
-  AccessGate,
-  AccessGateOptions,
-  AccessMode,
-  ControlRequestResult,
-  DenialReason,
-  ViewerRole,
-} from './access.js';
+function getDefaultManager(transportOpts?: LocalHttpTransportOptions): ShareManager {
+  defaultManager ??= new ShareManager({
+    consent: loadLedger(),
+    transport: new LocalHttpTransport(transportOpts),
+  });
+  return defaultManager;
+}
 
-// share orchestrator
-export {
-  ConsentError,
-  HOST_PARTICIPANT_NAME,
-  SHARE_SESSION_SCOPE,
-  createShare,
-  parseExpiry,
-} from './share.js';
-export type {
-  ExpirySpec,
-  RevokeReason,
-  ShareHandle,
-  ShareOptions,
-  Viewer,
-  ViewerRoster,
-} from './share.js';
+export interface CreateShareLibraryOptions extends CreateShareOptions {
+  /** Serve on a specific consent ledger (default: ~/.vibeshare file ledger). */
+  readonly consent?: ConsentLedger;
+  /** Transport options for the default local transport (host, port, baseUrl). */
+  readonly transport?: LocalHttpTransportOptions;
+  /** Bring your own manager (tests, embedders) instead of the shared default. */
+  readonly manager?: ShareManager;
+}
+
+/**
+ * Create a share → `{share, url, feed, viewers, revoke}`.
+ *
+ * @throws ConsentRequiredError when the ledger has no `share:session` grant.
+ */
+export async function createShare(opts: CreateShareLibraryOptions = {}): Promise<CreatedShare> {
+  const manager = opts.manager
+    ?? (opts.consent ? new ShareManager({ consent: opts.consent, transport: new LocalHttpTransport(opts.transport) }) : getDefaultManager(opts.transport));
+  const { consent: _c, transport: _t, manager: _m, ...shareOpts } = opts;
+  return manager.createShare(shareOpts);
+}
+
+/** Grant the `share:session` scope on the host's local consent ledger. */
+export function grantConsent(note?: string): void {
+  loadLedger().grant(SHARE_SCOPE, note ?? 'granted via vibeshare library');
+}
+
+/** Revoke the `share:session` scope. */
+export function revokeConsent(): void {
+  loadLedger().revoke(SHARE_SCOPE);
+}

@@ -1,183 +1,261 @@
+#!/usr/bin/env node
 /**
- * vibeshare MCP server (stdio). Exposes two tools an agent can call:
+ * vibeshare MCP server (stdio transport).
  *
- *   - create_share  — host a vibelive session wrapping a command, mint a share URL
- *                     with an access policy (+ optional expiry/passphrase), and
- *                     return the capability URL + relay URL. Lives for the MCP
- *                     process lifetime (or until the wrapped agent exits).
- *   - viewers       — list active shares and their viewer rosters (connected
- *                     spectators/participants + pending join requests).
+ * Lets an agent offer "share this session?": the MCP client's own tool-approval
+ * prompt is the consent UX, so a successful `vibeshare_create` call records the
+ * `share:session` grant in the local consent ledger (note: via MCP tool
+ * approval). Approval of *join requests* stays with the human via the CLI —
+ * the agent can create, list viewers, and stop; it cannot let anyone in.
  *
- * Uses the high-level `McpServer` API from `@modelcontextprotocol/sdk`. Input
- * schemas are Zod raw shapes (the SDK's expected form); zod is a transitive
- * dependency of the SDK and gets bundled into dist/mcp.js by tsup.
+ * Tools (spec names `vibeshare.create` / `vibeshare.viewers`; MCP tool names
+ * allow only [a-zA-Z0-9_-], hence underscores):
+ *   vibeshare_create   {session?, access?, expiry?, passphrase?, name?} → {id, url, …}
+ *   vibeshare_viewers  {shareId?} → {share, viewers}
+ *   vibeshare_stop     {shareId?} → {stopped}
  */
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { z } from 'zod';
-import { createHost, createRelay, SHARE_SESSION_SCOPE } from 'vibelive';
-import type { RelayHandle } from 'vibelive';
-import { createShare } from './share.js';
-import type { ShareHandle } from './share.js';
+import { createInterface } from 'node:readline';
+import { createHookBus, watchCwd, type ConsentLedger, type TriggerKind } from '@pooriaarab/vibe-core';
+import { loadLedger } from './consent.js';
+import { LocalHttpTransport } from './localHttp.js';
+import { ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
 import { VERSION } from './version.js';
 
-interface ActiveShare {
-  readonly id: string;
-  readonly url: string;
-  readonly relayUrl: string;
-  readonly access: string;
-  readonly command: readonly string[];
-  readonly share: ShareHandle;
-  readonly relay: RelayHandle;
+const PROTOCOL_VERSION = '2024-11-05';
+
+const TOOLS = [
+  {
+    name: 'vibeshare_create',
+    description:
+      'Share this live session by URL. Spectators watch read-only; with access="invite" they may request to join (the host approves via the vibeshare CLI). Served from the user\'s machine — nothing is stored on a server.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session: { type: 'string', description: 'Label for what is being shared (e.g. the agent or task).' },
+        access: { type: 'string', enum: ['spectate', 'invite'], description: 'Default spectate (read-only).' },
+        expiry: { type: 'string', description: '1h, 24h, 7d, … or "stop" (default).' },
+        passphrase: { type: 'string', description: 'Optional passphrase viewers must enter.' },
+        name: { type: 'string', description: 'Display name override.' },
+      },
+    },
+  },
+  {
+    name: 'vibeshare_viewers',
+    description: 'List viewers of a live share: who is watching, roles, and pending join requests.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        shareId: { type: 'string', description: 'Share id. Optional when exactly one share is live.' },
+      },
+    },
+  },
+  {
+    name: 'vibeshare_stop',
+    description: 'End a live share: viewers are disconnected and the URL stops working.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        shareId: { type: 'string', description: 'Share id. Optional when exactly one share is live.' },
+      },
+    },
+  },
+] as const;
+
+interface JsonRpcRequest {
+  jsonrpc?: string;
+  id?: string | number | null;
+  method?: string;
+  params?: Record<string, unknown>;
 }
 
-/**
- * Build the vibeshare MCP server (tools registered, not yet connected).
- *
- * `sessions` defaults to a fresh module-level map so independent `createMcpServer`
- * calls don't share state, but a single stdio process keeps one map for its
- * lifetime (so `viewers` sees shares started via `create_share`).
- */
-export function createMcpServer(sessions: Map<string, ActiveShare> = new Map()): McpServer {
-  const server = new McpServer(
-    { name: 'vibeshare', version: VERSION },
-    {
-      capabilities: { tools: {} },
-      instructions:
-        'vibeshare lets an agent share a live coding session by URL. Use create_share to host a ' +
-        'wrapped agent command and get a shareable capability URL (spectate read-only or invite to ' +
-        'collaborate); use viewers to list active shares and their audiences.',
-    },
-  );
+interface JsonRpcResponse {
+  jsonrpc: '2.0';
+  id: string | number | null;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
 
-  server.registerTool(
-    'create_share',
-    {
-      title: 'Create a vibeshare URL',
-      description:
-        'Host a vibelive session wrapping an agent command (e.g. ["claude"]) and mint a vibeshare ' +
-        'capability URL for it. Returns the share URL (vibeshare.stream/s/<id>), the local relay URL ' +
-        'viewers connect over, the access mode, and the share id. Spectators are read-only; "invite" ' +
-        'lets link holders request to join (host approves to let them drive).',
-      inputSchema: {
-        command: z
-          .array(z.string())
-          .min(1)
-          .describe('The agent command to wrap, argv-style, e.g. ["claude"] or ["python","-i"].'),
-        access: z
-          .enum(['spectate', 'invite'])
-          .optional()
-          .describe('Access policy for link holders. Default: spectate (read-only).'),
-        expire: z
-          .enum(['1h', '24h'])
-          .optional()
-          .describe('Auto-revoke the share after this duration.'),
-        pass: z
-          .string()
-          .optional()
-          .describe('Optional passphrase — a second factor on top of the share URL.'),
-        name: z
-          .string()
-          .optional()
-          .describe('Optional display name for the host participant.'),
-      },
-    },
-    async ({ command, access, expire, pass, name }) => {
-      const host = createHost({ command });
-      const relay = await createRelay({
-        port: 0,
-        hostHandle: host,
-        initialDriver: 'host',
-        hostParticipantName: name ?? 'host',
-      });
-      relay.consent.grant(SHARE_SESSION_SCOPE);
+export interface McpServerDeps {
+  manager: ShareManager;
+  consent: ConsentLedger;
+}
 
-      const share = createShare({
-        session: relay,
-        access: access ?? 'spectate',
-        expiry: expire,
-        passphrase: pass,
-      });
-      const rec: ActiveShare = {
-        id: share.id,
-        url: share.url,
-        relayUrl: relay.url,
-        access: share.access,
-        command,
-        share,
-        relay,
-      };
-      sessions.set(share.id, rec);
-      void host.exited.then(async () => {
-        sessions.delete(share.id);
-        await share.revoke();
-      });
+export interface McpServer {
+  handleMessage(msg: JsonRpcRequest): Promise<JsonRpcResponse | null>;
+}
 
-      const lines = [
-        'vibeshare session ready.',
-        `id: ${share.id}`,
-        `url: ${share.url}`,
-        `relay: ${relay.url}`,
-        `access: ${share.access}${pass ? ' \u00B7 passphrase' : ''}${expire ? ` \u00B7 expires ${expire}` : ''}`,
-      ];
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
-    },
-  );
+function toolText(value: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+}
 
-  server.registerTool(
-    'viewers',
-    {
-      title: 'List vibeshare sessions + viewers',
-      description:
-        'List active vibeshare shares started via create_share. Each entry includes the share id, ' +
-        'share URL, access mode, and the current viewer roster (connected viewers by role, plus ' +
-        'pending join requests under invite access).',
-      inputSchema: {
-        id: z
-          .string()
-          .optional()
-          .describe('Optional: return only the share whose id (or URL) matches.'),
-      },
-    },
-    async ({ id }) => {
-      const wantId = id ? parseShareIdLoose(id) : undefined;
-      const rows: unknown[] = [];
-      for (const s of sessions.values()) {
-        if (wantId !== undefined && s.id !== wantId && s.url !== id) continue;
-        const roster = s.share.viewers();
-        rows.push({
-          id: s.id,
-          url: s.url,
-          relay: s.relayUrl,
-          access: s.access,
-          command: s.command,
-          viewers: roster.viewers.map((v) => ({ id: v.id, name: v.name, role: v.role })),
-          pending: roster.pending.map((v) => ({ id: v.id, name: v.name })),
-          revoked: s.share.revoked,
+function toolError(message: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  return { content: [{ type: 'text', text: message }], isError: true };
+}
+
+export function createMcpServer(deps: McpServerDeps): McpServer {
+  const { manager, consent } = deps;
+
+  const resolveShare = (shareId: unknown): CreatedShare | string => {
+    if (typeof shareId === 'string' && shareId.length > 0) {
+      const s = manager.get(shareId);
+      return s ?? `no live share ${shareId}`;
+    }
+    const live = manager.list();
+    if (live.length === 0) return 'no live shares — call vibeshare_create first';
+    if (live.length > 1) {
+      return `multiple live shares; pass shareId: ${live.map((s) => s.share.id).join(', ')}`;
+    }
+    return live[0]!;
+  };
+
+  const callTool = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+    switch (name) {
+      case 'vibeshare_create': {
+        // The MCP client's tool-approval prompt is the user's consent act.
+        if (!consent.allows(SHARE_SCOPE)) {
+          consent.grant(SHARE_SCOPE, 'granted via MCP tool approval');
+        }
+        const created = await manager.createShare({
+          ...(typeof args['session'] === 'string' ? { session: args['session'] } : {}),
+          ...(args['access'] === 'invite' || args['access'] === 'spectate' ? { access: args['access'] } : {}),
+          ...(typeof args['expiry'] === 'string' ? { expiry: args['expiry'] } : {}),
+          ...(typeof args['passphrase'] === 'string' ? { passphrase: args['passphrase'] } : {}),
+          ...(typeof args['name'] === 'string' ? { name: args['name'] } : {}),
+        });
+        created.feed.system('share created by agent via MCP');
+        return toolText({
+          id: created.share.id,
+          url: created.url,
+          access: created.share.access,
+          expiresAt: created.share.expiresAt,
+          note: 'read-only stream served from this machine; manage join requests with `vibeshare viewers`',
         });
       }
-      const text =
-        rows.length === 0 ? 'no active vibeshare shares' : JSON.stringify(rows, null, 2);
-      return { content: [{ type: 'text', text }] };
+      case 'vibeshare_viewers': {
+        const share = resolveShare(args['shareId']);
+        if (typeof share === 'string') return toolError(share);
+        return toolText({
+          share: { id: share.share.id, url: share.url, access: share.share.access, state: share.share.state },
+          viewers: share.viewers.list().map((v) => ({
+            id: v.id, name: v.name, role: v.role, joinRequest: v.joinRequest, joinedAt: v.joinedAt,
+          })),
+        });
+      }
+      case 'vibeshare_stop': {
+        const share = resolveShare(args['shareId']);
+        if (typeof share === 'string') return toolError(share);
+        const id = share.share.id;
+        await share.revoke();
+        return toolText({ stopped: id });
+      }
+      default:
+        return toolError(`unknown tool: ${name}`);
+    }
+  };
+
+  return {
+    async handleMessage(msg: JsonRpcRequest): Promise<JsonRpcResponse | null> {
+      const id = msg.id ?? null;
+      const isNotification = msg.id === undefined;
+
+      switch (msg.method) {
+        case 'initialize': {
+          const requested = msg.params?.['protocolVersion'];
+          return {
+            jsonrpc: '2.0',
+            id,
+            result: {
+              protocolVersion: typeof requested === 'string' ? requested : PROTOCOL_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: 'vibeshare', version: VERSION },
+            },
+          };
+        }
+        case 'ping':
+          return { jsonrpc: '2.0', id, result: {} };
+        case 'tools/list':
+          return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
+        case 'tools/call': {
+          const name = msg.params?.['name'];
+          const args = msg.params?.['arguments'];
+          if (typeof name !== 'string') {
+            return { jsonrpc: '2.0', id, error: { code: -32602, message: 'tools/call needs a tool name' } };
+          }
+          try {
+            const result = await callTool(name, (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>);
+            return { jsonrpc: '2.0', id, result };
+          } catch (err) {
+            return { jsonrpc: '2.0', id, result: toolError(err instanceof Error ? err.message : String(err)) };
+          }
+        }
+        default:
+          if (isNotification) return null;
+          return { jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${String(msg.method)}` } };
+      }
     },
-  );
-
-  return server;
+  };
 }
 
-/** Extract a share id from a bare id or a full share URL (best-effort). */
-function parseShareIdLoose(input: string): string {
-  const slash = input.lastIndexOf('/s/');
-  return slash >= 0 ? input.slice(slash + 3) : input;
+// ---------------------------------------------------------------- stdio
+
+const HOOK_KINDS: TriggerKind[] = [
+  'task-done', 'pr-opened', 'prototype-finished', 'spec-completed',
+  'tests-pass', 'tests-fail', 'error', 'session-end', 'manual',
+];
+
+async function main(): Promise<void> {
+  const consent = loadLedger();
+  const transport = new LocalHttpTransport({});
+  await transport.listen();
+  const manager = new ShareManager({ consent, transport });
+  const server = createMcpServer({ manager, consent });
+
+  // Stream harness-agnostic milestones (commits, sentinel signals) into every
+  // live share's feed via the vibe-core hook bus + watcher floor.
+  const bus = createHookBus({ onError: (e) => console.error('[vibeshare-mcp] hook error:', e) });
+  const watcher = watchCwd(process.cwd(), bus);
+  for (const kind of HOOK_KINDS) {
+    bus.on(kind, (e) => {
+      for (const created of manager.list()) created.feed.publishEvent(e);
+    });
+  }
+
+  const rl = createInterface({ input: process.stdin });
+  // A client closing the pipe (shutdown, crash) must not crash the server.
+  process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE') teardown();
+    else throw err;
+  });
+  rl.on('line', (line) => {
+    if (line.trim().length === 0) return;
+    let msg: JsonRpcRequest;
+    try {
+      msg = JSON.parse(line) as JsonRpcRequest;
+    } catch {
+      const res: JsonRpcResponse = { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } };
+      process.stdout.write(JSON.stringify(res) + '\n');
+      return;
+    }
+    void server.handleMessage(msg).then((res) => {
+      if (res) process.stdout.write(JSON.stringify(res) + '\n');
+    });
+  });
+
+  const teardown = () => {
+    watcher.stop();
+    void manager.stopAll().finally(() => process.exit(0));
+  };
+  process.on('SIGINT', teardown);
+  process.on('SIGTERM', teardown);
+  // The client closing stdin means the session is over.
+  rl.on('close', teardown);
 }
 
-/** Create the server, wire it to stdio, and run until the client disconnects. */
-export async function runMcpStdio(): Promise<void> {
-  const server = createMcpServer();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  await new Promise((resolve) => {
-    process.stdin.once('end', resolve);
-    process.stdin.once('close', resolve);
+/* c8 ignore next 3 — entry guard */
+const isMain = process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+if (isMain) {
+  main().catch((err: unknown) => {
+    console.error('[vibeshare-mcp]', err);
+    process.exit(1);
   });
 }

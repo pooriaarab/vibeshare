@@ -1,104 +1,90 @@
 # vibeshare
 
-Share your live agent coding session by URL — traces.com-style, open source, CLI-first. Spectate read-only or invite into the vibelive multiplayer engine.
+Share your live agent coding session by URL — traces.com-style, open source, CLI-first. Spectators watch read-only; invite links let viewers request to join as collaborators (host approves, live).
 
-Part of the **Vibe Suite** — companion tools for agentic coding CLIs (Claude Code, Codex, Gemini, Grok/pi, Kimi). Ships as **CLI + npm package + MCP server**.
+Part of the **Vibe Suite** — companion tools for agentic coding CLIs (Claude Code, Codex, Gemini, Grok/pi, Kimi). Ships as **CLI + npm package + MCP server**, built on [`@pooriaarab/vibe-core`](https://www.npmjs.com/package/@pooriaarab/vibe-core) (consent ledger, hooks bus, badges).
 
-**Local-first: runs on your own machine, no data out** (consent model in `@pooriaarab/vibe-core`).
+**Local-first: the share runs on your machine.** The consent ledger gates every share (`share:session` scope), the stream is served straight from your host, and nothing is stored on a server.
 
-> Status: **v0** — the share/access layer over [`@pooriaarab/vibelive`](https://www.npmjs.com/package/@pooriaarab/vibelive) is implemented (CLI, library, MCP). Local/LAN, host-authoritative. E2e relay fan-out to ~1000 spectators is on the vibelive roadmap.
+## Install & build
 
-## Install
-
-```bash
-npm install -g vibeshare-live
-# or use it inline:
-npx vibeshare-live -- claude
+```sh
+npm install
+npm run build      # tsup → dist/ (cli.js, index.js, mcp.js + types)
+npm run typecheck  # tsc --noEmit
+npm test           # vitest
 ```
 
-It pulls in `@pooriaarab/vibelive` (the multiplayer engine) and `@pooriaarab/vibe-core` (the consent ledger).
+## CLI
 
-## Quick start
+```sh
+vibeshare                        # share your shell, spectate read-only
+vibeshare --invite --expire 1h   # viewers may request to join; auto-expires
+vibeshare --pass hunter2         # passphrase second factor
+vibeshare -- npm test            # share a specific command
+vibeshare --host 0.0.0.0         # share on your LAN (default: loopback only)
 
-Host your agent and hand someone a link:
-
-```bash
-vibeshare --invite -- claude
+vibeshare viewers                # who's watching, pending join requests
+vibeshare viewers --approve <id> # promote a viewer to collaborator
+vibeshare viewers --kick <id>    # remove a viewer, live
+vibeshare stop                   # end the share (works from another terminal)
 ```
 
-You'll get back something like:
+Running `vibeshare` prints the link:
 
 ```
-vibeshare — sharing claude
-  share:  https://vibeshare.stream/s/a5e3a635-0bb7-4689-973c-5fe2d7de6207
-  access: invite · no expiry
-  relay:  ws://localhost:55410
-  ● p2p · e2e · nothing stored on a server
+● local · no data out
+  sharing:  npm test
+  url:      http://127.0.0.1:50613/s/KKxzdjLpr_km
+  access:   spectate (read-only)
+  expires:  until you stop
+  manage:   vibeshare viewers · vibeshare stop
 ```
 
-Send them the `share` URL. They spectate read-only; with `--invite` they can request to join and you `/approve <id>` to let them drive. Slash commands inside the host session: `/drive` `/release` `/viewers` `/approve <id>` `/stop`.
+Opening the URL shows a self-contained spectator page (no install for viewers) streaming the session live over SSE, with a "Request to join" button on invite links. First run asks for consent (`--yes` to skip); the grant is recorded locally in `~/.vibeshare/consent.json` and can be revoked any time.
 
-| Flag | Meaning |
-| --- | --- |
-| `--spectate` | link holders get read-only access (default) |
-| `--invite` | link holders may request to join; you approve to let them drive |
-| `--expire 1h\|24h` | auto-revoke the share after this duration |
-| `--pass <p>` | require a passphrase on top of the share URL |
+Read-only is real: there is no route that lets a viewer write — the host is the server of record, and promotion to collaborator goes only through a host-approved request (`ViewerRegistry.canWrite()` is the single gate).
 
-`vibeshare --version` · `vibeshare --help` · `vibeshare mcp`
-
-## Share links
-
-The share URL reads like `your-host/s/<id>`. The link is a capability URL: the id is the only thing that grants access (122 bits of entropy), so it's unguessable. Optional `--pass` adds a second factor.
-
-The actual live stream runs over the local/LAN WebSocket relay that vibelive starts on your machine. The `vibeshare.stream` URL is the identity layer; the bytes flow over a self-hostable relay.
-
-## Peer-to-peer, end-to-end encrypted, nothing stored on a server
-
-The session stream runs **peer-to-peer / via a dumb e2e-encrypted relay** that forwards opaque blobs. The relay cannot decrypt anything — nothing readable is ever stored on a server, and the relay is self-hostable. This is vibelive's transport (§1–2 of its tech spec); vibeshare is the URL/access layer on top. Fanning session output off your machine is gated behind the `share:session` consent scope.
-
-## As a library
+## npm library
 
 ```ts
-import { createHost, createRelay } from '@pooriaarab/vibelive';
-import { createShare } from 'vibeshare-live';
+import { createShare, grantConsent } from 'vibeshare';
 
-const host = createHost({ command: ['claude'] });
-const relay = await createRelay({ port: 0, hostHandle: host, initialDriver: 'host' });
-
-const share = createShare({
-  session: relay,
-  access: 'spectate',      // 'spectate' (read-only) | 'invite' (can join to drive)
-  expiry: '1h',            // optional: '1h' | '24h' | number(ms)
-  passphrase: 'sekret',    // optional second factor
+grantConsent('share from my tool');              // once; local ledger
+const { url, feed, viewers, revoke } = await createShare({
+  session: 'npm test',
+  access: 'spectate',                            // or 'invite'
+  expiry: '1h',                                  // or 'stop'
 });
 
-console.log(share.url);    // https://vibeshare.stream/s/<id>
-const { viewers, pending } = share.viewers();
-await share.revoke();      // tear down (also fires on expiry)
+feed.publish('tests starting…');
+viewers.on('request', (v) => viewers.approve(v.id));
+await revoke();
 ```
 
-Spectators are enforced read-only at the access gate: a spectator's control request never reaches vibelive's `WriteArbiter`, so they can never obtain the write token — the same "never two concurrent writers" invariant vibelive holds, extended to the share.
+`createShare` throws `ConsentRequiredError` without a `share:session` grant. Bring your own plumbing with `ShareManager`, `LocalHttpTransport`, and `FileConsentStore`.
 
-## As an MCP server
+## MCP server
 
-Wire it into an agent that speaks MCP and it can offer "share this session?":
-
-```jsonc
-// .mcp.json or your client's MCP config
+```json
 {
   "mcpServers": {
-    "vibeshare": { "command": "vibeshare", "args": ["mcp"] }
+    "vibeshare": { "command": "vibeshare-mcp" }
   }
 }
 ```
 
-Tools: `create_share` (host a command, mint a share URL) and `viewers` (list active shares + their audiences).
+Tools: `vibeshare_create`, `vibeshare_viewers`, `vibeshare_stop` — so an agent can offer "share this session?". Your MCP client's tool-approval prompt is the consent act (recorded with that note). Approving *join requests* stays human-only, via the CLI.
+
+## Architecture & the vibelive seam
+
+vibeshare owns the **link + gate**; session content is an ordered feed served to spectators. The one deliberate seam is transport (`src/transport.ts`):
+
+- **`LocalHttpTransport`** (implemented, default): spectator page + SSE stream + loopback host-control API, served from your machine. Nothing stored on a server.
+- **`RelayTransport`** (lands with vibelive): a dumb e2e relay / p2p mesh handing out public `vibeshare.io` URLs — same `ShareTransport` interface, swap-in only. Collaborator input routing is part of that seam and must pass `ViewerRegistry.canWrite()`.
+
+Everything else — consent, access policy, passphrase gate, expiry teardown, viewer registry, revocation — is fully implemented and tested.
 
 ## Prototype
 
-Interactive, self-contained UX prototype (no build, no network): open [`docs/prototype.html`](docs/prototype.html) in a browser.
-
-## License
-
-MIT.
+The original UX prototype (no build, no network): open [`docs/prototype.html`](docs/prototype.html). Spec: [`docs/spec.md`](docs/spec.md).
