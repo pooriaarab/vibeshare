@@ -11,6 +11,8 @@
  */
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { badge, createHookBus, parseConfirm, watchCwd, type TriggerKind } from '@pooriaarab/vibe-core';
 import {
   clearActiveShare,
@@ -506,7 +508,11 @@ export async function run(argv: string[], io: IO = stdio): Promise<number> {
 }
 
 /* c8 ignore next 3 — entry guard */
-const isMain = process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+// Resolve the symlink first: under a global/npx bin, argv[1] is a symlink into
+// node_modules/.bin, so comparing to the real module path fails without realpath.
+const isMain =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain) {
   run(process.argv.slice(2)).then(
     (code) => process.exit(code),
