@@ -1,6 +1,6 @@
 {
   "name": "vibeshare-live",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Share your live agent coding session by URL \u2014 spectate read-only or invite into the session. Local-first: runs on your machine, nothing readable leaves without consent. Part of the Vibe Suite.",
   "license": "MIT",
   "type": "module",
@@ -10,8 +10,8 @@
   "bin": {
     "vibeshare-live": "./dist/cli.js",
     "vibeshare": "./dist/cli.js",
-    "vibeshare-live-mcp": "./dist/mcp.js",
-    "vibeshare-mcp": "./dist/mcp.js"
+    "vibeshare-live-mcp": "./dist/mcp-bin.js",
+    "vibeshare-mcp": "./dist/mcp-bin.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

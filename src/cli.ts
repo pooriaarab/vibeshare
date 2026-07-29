@@ -24,6 +24,7 @@ import {
 } from './consent.js';
 import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
+import { startMcp } from './mcp.js';
 import { VERSION } from './version.js';
 
 // ---------------------------------------------------------------- parsing
@@ -43,6 +44,7 @@ export type CliCommand =
   | { cmd: 'start'; options: StartOptions }
   | { cmd: 'stop'; share?: string }
   | { cmd: 'viewers'; share?: string; approve?: string; deny?: string; kick?: string; json: boolean }
+  | { cmd: 'mcp' }
   | { cmd: 'help' }
   | { cmd: 'version' };
 
@@ -113,6 +115,7 @@ export function parseArgv(argv: string[]): CliCommand {
     if (actions > 1) throw new CliUsageError('use only one of --approve / --deny / --kick');
     return out;
   }
+  if (sub === 'mcp') return { cmd: 'mcp' };
   if (sub === 'start') rest.shift();
 
   // Default: start.
@@ -497,6 +500,9 @@ export async function run(argv: string[], io: IO = stdio): Promise<number> {
       return 0;
     case 'version':
       io.out(`vibeshare ${VERSION}`);
+      return 0;
+    case 'mcp':
+      await startMcp();
       return 0;
     case 'start':
       return startShare(command.options, io);
