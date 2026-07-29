@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "vibeshare-live": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "vibeshare-live",
+        "mcp"
+      ]
+    }
+  }
+}
