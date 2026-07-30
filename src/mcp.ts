@@ -203,7 +203,7 @@ const HOOK_KINDS: TriggerKind[] = [
   'tests-pass', 'tests-fail', 'error', 'session-end', 'manual',
 ];
 
-async function main(): Promise<void> {
+export async function startMcp(): Promise<void> {
   const consent = loadLedger();
   const transport = new LocalHttpTransport({});
   await transport.listen();
@@ -249,13 +249,10 @@ async function main(): Promise<void> {
   process.on('SIGTERM', teardown);
   // The client closing stdin means the session is over.
   rl.on('close', teardown);
-}
 
-/* c8 ignore next 3 — entry guard */
-const isMain = process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href;
-if (isMain) {
-  main().catch((err: unknown) => {
-    console.error('[vibeshare-mcp]', err);
-    process.exit(1);
-  });
+  // Block until teardown calls process.exit. Without this the promise resolves
+  // as soon as the listeners are wired, and callers that `process.exit` on the
+  // returned code (the `mcp` subcommand via cli.ts run()) would kill the server
+  // before it reads a single stdin line.
+  await new Promise<void>(() => {});
 }

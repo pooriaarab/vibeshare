@@ -5,6 +5,7 @@ export default defineConfig({
     index: 'src/index.ts',
     cli: 'src/cli.ts',
     mcp: 'src/mcp.ts',
+    'mcp-bin': 'src/mcp-bin.ts',
   },
   format: ['esm'],
   dts: true,
