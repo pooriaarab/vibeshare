@@ -260,6 +260,28 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     feed.close();
   });
 
+  it('kicking a viewer drops the peer and stops the data plane', async () => {
+    transport = new WebRtcTransport({ signaling });
+
+    const share = makeShare();
+    const feed = new SessionFeed();
+    const viewers = new ViewerRegistry(() => share.access);
+    await transport.serve(share, feed, viewers);
+
+    const watcher = viewers.add('Watcher');
+    const viewer = connect(signaling, share.id, watcher.id);
+    const dc = await viewer.opened;
+    expect(transport.peerCount(share.id)).toBe(1);
+
+    // Kick must close the DATA plane, not merely revoke write: the session
+    // stream stops reaching the kicked viewer's DataChannel.
+    const closed = new Promise<void>((resolve) => dc.onClosed(() => resolve()));
+    viewers.kick(watcher.id);
+    await closed;
+    expect(transport.peerCount(share.id)).toBe(0);
+    feed.close();
+  });
+
   it('unserve disconnects the viewer; close is idempotent', async () => {
     transport = new WebRtcTransport({ signaling });
 

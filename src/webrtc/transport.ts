@@ -23,7 +23,7 @@ import { PeerConnection, type DataChannel } from 'node-datachannel';
 import type { SessionFeed } from '../feed.js';
 import type { ViewerRegistry } from '../registry.js';
 import type { ShareTransport } from '../transport.js';
-import type { FeedEntry, Share } from '../types.js';
+import type { FeedEntry, Share, Viewer } from '../types.js';
 import type { SignalingChannel } from './signaling.js';
 
 const KEY_LEN = 32;
@@ -99,6 +99,8 @@ interface ShareContext {
   readonly key: Buffer;
   readonly peers: Map<string, PeerContext>;
   unwatch: () => void;
+  /** Remove the registry (kick/leave) + feed-close listeners on teardown. */
+  detach: () => void;
 }
 
 export class WebRtcTransport implements ShareTransport {
@@ -118,6 +120,10 @@ export class WebRtcTransport implements ShareTransport {
   }
 
   async serve(share: Share, feed: SessionFeed, viewers: ViewerRegistry): Promise<string> {
+    if (this.#shares.has(share.id)) {
+      // A second serve would orphan the first share's peers + listeners.
+      throw new Error(`share ${share.id} is already being served`);
+    }
     const key = randomBytes(KEY_LEN);
     const ctx: ShareContext = {
       share,
@@ -126,10 +132,26 @@ export class WebRtcTransport implements ShareTransport {
       key,
       peers: new Map(),
       unwatch: () => {},
+      detach: () => {},
     };
     ctx.unwatch = this.#signaling.watchShare(share.id, (viewerId) => this.#acceptViewer(ctx, viewerId));
+
+    // A kicked or departed viewer must lose the DATA plane, not just input.
+    // canWrite() already blocks their input, but the session keeps streaming
+    // to their DataChannel until the peer is dropped — mirror the
+    // LocalHttpTransport contract that kick/leave close a viewer's streams.
+    const dropOnRemoval = (v: Viewer): void => this.#dropPeer(ctx, v.id);
+    const onFeedClose = (): void => void this.unserve(share.id);
+    viewers.on('kick', dropOnRemoval);
+    viewers.on('leave', dropOnRemoval);
+    feed.on('close', onFeedClose);
+    ctx.detach = () => {
+      viewers.off('kick', dropOnRemoval);
+      viewers.off('leave', dropOnRemoval);
+      feed.off('close', onFeedClose);
+    };
+
     this.#shares.set(share.id, ctx);
-    feed.on('close', () => void this.unserve(share.id));
     return `${this.#baseUrl}/s/${share.id}#${key.toString('base64url')}`;
   }
 
@@ -138,6 +160,7 @@ export class WebRtcTransport implements ShareTransport {
     if (!ctx) return;
     this.#shares.delete(shareId);
     ctx.unwatch();
+    ctx.detach();
     for (const peer of ctx.peers.values()) this.#closePeer(peer);
     ctx.peers.clear();
   }
@@ -220,22 +243,35 @@ export class WebRtcTransport implements ShareTransport {
     // Subscribe now and buffer until the channel opens: replaying the
     // backlog only at open time would silently drop entries published
     // during the handshake.
-    const backlog = [...ctx.feed.backlog()];
+    // Subscribe BEFORE snapshotting the backlog: an entry published during
+    // the handshake then lands in `pending` instead of the gap between the
+    // two calls. The two can overlap (an entry in both) — dedup by seq.
     peer.unsubscribeFeed = ctx.feed.subscribe((entry) => {
       if (peer.open) this.#sendEntry(ctx, peer, entry);
       else peer.pending.push(entry);
     });
+    const backlog = [...ctx.feed.backlog()];
 
     dc.onOpen(() => {
       peer.open = true;
-      for (const entry of backlog) this.#sendEntry(ctx, peer, entry);
-      for (const entry of peer.pending) this.#sendEntry(ctx, peer, entry);
+      const sent = new Set<number>();
+      for (const entry of backlog) {
+        this.#sendEntry(ctx, peer, entry);
+        sent.add(entry.seq);
+      }
+      for (const entry of peer.pending) {
+        if (!sent.has(entry.seq)) this.#sendEntry(ctx, peer, entry);
+      }
       peer.pending = [];
     });
     dc.onMessage((msg) => this.#handleInbound(ctx, viewerId, msg));
     dc.onClosed(() => this.#dropPeer(ctx, viewerId));
     pc.onStateChange((state) => {
-      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
+      // `disconnected` is often a transient ICE blip that recovers; only a
+      // terminal state tears the peer down. (Real reconnect/backoff is a
+      // later hardening — ponytail: drop on terminal states, revisit if
+      // flaky loopback/LAN peers need a grace window.)
+      if (state === 'failed' || state === 'closed') {
         this.#dropPeer(ctx, viewerId);
       }
     });
