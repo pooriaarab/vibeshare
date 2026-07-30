@@ -6,6 +6,12 @@ Part of the **Vibe Suite** — companion tools for agentic coding CLIs (Claude C
 
 **Local-first: the share runs on your machine.** The consent ledger gates every share (`share:session` scope), the stream is served straight from your host, and nothing is stored on a server.
 
+## Demo
+
+[▶ Watch the launch video](branding/launch-video.mp4) — claude is multiplayer now.
+
+https://github.com/pooriaarab/vibeshare/raw/main/branding/launch-video.mp4
+
 ## Install & build
 
 ```sh
