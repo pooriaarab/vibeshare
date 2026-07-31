@@ -40,7 +40,7 @@ export { SessionFeed, type PublishOptions } from './feed.js';
 export { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.js';
 export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, type ShareManagerDeps } from './manager.js';
 export { ViewerRegistry } from './registry.js';
-export { SPECTATOR_CSS, spectatorPage } from './spectatorPage.js';
+export { SPECTATOR_CSS, spectatorPage, type SpectatorPageOptions } from './spectatorPage.js';
 export type { SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
 export { LoopbackSignaling } from './webrtc/signaling.js';
 export { decryptFrame, encryptFrame, E2E_KEY_LEN, E2E_NONCE_LEN, E2E_TAG_LEN } from './e2e.js';

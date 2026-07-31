@@ -2,6 +2,11 @@
  * The web spectator view: a minimal, self-contained read-only client served
  * straight from the host machine — no install, no build, no external assets
  * (local-first holds for viewers too; the page phones nowhere).
+ *
+ * Two modes, same shell:
+ *   - default (local loopback): plaintext SSE, JSON payloads
+ *   - e2e (tunnel path): SSE data is base64(AES-GCM frame); the page decrypts
+ *     with the key from `location.hash` via WebCrypto (mirrors viewerPage.ts)
  */
 import type { Share } from './types.js';
 
@@ -68,12 +73,27 @@ export const SPECTATOR_CSS = `:root{ --bg:#0a0b0f; --panel:#12141a; --panel-2:#1
   .join-btn.joined{ background:rgba(126,231,135,.12); border-color:rgba(126,231,135,.4); color:var(--green); }
   .hidden{ display:none !important; }`;
 
-export function spectatorPage(share: Share): string {
+export interface SpectatorPageOptions {
+  /**
+   * When true, the served page decrypts SSE payloads with WebCrypto AES-GCM
+   * using the key from the URL `#fragment` (tunnel path). Default false —
+   * plaintext SSE for the pure-local loopback path.
+   */
+  readonly e2e?: boolean;
+}
+
+export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): string {
+  const e2e = opts.e2e === true;
   const config = JSON.stringify({
     id: share.id,
     name: share.name,
     access: share.access,
+    e2e,
   }).replace(/</g, '\\u003c');
+
+  const badgeLine = e2e
+    ? '<div class="p2p"><b>●</b> tunnel · end-to-end encrypted</div>'
+    : '<div class="p2p"><b>●</b> p2p · nothing stored on a server</div>';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -89,12 +109,12 @@ export function spectatorPage(share: Share): string {
 <div class="app">
   <header class="topbar">
     <div class="brand">vibeshare<span id="sessionName"></span></div>
-    <div class="p2p"><b>●</b> p2p · nothing stored on a server</div>
+    ${badgeLine}
   </header>
 
   <div class="panel" id="joinPanel">
     <h1>Watch this session live</h1>
-    <p>Read-only. The stream comes straight from the host machine.</p>
+    <p>${e2e ? 'Read-only. Stream is end-to-end encrypted — the tunnel only sees ciphertext.' : 'Read-only. The stream comes straight from the host machine.'}</p>
     <div class="row">
       <input id="nameInput" placeholder="your name (optional)" maxlength="32">
       <input id="passInput" placeholder="passphrase" type="password" class="hidden">
@@ -146,6 +166,53 @@ export function spectatorPage(share: Share): string {
     termBody.scrollTop = termBody.scrollHeight;
   }
 
+  // ---- optional e2e helpers (only when CFG.e2e). Key rides in #fragment.
+  var cryptoKey = null;
+  function b64urlToBytes(s){
+    var b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+    while(b64.length % 4) b64 += "=";
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function b64ToBytes(s){
+    var bin = atob(s);
+    var out = new Uint8Array(bin.length);
+    for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function decryptPayload(data){
+    if(!cryptoKey) return Promise.resolve(null);
+    var bytes;
+    try { bytes = b64ToBytes(data); } catch(e){ return Promise.resolve(null); }
+    if(bytes.length < 12 + 16) return Promise.resolve(null);
+    var nonce = bytes.slice(0, 12);
+    var ct = bytes.slice(12); // WebCrypto expects ciphertext‖tag concatenated
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, cryptoKey, ct).then(function(plain){
+      try { return JSON.parse(new TextDecoder().decode(plain)); } catch(e){ return null; }
+    }).catch(function(){ return null; }); // GCM auth failure — drop, never render
+  }
+  if(CFG.e2e){
+    var keyB64 = location.hash.slice(1);
+    if(!keyB64){
+      setBadge("ended", "MISSING KEY");
+      showErr("This link is incomplete — the decryption key lives in the #fragment of the URL.");
+    } else {
+      crypto.subtle.importKey("raw", b64urlToBytes(keyB64), { name: "AES-GCM" }, false, ["decrypt"]).then(function(k){
+        cryptoKey = k;
+      }).catch(function(){
+        setBadge("ended", "BAD KEY");
+        showErr("The link's key fragment could not be imported as an AES-GCM key.");
+      });
+    }
+  }
+
+  function parseEventData(raw){
+    if(CFG.e2e) return decryptPayload(raw);
+    try { return Promise.resolve(JSON.parse(raw)); } catch(e){ return Promise.resolve(null); }
+  }
+
   fetch(base + "/meta").then(function(r){ return r.json(); }).then(function(meta){
     if(meta.state !== "live"){ ended(meta.state); joinPanel.classList.add("hidden"); return; }
     if(meta.requiresPassphrase) passInput.classList.remove("hidden");
@@ -175,11 +242,15 @@ export function spectatorPage(share: Share): string {
   function openStream(){
     source = new EventSource(base + "/stream?token=" + encodeURIComponent(viewer.token));
     source.addEventListener("entry", function(ev){
-      var e = JSON.parse(ev.data);
-      var cls = e.type === "milestone" ? "milestone" : e.type === "system" ? "system" : (e.stream === "stderr" ? "stderr" : "");
-      line(cls, e.text);
+      parseEventData(ev.data).then(function(e){
+        if(!e) return;
+        var cls = e.type === "milestone" ? "milestone" : e.type === "system" ? "system" : (e.stream === "stderr" ? "stderr" : "");
+        line(cls, e.text);
+      });
     });
-    source.addEventListener("viewers", function(ev){ watchingEl.textContent = JSON.parse(ev.data).watching; });
+    source.addEventListener("viewers", function(ev){
+      parseEventData(ev.data).then(function(d){ if(d) watchingEl.textContent = d.watching; });
+    });
     source.addEventListener("join-approved", function(){
       setBadge("collab", "COLLABORATING · live");
       reqBtn.className = "join-btn joined"; reqBtn.disabled = true; reqBtn.textContent = "You’re in — live";
@@ -189,7 +260,10 @@ export function spectatorPage(share: Share): string {
       reqBtn.className = "join-btn"; reqBtn.disabled = false; reqBtn.textContent = "Request denied — try again";
     });
     source.addEventListener("kicked", function(){ source.close(); ended("kicked"); });
-    source.addEventListener("ended", function(ev){ source.close(); ended(JSON.parse(ev.data).state); });
+    source.addEventListener("ended", function(ev){
+      source.close();
+      parseEventData(ev.data).then(function(d){ ended(d && d.state ? d.state : "ended"); });
+    });
     source.onerror = function(){ if(badge.className.indexOf("ended") === -1) setBadge("", "RECONNECTING…"); };
     source.onopen = function(){ if(!viewer || reqBtn.className.indexOf("joined") === -1) setBadge("", "SPECTATING · read-only"); };
   }
