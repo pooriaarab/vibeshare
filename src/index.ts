@@ -49,6 +49,7 @@ export { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.
 export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, type ShareManagerDeps } from './manager.js';
 export { ViewerRegistry } from './registry.js';
 export { SPECTATOR_CSS, spectatorPage, type SpectatorPageOptions } from './spectatorPage.js';
+export { XTERM_BOOT_JS, xtermPageStyles, xtermScriptTags } from './xtermClient.js';
 export type { SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
 export { LoopbackSignaling } from './webrtc/signaling.js';
 export {

@@ -15,10 +15,10 @@
  *   - collaborator input carries a per-peer monotonic `seq` INSIDE the
  *     encrypted payload (the host drops replays; see `transport.ts`).
  *
- * Terminal rendering and CSS are shared with the local spectator view
- * (`SPECTATOR_CSS`, same line classes) so local and public views look alike.
+ * Terminal rendering uses the same inlined xterm.js bootstrap as the local
+ * spectator page so raw PTY bytes reconstruct the real TUI on both transports.
  */
-import { SPECTATOR_CSS } from '../spectatorPage.js';
+import { XTERM_BOOT_JS, xtermPageStyles, xtermScriptTags } from '../xtermClient.js';
 
 export function viewerPage(): string {
   return `<!DOCTYPE html>
@@ -28,8 +28,7 @@ export function viewerPage(): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>vibeshare · live</title>
 <style>
-  ${SPECTATOR_CSS}
-  .input-row{ display:flex; gap:10px; margin-top:14px; }
+  ${xtermPageStyles()}
 </style>
 </head>
 <body>
@@ -51,7 +50,7 @@ export function viewerPage(): string {
 
   <div class="term">
     <div class="chrome"><span></span><span></span><span></span><span class="path" id="chromePath"></span></div>
-    <div class="body" id="termBody"></div>
+    <div class="term-body" id="termBody"></div>
   </div>
 
   <div class="input-row">
@@ -60,7 +59,9 @@ export function viewerPage(): string {
   </div>
 </div>
 
+${xtermScriptTags()}
 <script>
+${XTERM_BOOT_JS}
 (function(){
   "use strict";
 
@@ -68,6 +69,8 @@ export function viewerPage(): string {
   var termBody = document.getElementById("termBody");
   var cmdInput = document.getElementById("cmdInput");
   var sendBtn = document.getElementById("sendBtn");
+  var termApi = null;
+  var lastEntrySeq = 0;
 
   function setBadge(cls, text){ badge.className = "badge" + (cls ? " " + cls : ""); badge.innerHTML = '<span class="d"></span> ' + text; }
   function fatal(msg){
@@ -75,13 +78,18 @@ export function viewerPage(): string {
     document.getElementById("errPanel").classList.remove("hidden");
     setBadge("ended", "UNAVAILABLE");
   }
-  function line(cls, text){
-    var d = document.createElement("div");
-    d.className = "line " + cls;
-    d.textContent = text;
-    termBody.appendChild(d);
-    while(termBody.childNodes.length > 800) termBody.removeChild(termBody.firstChild);
-    termBody.scrollTop = termBody.scrollHeight;
+  function ensureTerm(){
+    if(termApi) return termApi;
+    termApi = __vsCreateTerm(termBody);
+    return termApi;
+  }
+  function applyEntry(entry){
+    if(!entry) return;
+    if(typeof entry.seq === "number"){
+      if(entry.seq <= lastEntrySeq) return;
+      lastEntrySeq = entry.seq;
+    }
+    __vsHandleEntry(ensureTerm(), entry);
   }
 
   // ---- share id from the path, key from the fragment (never sent anywhere)
@@ -118,7 +126,6 @@ export function viewerPage(): string {
   var remoteDescSet = false;
   var iceQueue = [];
   var inputSeq = 0;      // per-peer monotonic, inside the encrypted payload
-  var lastEntrySeq = 0;  // render dedupe (backlog + live overlap)
 
   ws.onmessage = function(ev){
     var msg;
@@ -155,6 +162,7 @@ export function viewerPage(): string {
         setBadge("", "LIVE · p2p");
         cmdInput.disabled = false;
         sendBtn.disabled = false;
+        ensureTerm();
       };
       dc.onclose = function(){ ended("SHARE ENDED", "— the host ended this share —"); };
       dc.onmessage = function(mev){ onFrame(mev.data); };
@@ -195,12 +203,7 @@ export function viewerPage(): string {
     crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ct).then(function(plain){
       var entry;
       try { entry = JSON.parse(new TextDecoder().decode(plain)); } catch(e){ return; }
-      if(typeof entry.seq === "number"){
-        if(entry.seq <= lastEntrySeq) return;
-        lastEntrySeq = entry.seq;
-      }
-      var cls = entry.type === "milestone" ? "milestone" : entry.type === "system" ? "system" : (entry.stream === "stderr" ? "stderr" : "");
-      line(cls, entry.text);
+      applyEntry(entry);
     }).catch(function(){
       // GCM auth failure: tampered frame — dropped, never rendered.
     });
@@ -228,7 +231,7 @@ export function viewerPage(): string {
     setBadge("ended", state);
     cmdInput.disabled = true;
     sendBtn.disabled = true;
-    line("system", msg);
+    applyEntry({ type: "system", text: msg });
   }
 
   keyPromise.then(function(k){
