@@ -3,11 +3,15 @@
  * vibeshare CLI.
  *
  *   vibeshare [options] [-- <cmd…>]   start sharing (default command: your shell)
+ *   vibeshare attach [target]         share an already-running tmux pane
  *   vibeshare viewers [--approve|--deny|--kick <viewerId>] [--json]
  *   vibeshare stop
  *
  * The share runs on your machine only: the consent ledger (@pooriaarab/vibe-core)
  * gates every share, and the spectator stream is served straight from here.
+ *
+ * Capture sources (PTY spawn vs tmux attach) are swappable; share/transport/e2e
+ * logic is shared — see src/capture.ts + src/attach.ts.
  */
 import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
@@ -24,6 +28,13 @@ import {
   watchCwd,
   type TriggerKind,
 } from '@pooriaarab/vibe-core';
+import {
+  AttachError,
+  createProcessTmuxClient,
+  createTmuxCaptureSource,
+  pickAttachTarget,
+  type TmuxClient,
+} from './attach.js';
 import { decryptChatText } from './presenceChatCrypto.js';
 import {
   clearActiveShare,
@@ -51,7 +62,8 @@ const DEFAULT_STUN_SERVER = 'stun:stun.l.google.com:19302';
 
 // ---------------------------------------------------------------- parsing
 
-export interface StartOptions {
+/** Share flags common to `start` (PTY) and `attach` (tmux). */
+export interface ShareFlags {
   access: 'spectate' | 'invite';
   expiry: string;
   passphrase?: string;
@@ -81,11 +93,24 @@ export interface StartOptions {
       start(port: number, opts?: { hostname?: string; serverAddr?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; timeoutMs?: number }): Promise<{ url: string; stop(): Promise<void> }>;
     }>;
   };
+}
+
+export interface StartOptions extends ShareFlags {
   command: string[];
+}
+
+export interface AttachCliOptions extends ShareFlags {
+  /** tmux target (`session:window.pane` / `%id`). Omitted → $TMUX_PANE or picker. */
+  target?: string;
+  /** Injectable tmux client (tests). */
+  tmux?: TmuxClient;
+  /** Pane-size poll interval ms (tests may set 0 to disable). */
+  sizePollMs?: number;
 }
 
 export type CliCommand =
   | { cmd: 'start'; options: StartOptions }
+  | { cmd: 'attach'; options: AttachCliOptions }
   | { cmd: 'stop'; share?: string }
   | { cmd: 'viewers'; share?: string; approve?: string; deny?: string; kick?: string; json: boolean }
   | { cmd: 'mcp' }
@@ -103,6 +128,7 @@ const USAGE = `vibeshare — share your live agent coding session by URL
 
 usage:
   vibeshare [options] [-- <cmd…>]   start sharing (default: your shell)
+  vibeshare attach [target] [opts]  share an already-running tmux pane (read-only)
   vibeshare viewers [shareId]       list viewers; act on join requests
   vibeshare stop [shareId]          end the active share
 
@@ -131,8 +157,83 @@ options:
   --version, -v     print version
   --help, -h        this help
 
+attach:
+  target is a tmux pane id (session:window.pane or %pane_id). Omit it to use
+  $TMUX_PANE when inside tmux, or to list panes. v0 is read-only (no send-keys).
+  Needs tmux — GNU screen is not supported yet. To share a fresh command instead:
+    vibeshare -- <cmd>
+
 local-first: the stream is served from this machine; nothing is stored on a
 server. Consent scope "share:session" is recorded in ~/.vibeshare/consent.json.`;
+
+function defaultShareFlags(): ShareFlags {
+  return {
+    access: 'spectate',
+    expiry: 'stop',
+    port: 0,
+    host: '127.0.0.1',
+    yes: false,
+    public: false,
+    tunnel: false,
+  };
+}
+
+/**
+ * Parse shared start/attach flags from argv.
+ * Returns the next index after the last consumed flag token, plus any bare
+ * positional args collected (attach target, or start command words).
+ */
+function parseShareFlags(
+  args: string[],
+  opts: ShareFlags,
+): { positionals: string[]; commandAfterDashDash: string[] | null } {
+  const positionals: string[] = [];
+  let commandAfterDashDash: string[] | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    const value = (flag: string): string => {
+      const v = args[++i];
+      if (v === undefined) throw new CliUsageError(`${flag} needs a value`);
+      return v;
+    };
+    if (a === '--') {
+      commandAfterDashDash = args.slice(i + 1);
+      break;
+    } else if (a === '--spectate') opts.access = 'spectate';
+    else if (a === '--invite') opts.access = 'invite';
+    else if (a === '--public') opts.public = true;
+    else if (a === '--tunnel') {
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith('-') && next !== '--') {
+        opts.tunnel = args[++i]!;
+      } else {
+        opts.tunnel = true;
+      }
+    } else if (a === '--signaling') opts.signaling = value(a);
+    else if (a === '--expire' || a === '--expiry') opts.expiry = value(a);
+    else if (a === '--pass') opts.passphrase = value(a);
+    else if (a === '--port') {
+      const n = Number(value(a));
+      if (!Number.isInteger(n) || n < 0 || n > 65535) throw new CliUsageError('--port must be 0–65535');
+      opts.port = n;
+    } else if (a === '--host') opts.host = value(a);
+    else if (a === '--name') opts.name = value(a);
+    else if (a === '--yes' || a === '-y') opts.yes = true;
+    else if (a === '--help' || a === '-h') {
+      // Caller maps this; throw a sentinel via special positional.
+      throw new HelpRequested();
+    } else if (a.startsWith('-')) throw new CliUsageError(`unknown option: ${a}`);
+    else positionals.push(a);
+  }
+  return { positionals, commandAfterDashDash };
+}
+
+class HelpRequested extends Error {
+  constructor() {
+    super('help');
+    this.name = 'HelpRequested';
+  }
+}
 
 export function parseArgv(argv: string[]): CliCommand {
   const rest = [...argv];
@@ -169,57 +270,46 @@ export function parseArgv(argv: string[]): CliCommand {
     return out;
   }
   if (sub === 'mcp') return { cmd: 'mcp' };
+
+  // attach [target] [share flags…]
+  if (sub === 'attach') {
+    const flags = defaultShareFlags();
+    try {
+      const { positionals, commandAfterDashDash } = parseShareFlags(rest.slice(1), flags);
+      if (commandAfterDashDash !== null) {
+        throw new CliUsageError('attach does not take `-- <cmd>` — pass a tmux target, or use `vibeshare -- <cmd>` to launch wrapped');
+      }
+      if (positionals.length > 1) {
+        throw new CliUsageError('attach takes at most one target (session:window.pane)');
+      }
+      const options: AttachCliOptions = {
+        ...flags,
+        ...(positionals[0] !== undefined ? { target: positionals[0] } : {}),
+      };
+      return { cmd: 'attach', options };
+    } catch (err) {
+      if (err instanceof HelpRequested) return { cmd: 'help' };
+      throw err;
+    }
+  }
+
   if (sub === 'start') rest.shift();
 
   // Default: start.
   const options: StartOptions = {
-    access: 'spectate',
-    expiry: 'stop',
-    port: 0,
-    host: '127.0.0.1',
-    yes: false,
-    public: false,
-    tunnel: false,
+    ...defaultShareFlags(),
     command: [],
   };
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i]!;
-    const value = (flag: string): string => {
-      const v = rest[++i];
-      if (v === undefined) throw new CliUsageError(`${flag} needs a value`);
-      return v;
-    };
-    if (a === '--') {
-      options.command = rest.slice(i + 1);
-      break;
-    } else if (a === '--spectate') options.access = 'spectate';
-    else if (a === '--invite') options.access = 'invite';
-    else if (a === '--public') options.public = true;
-    else if (a === '--tunnel') {
-      // Optional value: `--tunnel` (cascade) or `--tunnel ngrok`.
-      // A following bare non-flag token is the provider name; anything
-      // starting with `-` or end-of-args means cascade with no name.
-      const next = rest[i + 1];
-      if (next !== undefined && !next.startsWith('-') && next !== '--') {
-        options.tunnel = rest[++i]!;
-      } else {
-        options.tunnel = true;
-      }
+  try {
+    const { positionals, commandAfterDashDash } = parseShareFlags(rest, options);
+    if (commandAfterDashDash !== null) {
+      options.command = commandAfterDashDash;
+    } else if (positionals.length > 0) {
+      options.command = positionals;
     }
-    else if (a === '--signaling') options.signaling = value(a);
-    else if (a === '--expire' || a === '--expiry') options.expiry = value(a);
-    else if (a === '--pass') options.passphrase = value(a);
-    else if (a === '--port') {
-      const n = Number(value(a));
-      if (!Number.isInteger(n) || n < 0 || n > 65535) throw new CliUsageError('--port must be 0–65535');
-      options.port = n;
-    } else if (a === '--host') options.host = value(a);
-    else if (a === '--name') options.name = value(a);
-    else if (a === '--yes' || a === '-y') options.yes = true;
-    else if (a === '--help' || a === '-h') return { cmd: 'help' };
-    else if (a.startsWith('-')) throw new CliUsageError(`unknown option: ${a}`);
-    else options.command = rest.slice(i); // bare words = command to share
-    if (!a.startsWith('-')) break;
+  } catch (err) {
+    if (err instanceof HelpRequested) return { cmd: 'help' };
+    throw err;
   }
   return { cmd: 'start', options };
 }
@@ -279,12 +369,33 @@ async function ensureConsent(io: IO, yes: boolean): Promise<boolean> {
   }
 }
 
-async function startShare(options: StartOptions, io: IO): Promise<number> {
+/** Runtime produced by mintShareRuntime — shared by start (PTY) and attach (tmux). */
+interface ShareRuntime {
+  created: CreatedShare;
+  manager: ShareManager;
+  record: ActiveShareRecord;
+  tunnelHandle: { url: string; stop(): Promise<void> } | null;
+  watcher: { stop(): void };
+  tunnelOn: boolean;
+  tunnelProviderName: string | null;
+  /** Tear down transport + state. Idempotent enough for error paths. */
+  cleanup(): Promise<void>;
+}
+
+/**
+ * Mint the share + transport exactly once for both capture sources.
+ * Returns null and has already printed + cleaned up on failure (exit code set).
+ */
+async function mintShareRuntime(
+  options: ShareFlags,
+  io: IO,
+  sessionLabel: string | undefined,
+): Promise<{ ok: true; runtime: ShareRuntime } | { ok: false; code: number }> {
   if (options.public && options.tunnel) {
     io.err('vibeshare: --public and --tunnel are mutually exclusive');
-    return 2;
+    return { ok: false, code: 2 };
   }
-  if (!(await ensureConsent(io, options.yes))) return 1;
+  if (!(await ensureConsent(io, options.yes))) return { ok: false, code: 1 };
 
   const bus = createHookBus({ onError: (e) => io.err(`[vibeshare] hook error: ${String(e)}`) });
   const watcher = watchCwd(process.cwd(), bus);
@@ -298,10 +409,9 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   let localHttp: LocalHttpTransport | null = null;
   let tunnelHandle: { url: string; stop(): Promise<void> } | null = null;
   let tunnelProviderName: string | null = null;
-  let publicShareUrl: string | null = null;
   const tunnelOn = options.tunnel !== false;
 
-  /** Print incoming chat to the host terminal without breaking PTY output. */
+  /** Print incoming chat to the host terminal without breaking session output. */
   const printChat = (name: string, text: string): void => {
     const who = sanitizePeerText(name, 32).trim() || 'viewer';
     const msg = sanitizePeerText(text, 500);
@@ -369,7 +479,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
       expiry: options.expiry,
       ...(options.passphrase !== undefined ? { passphrase: options.passphrase } : {}),
       ...(options.name !== undefined ? { name: options.name } : {}),
-      session: options.command.length > 0 ? options.command.join(' ') : undefined,
+      session: sessionLabel,
     });
     // --public: pull the share key from the URL fragment for chat decrypt, and
     // announce the host display name on the multi-party presence roster.
@@ -389,7 +499,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
     await transport.close();
     if (err instanceof ConsentRequiredError || err instanceof Error) {
       io.err(`vibeshare: ${err.message}`);
-      return err instanceof ConsentRequiredError ? 1 : 2;
+      return { ok: false, code: err instanceof ConsentRequiredError ? 1 : 2 };
     }
     throw err;
   }
@@ -407,7 +517,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
       const fragment = created.url.includes('#') ? created.url.slice(created.url.indexOf('#') + 1) : '';
       tunnelHandle = await provider.start(localHttp.port, resolved.startOpts);
       const publicBase = tunnelHandle.url.replace(/\/$/, '');
-      publicShareUrl = `${publicBase}${localUrl.pathname}${fragment ? `#${fragment}` : ''}`;
+      const publicShareUrl = `${publicBase}${localUrl.pathname}${fragment ? `#${fragment}` : ''}`;
       // Rewrite so viewers / the state file point at the public URL.
       created = { ...created, url: publicShareUrl };
     } catch (err) {
@@ -417,7 +527,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
       const msg = err instanceof Error ? err.message : String(err);
       // Never echo secrets — startOpts.env is not in the error path.
       io.err(`vibeshare: tunnel failed: ${msg}`);
-      return 2;
+      return { ok: false, code: 2 };
     }
   }
 
@@ -455,6 +565,41 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   io.out(`  manage:   vibeshare viewers · vibeshare stop`);
   if (!loopback && !options.public && !tunnelOn) io.err('note: bound to a non-loopback address — anyone who can reach this host with the link can watch.');
 
+  let cleaned = false;
+  const cleanup = async (): Promise<void> => {
+    if (cleaned) return;
+    cleaned = true;
+    watcher.stop();
+    clearActiveShare(record.id);
+    await manager.stopAll();
+    if (tunnelHandle) {
+      try { await tunnelHandle.stop(); } catch { /* best effort */ }
+      tunnelHandle = null;
+    }
+  };
+
+  return {
+    ok: true,
+    runtime: {
+      created,
+      manager,
+      record,
+      get tunnelHandle() { return tunnelHandle; },
+      watcher,
+      tunnelOn,
+      tunnelProviderName,
+      cleanup,
+    },
+  };
+}
+
+async function startShare(options: StartOptions, io: IO): Promise<number> {
+  const sessionLabel = options.command.length > 0 ? options.command.join(' ') : undefined;
+  const minted = await mintShareRuntime(options, io, sessionLabel);
+  if (!minted.ok) return minted.code;
+  const { runtime } = minted;
+  const { created, record } = runtime;
+
   // Spawn the session in a real PTY so interactive TUIs (Claude Code / Codex)
   // render their full terminal UI. Raw bytes (ANSI included) go into the feed;
   // viewers reconstruct via xterm.js.
@@ -473,13 +618,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     io.err(`vibeshare: could not start ${cmd[0]!}: ${msg}`);
-    watcher.stop();
-    clearActiveShare(record.id);
-    await manager.stopAll();
-    if (tunnelHandle) {
-      try { await tunnelHandle.stop(); } catch { /* best effort */ }
-      tunnelHandle = null;
-    }
+    await runtime.cleanup();
     return 2;
   }
 
@@ -489,7 +628,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   // Tee PTY output to the host terminal and the ordered raw-byte feed.
   ptyProcess.onData((data) => {
     process.stdout.write(data);
-    created?.feed.publishRaw(data);
+    created.feed.publishRaw(data);
   });
 
   // Host stdin → PTY so the host user still drives the session normally.
@@ -508,7 +647,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
     const c = process.stdout.columns || 80;
     const r = process.stdout.rows || 24;
     try { ptyProcess.resize(c, r); } catch { /* closed */ }
-    created?.feed.publishResize(c, r);
+    created.feed.publishResize(c, r);
   };
   process.on('SIGWINCH', onWinch);
 
@@ -535,13 +674,72 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   if (stdin.isTTY) {
     try { stdin.setRawMode(wasRaw); } catch { /* ignore */ }
   }
-  watcher.stop();
-  clearActiveShare(record.id);
-  await manager.stopAll();
-  if (tunnelHandle) {
-    try { await tunnelHandle.stop(); } catch { /* best effort */ }
-    tunnelHandle = null;
+  await runtime.cleanup();
+  return exitCode;
+}
+
+/**
+ * `vibeshare attach [target]` — share an already-running tmux pane.
+ * Capture source only; transports/e2e/xterm/presence-chat are unchanged.
+ * Read-only v0 (no tmux send-keys).
+ */
+async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
+  const tmux = options.tmux ?? createProcessTmuxClient();
+
+  let target: string;
+  try {
+    target = await pickAttachTarget(options.target, tmux);
+    // Fail closed on bad target BEFORE minting a share URL.
+    await tmux.paneSize(target);
+  } catch (err) {
+    const msg = err instanceof AttachError || err instanceof Error ? err.message : String(err);
+    io.err(msg.startsWith('vibeshare') ? msg : `vibeshare attach: ${msg}`);
+    return 2;
   }
+
+  const sessionLabel = options.name ?? `tmux ${target}`;
+  const minted = await mintShareRuntime(options, io, sessionLabel);
+  if (!minted.ok) return minted.code;
+  const { runtime } = minted;
+  const { created } = runtime;
+
+  io.out(`  source:   tmux ${target} (read-only attach)`);
+
+  let captureStop: (() => Promise<void>) | null = null;
+  try {
+    const source = createTmuxCaptureSource({
+      target,
+      tmux,
+      ...(options.sizePollMs !== undefined ? { sizePollMs: options.sizePollMs } : {}),
+    });
+    const handle = await source.start(created.feed);
+    captureStop = () => handle.stop();
+  } catch (err) {
+    const msg = err instanceof AttachError || err instanceof Error ? err.message : String(err);
+    io.err(msg.startsWith('vibeshare') ? msg : `vibeshare attach: ${msg}`);
+    await runtime.cleanup();
+    return 2;
+  }
+
+  // Host stays attached until SIGINT/SIGTERM / vibeshare stop. We do not proxy
+  // host stdin into the pane (the user's own tmux client already owns input).
+  let shuttingDown = false;
+  const exitCode = await new Promise<number>((resolve) => {
+    process.on('SIGINT', () => shutdown(130));
+    process.on('SIGTERM', () => shutdown(143));
+
+    function shutdown(code: number): void {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      resolve(code);
+    }
+    shutdownRef = shutdown;
+  });
+
+  if (captureStop) {
+    try { await captureStop(); } catch { /* best effort */ }
+  }
+  await runtime.cleanup();
   return exitCode;
 }
 
@@ -719,6 +917,8 @@ export async function runCommand(command: CliCommand, io: IO = stdio): Promise<n
       return 0;
     case 'start':
       return startShare(command.options, io);
+    case 'attach':
+      return attachShare(command.options, io);
     case 'viewers':
       return viewersCommand(command, io);
     case 'stop':
