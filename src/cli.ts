@@ -20,9 +20,11 @@ import {
   createTunnelRegistry,
   E2E_KEY_LEN,
   parseConfirm,
+  sanitizePeerText,
   watchCwd,
   type TriggerKind,
 } from '@pooriaarab/vibe-core';
+import { decryptChatText } from './presenceChatCrypto.js';
 import {
   clearActiveShare,
   listActiveShares,
@@ -299,13 +301,35 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   let publicShareUrl: string | null = null;
   const tunnelOn = options.tunnel !== false;
 
+  /** Print incoming chat to the host terminal without breaking PTY output. */
+  const printChat = (name: string, text: string): void => {
+    const who = sanitizePeerText(name, 32).trim() || 'viewer';
+    const msg = sanitizePeerText(text, 500);
+    if (!msg) return;
+    // Dim line so it doesn't fight the session TUI; leading \r keeps raw-mode tidy.
+    io.err(`\r\x1b[2m[chat] ${who}: ${msg}\x1b[0m`);
+  };
+
+  let publicSignaling: WsSignaling | null = null;
+  // Filled after createShare for --public (key lives in the URL #fragment).
+  let publicShareKey: Buffer | null = null;
+
   if (options.public) {
     const signalingUrl = resolveSignaling(options.signaling);
+    publicSignaling = new WsSignaling({
+      url: signalingUrl,
+      onError: (e) => io.err(`[vibeshare] signaling: ${e.message}`),
+      onChat: (frame) => {
+        // Decrypt with the share key once we have the created URL fragment.
+        // Until createShare returns the key is unknown — drop early frames.
+        const key = publicShareKey;
+        if (!key) return;
+        const plain = decryptChatText(key, frame.text);
+        if (plain) printChat(frame.name, plain);
+      },
+    });
     transport = new WebRtcTransport({
-      signaling: new WsSignaling({
-        url: signalingUrl,
-        onError: (e) => io.err(`[vibeshare] signaling: ${e.message}`),
-      }),
+      signaling: publicSignaling,
       iceServers: [DEFAULT_STUN_SERVER],
       // The viewer page is served by the rendezvous itself at /vibeshare/s/<id>
       // — the share URL is the ws endpoint with an http(s) scheme.
@@ -319,6 +343,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
       host: '127.0.0.1',
       port: options.port,
       e2e: { key: e2eKey },
+      onChat: (_shareId, frame) => printChat(frame.name, frame.text),
       onStopRequested: () => {
         shutdown(0);
       },
@@ -328,6 +353,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
     localHttp = new LocalHttpTransport({
       host: options.host,
       port: options.port,
+      onChat: (_shareId, frame) => printChat(frame.name, frame.text),
       onStopRequested: () => {
         // `vibeshare stop` from another process → shut this one down.
         shutdown(0);
@@ -345,6 +371,19 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
       ...(options.name !== undefined ? { name: options.name } : {}),
       session: options.command.length > 0 ? options.command.join(' ') : undefined,
     });
+    // --public: pull the share key from the URL fragment for chat decrypt, and
+    // announce the host display name on the multi-party presence roster.
+    if (options.public && publicSignaling) {
+      const frag = created.url.includes('#') ? created.url.slice(created.url.indexOf('#') + 1) : '';
+      if (frag) {
+        try {
+          publicShareKey = Buffer.from(frag, 'base64url');
+        } catch {
+          publicShareKey = null;
+        }
+      }
+      publicSignaling.setHostName(created.share.id, created.share.name || 'host');
+    }
   } catch (err) {
     watcher.stop();
     await transport.close();

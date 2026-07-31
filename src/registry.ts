@@ -9,6 +9,7 @@
  * exactly one choke point when it lands.
  */
 import { EventEmitter } from 'node:events';
+import { sanitizePeerText } from '@pooriaarab/vibe-core';
 import { ShareError, type ShareAccess, type Viewer } from './types.js';
 import { newShareId, newToken } from './utils.js';
 
@@ -142,6 +143,7 @@ export class ViewerRegistry extends EventEmitter {
 }
 
 function sanitizeName(name: string | undefined): string {
-  const cleaned = (name ?? '').trim().slice(0, 32);
+  // Peer-supplied display text — strip terminal/bidi injection before storage.
+  const cleaned = sanitizePeerText(name ?? '', 32).trim().slice(0, 32);
   return cleaned.length > 0 ? cleaned : `anon-${newToken(2)}`;
 }

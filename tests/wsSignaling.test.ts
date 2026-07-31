@@ -20,10 +20,17 @@ import { WsSignaling } from '../src/webrtc/wsSignaling.js';
 
 // ------------------------------------------------------------ mock rendezvous
 
+interface AttachedSocket {
+  ws: WsSocket;
+  role: 'host' | 'viewer';
+  viewerId?: string;
+  name: string;
+}
+
 interface ShareRoom {
   hostSecret: string | null;
-  host: WsSocket | null;
-  readonly viewers: Map<string, WsSocket>;
+  host: AttachedSocket | null;
+  readonly viewers: Map<string, AttachedSocket>;
 }
 
 const MAX_FRAME_BYTES = 32 * 1024;
@@ -69,8 +76,8 @@ class MockRendezvous {
 
   close(): void {
     for (const room of this.rooms.values()) {
-      room.host?.close();
-      for (const v of room.viewers.values()) v.close();
+      room.host?.ws.close();
+      for (const v of room.viewers.values()) v.ws.close();
     }
     this.server.close();
   }
@@ -92,25 +99,35 @@ class MockRendezvous {
     if (url.pathname === '/vibeshare/ws/host') {
       const secret = url.searchParams.get('secret') ?? '';
       room.hostSecret ??= secret;
-      room.host?.close(1012, 'host reconnected');
-      room.host = ws;
+      room.host?.ws.close(1012, 'host reconnected');
+      const att: AttachedSocket = { ws, role: 'host', name: 'host' };
+      room.host = att;
       ws.send(JSON.stringify({ kind: 'host-ready' }));
-      ws.on('message', (data) => this.#onHostFrame(room, shareId, String(data)));
+      this.#broadcastPresence(room);
+      ws.on('message', (data) => this.#onHostFrame(room, shareId, att, String(data)));
       ws.on('close', () => {
-        if (room.host === ws) room.host = null;
-        for (const v of room.viewers.values()) v.close(1012, 'host left');
+        if (room.host?.ws === ws) room.host = null;
+        for (const v of room.viewers.values()) v.ws.close(1012, 'host left');
       });
       return;
     }
 
     if (url.pathname === '/vibeshare/ws/viewer') {
       const viewerId = randomUUID(); // server-minted, unforgeable
-      room.viewers.set(viewerId, ws);
+      const att: AttachedSocket = {
+        ws,
+        role: 'viewer',
+        viewerId,
+        name: `viewer-${viewerId.replace(/-/g, '').slice(0, 6)}`,
+      };
+      room.viewers.set(viewerId, att);
       ws.send(JSON.stringify({ kind: 'assigned', viewerId }));
-      room.host?.send(JSON.stringify({ kind: 'viewer-joined', viewerId }));
-      ws.on('message', (data) => this.#onViewerFrame(room, shareId, viewerId, String(data)));
+      room.host?.ws.send(JSON.stringify({ kind: 'viewer-joined', viewerId }));
+      this.#broadcastPresence(room);
+      ws.on('message', (data) => this.#onViewerFrame(room, shareId, att, String(data)));
       ws.on('close', () => {
-        if (room.viewers.get(viewerId) === ws) room.viewers.delete(viewerId);
+        if (room.viewers.get(viewerId)?.ws === ws) room.viewers.delete(viewerId);
+        this.#broadcastPresence(room);
       });
       return;
     }
@@ -118,11 +135,12 @@ class MockRendezvous {
     ws.close(1008, 'unknown route');
   }
 
-  #onHostFrame(room: ShareRoom, shareId: string, text: string): void {
+  #onHostFrame(room: ShareRoom, shareId: string, att: AttachedSocket, text: string): void {
     const msg = parse(text);
     if (!msg) return;
+    if (this.#handlePresenceChat(room, att, msg)) return;
     if (msg['kind'] === 'rtc-offer' && typeof msg['viewerId'] === 'string' && typeof msg['sdp'] === 'string') {
-      room.viewers.get(msg['viewerId'])?.send(
+      room.viewers.get(msg['viewerId'])?.ws.send(
         JSON.stringify({ kind: 'rtc-offer', shareId, viewerId: msg['viewerId'], sdp: msg['sdp'] }),
       );
       return;
@@ -133,7 +151,7 @@ class MockRendezvous {
       typeof msg['candidate'] === 'string' &&
       typeof msg['mid'] === 'string'
     ) {
-      room.viewers.get(msg['viewerId'])?.send(
+      room.viewers.get(msg['viewerId'])?.ws.send(
         JSON.stringify({
           kind: 'rtc-ice',
           shareId,
@@ -147,20 +165,63 @@ class MockRendezvous {
     // anything else: dropped (whitelist relay)
   }
 
-  #onViewerFrame(room: ShareRoom, shareId: string, viewerId: string, text: string): void {
+  #onViewerFrame(room: ShareRoom, shareId: string, att: AttachedSocket, text: string): void {
     const msg = parse(text);
     if (!msg) return;
+    if (this.#handlePresenceChat(room, att, msg)) return;
+    const viewerId = att.viewerId!;
     // Stamped with the CONNECTION's own (shareId, viewerId) — client-supplied
     // identity fields are ignored, so a viewer cannot impersonate anyone.
     if (msg['kind'] === 'rtc-answer' && typeof msg['sdp'] === 'string') {
-      room.host?.send(JSON.stringify({ kind: 'rtc-answer', shareId, viewerId, sdp: msg['sdp'] }));
+      room.host?.ws.send(JSON.stringify({ kind: 'rtc-answer', shareId, viewerId, sdp: msg['sdp'] }));
       return;
     }
     if (msg['kind'] === 'rtc-ice' && typeof msg['candidate'] === 'string' && typeof msg['mid'] === 'string') {
-      room.host?.send(
+      room.host?.ws.send(
         JSON.stringify({ kind: 'rtc-ice', shareId, viewerId, candidate: msg['candidate'], mid: msg['mid'], from: 'viewer' }),
       );
     }
+  }
+
+  #handlePresenceChat(room: ShareRoom, att: AttachedSocket, msg: Record<string, unknown>): boolean {
+    if (msg['kind'] === 'hello') {
+      const raw = typeof msg['name'] === 'string' ? msg['name'] : '';
+      // Mirror worker: strip controls / cap length (tests import the real helper).
+      const cleaned = raw.replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, 32);
+      att.name = cleaned.length > 0 ? cleaned : att.role === 'host' ? 'host' : att.name;
+      this.#broadcastPresence(room);
+      return true;
+    }
+    if (msg['kind'] === 'chat') {
+      if (typeof msg['text'] !== 'string' || msg['text'].length === 0) return true;
+      const viewerId = att.role === 'host' ? 'host' : att.viewerId!;
+      // STAMP identity from the connection — ignore payload viewerId/name.
+      this.#broadcastAll(room, {
+        kind: 'chat',
+        viewerId,
+        name: att.name,
+        role: att.role,
+        text: msg['text'],
+        ts: Date.now(),
+      });
+      return true;
+    }
+    return false;
+  }
+
+  #broadcastPresence(room: ShareRoom): void {
+    const viewers: Array<{ viewerId: string; name: string; role: 'host' | 'viewer' }> = [];
+    if (room.host) viewers.push({ viewerId: 'host', name: room.host.name, role: 'host' });
+    for (const [id, v] of room.viewers) {
+      viewers.push({ viewerId: id, name: v.name, role: 'viewer' });
+    }
+    this.#broadcastAll(room, { kind: 'presence', viewers });
+  }
+
+  #broadcastAll(room: ShareRoom, frame: unknown): void {
+    const text = JSON.stringify(frame);
+    room.host?.ws.send(text);
+    for (const v of room.viewers.values()) v.ws.send(text);
   }
 }
 
@@ -471,7 +532,7 @@ describe('WsSignaling over a mock rendezvous', () => {
     await waitForMsg(hostAgain, 'host-ready');
   });
 
-  it('relays ONLY rtc-offer/rtc-answer/rtc-ice — anything else is dropped', async () => {
+  it('relays ONLY rtc-offer/rtc-answer/rtc-ice + presence/chat — anything else is dropped', async () => {
     const shareId = newShareId();
     const host = rawClient(`${base}/ws/host?share=${shareId}&secret=${'c'.repeat(32)}`);
     raws.push(host.ws);
@@ -493,10 +554,57 @@ describe('WsSignaling over a mock rendezvous', () => {
     host.ws.send(JSON.stringify({ kind: 'key', viewerId, key: 'AES KEY MATERIAL' }));
 
     await sleep(300);
-    const hostExtra = host.msgs.filter((m) => m['kind'] !== 'host-ready' && m['kind'] !== 'viewer-joined');
-    const viewerExtra = viewer.msgs.filter((m) => m['kind'] !== 'assigned');
+    const allowed = new Set(['host-ready', 'viewer-joined', 'assigned', 'presence', 'chat']);
+    const hostExtra = host.msgs.filter((m) => !allowed.has(String(m['kind'])));
+    const viewerExtra = viewer.msgs.filter((m) => !allowed.has(String(m['kind'])));
     expect(hostExtra).toEqual([]);
     expect(viewerExtra).toEqual([]);
+  });
+
+  it('broadcasts a presence roster on join/hello/leave and stamps chat from the connection', async () => {
+    const shareId = newShareId();
+    const host = rawClient(`${base}/ws/host?share=${shareId}&secret=${'f'.repeat(32)}`);
+    raws.push(host.ws);
+    await waitForMsg(host, 'host-ready');
+
+    const v1 = rawClient(`${base}/ws/viewer?share=${shareId}`);
+    raws.push(v1.ws);
+    const assigned1 = await waitForMsg(v1, 'assigned');
+    const id1 = assigned1['viewerId'] as string;
+    await waitForMsg(host, 'viewer-joined');
+
+    // Presence includes host + viewer after join.
+    const presence1 = await waitForMsg(v1, 'presence');
+    const roster1 = presence1['viewers'] as Array<Record<string, unknown>>;
+    expect(roster1.some((r) => r['role'] === 'host')).toBe(true);
+    expect(roster1.some((r) => r['viewerId'] === id1)).toBe(true);
+
+    // Viewer renames via hello → roster updates for everyone.
+    const beforeHello = host.msgs.length;
+    v1.ws.send(JSON.stringify({ kind: 'hello', name: 'Ada' }));
+    const presence2 = await waitForMsg(host, 'presence', beforeHello);
+    const ada = (presence2['viewers'] as Array<Record<string, unknown>>).find((r) => r['viewerId'] === id1);
+    expect(ada?.['name']).toBe('Ada');
+
+    // Chat: client claims a forged identity; hub stamps the real connection.
+    const beforeChat = host.msgs.length;
+    v1.ws.send(
+      JSON.stringify({
+        kind: 'chat',
+        viewerId: 'forged-id',
+        name: 'Eve',
+        text: 'cGxhaW50ZXh0LWFzLWNpcGhlcnRleHQ=', // opaque base64 blob
+      }),
+    );
+    const chat = await waitForMsg(host, 'chat', beforeChat);
+    expect(chat['viewerId']).toBe(id1); // connection-stamped
+    expect(chat['name']).toBe('Ada'); // live attachment name, not payload
+    expect(chat['role']).toBe('viewer');
+    expect(chat['text']).toBe('cGxhaW50ZXh0LWFzLWNpcGhlcnRleHQ=');
+    // Fan-out: the sender also sees the stamped relay.
+    const chatToV1 = await waitForMsg(v1, 'chat');
+    expect(chatToV1['viewerId']).toBe(id1);
+    expect(chatToV1['name']).toBe('Ada');
   });
 
   it('keeps shares isolated: a viewer-joined on one share is not fanned out to another', async () => {
