@@ -250,8 +250,10 @@ describe('VERSION matches package.json', () => {
       version: string;
     };
     const { VERSION } = await import('../src/version.js');
+    // VERSION must derive from package.json (no hardcoded literal — that only
+    // breaks on every bump; the derive-from-source invariant is the real check).
     expect(VERSION).toBe(pkg.version);
-    expect(pkg.version).toBe('0.2.8');
+    expect(pkg.version).toMatch(/^\d+\.\d+\.\d+$/);
 
     const out: string[] = [];
     const err: string[] = [];
