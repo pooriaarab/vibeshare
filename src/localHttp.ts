@@ -18,7 +18,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { timingSafeEqual } from 'node:crypto';
-import { encryptFrame } from './e2e.js';
+import { encryptFrame } from '@pooriaarab/vibe-core';
 import type { SessionFeed } from './feed.js';
 import type { ViewerRegistry } from './registry.js';
 import { spectatorPage } from './spectatorPage.js';
