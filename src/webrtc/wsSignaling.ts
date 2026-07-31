@@ -18,13 +18,21 @@
  *                    {kind:'viewer-joined', viewerId}
  *                    {kind:'rtc-answer', shareId, viewerId, sdp}
  *                    {kind:'rtc-ice', shareId, viewerId, candidate, mid, from:'viewer'}
+ *                    {kind:'presence', viewers:[{viewerId,name,role}]}
+ *                    {kind:'chat', viewerId, name, role, text, ts}   (text = ciphertext)
  *   server → viewer: {kind:'assigned', viewerId}        (server-minted, unforgeable)
  *                    {kind:'rtc-offer', shareId, viewerId, sdp}
  *                    {kind:'rtc-ice', shareId, viewerId, candidate, mid, from:'host'}
+ *                    {kind:'presence', viewers:[…]}
+ *                    {kind:'chat', viewerId, name, role, text, ts}
  *   host → server:   {kind:'rtc-offer', viewerId, sdp}
  *                    {kind:'rtc-ice', viewerId, candidate, mid}
+ *                    {kind:'hello', name}
+ *                    {kind:'chat', text}                (text = ciphertext)
  *   viewer → server: {kind:'rtc-answer', sdp}
  *                    {kind:'rtc-ice', candidate, mid}
+ *                    {kind:'hello', name}
+ *                    {kind:'chat', text}
  *
  * The server is the identity authority: it mints viewerIds, stamps every
  * relayed frame with the connection's own (shareId, viewerId, from), and
@@ -42,7 +50,14 @@
  */
 import { randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
+import type {
+  ChatRelayFrame,
+  PresenceEntry,
+  PresenceFrame,
+} from '../presenceChat.js';
 import type { SignalingChannel, SignalingFrame, SignalingSide } from './signaling.js';
+
+export type { ChatRelayFrame, PresenceEntry, PresenceFrame };
 
 export interface WsSignalingOptions {
   /**
@@ -52,6 +67,10 @@ export interface WsSignalingOptions {
   readonly url: string;
   /** Socket errors and unexpected drops are reported here (default: ignored). */
   readonly onError?: (error: Error) => void;
+  /** Multi-party presence roster updates (host socket). */
+  readonly onPresence?: (frame: PresenceFrame) => void;
+  /** Multi-party chat lines stamped by the rendezvous (host socket). */
+  readonly onChat?: (frame: ChatRelayFrame) => void;
 }
 
 interface HostConn {
@@ -64,6 +83,8 @@ interface HostConn {
   readonly watchers: Set<(viewerId: string) => void>;
   readonly hostSubs: Map<string, Set<(frame: SignalingFrame) => void>>;
   refs: number;
+  /** Host display name announced via hello (default "host"). */
+  name: string;
 }
 
 interface ViewerConn {
@@ -83,6 +104,8 @@ const OUTBOX_CAP = 256;
 export class WsSignaling implements SignalingChannel {
   readonly #base: string;
   readonly #onError: (error: Error) => void;
+  readonly #onPresence: ((frame: PresenceFrame) => void) | undefined;
+  readonly #onChat: ((frame: ChatRelayFrame) => void) | undefined;
   readonly #hosts = new Map<string, HostConn>();
   readonly #viewers = new Map<string, ViewerConn>();
   /** Viewer-side subscribers registered before their announceViewer call. */
@@ -91,6 +114,27 @@ export class WsSignaling implements SignalingChannel {
   constructor(opts: WsSignalingOptions) {
     this.#base = opts.url.replace(/\/+$/, '');
     this.#onError = opts.onError ?? (() => {});
+    this.#onPresence = opts.onPresence;
+    this.#onChat = opts.onChat;
+  }
+
+  /**
+   * Announce the host display name on a share's host socket (hello frame).
+   * Safe to call before or after watchShare — queued until the socket opens.
+   */
+  setHostName(shareId: string, name: string): void {
+    const conn = this.#hostConn(shareId);
+    conn.name = name.trim().length > 0 ? name.trim().slice(0, 32) : 'host';
+    this.#send(conn, { kind: 'hello', name: conn.name });
+  }
+
+  /**
+   * Send an e2e-encrypted chat ciphertext on the host socket. The rendezvous
+   * stamps sender identity from the connection; `text` must already be
+   * base64(encryptFrame(shareKey, utf8)) — the host client encrypts first.
+   */
+  sendChat(shareId: string, ciphertextB64: string): void {
+    this.#sendHost(shareId, { kind: 'chat', text: ciphertextB64 });
   }
 
   // ------------------------------------------------------- SignalingChannel
@@ -247,11 +291,14 @@ export class WsSignaling implements SignalingChannel {
       watchers: new Set(),
       hostSubs: new Map(),
       refs: 0,
+      name: 'host',
     };
     this.#hosts.set(shareId, conn);
     ws.on('open', () => {
       conn.open = true;
       this.#flush(conn);
+      // Re-announce name after (re)connect so the roster includes the host label.
+      this.#send(conn, { kind: 'hello', name: conn.name });
     });
     ws.on('message', (data: WebSocket.RawData) => this.#onHostMessage(conn, String(data)));
     ws.on('error', (err: Error) => this.#onError(err));
@@ -337,6 +384,16 @@ export class WsSignaling implements SignalingChannel {
           this.#dispatchHost(conn, frame);
           return;
         }
+        case 'presence': {
+          const frame = asPresence(msg);
+          if (frame) this.#onPresence?.(frame);
+          return;
+        }
+        case 'chat': {
+          const frame = asChat(msg);
+          if (frame) this.#onChat?.(frame);
+          return;
+        }
         default:
           return; // unknown shape — ignore
       }
@@ -367,6 +424,11 @@ export class WsSignaling implements SignalingChannel {
           for (const h of conn.viewerSubs) h(frame);
           return;
         }
+        case 'presence':
+        case 'chat':
+          // Viewer-side presence/chat is handled by the browser page over the
+          // same socket; the Node viewer path (tests) ignores them here.
+          return;
         default:
           return; // unknown shape — ignore
       }
@@ -422,4 +484,36 @@ function asIce(msg: Record<string, unknown>, from: SignalingSide): SignalingFram
     return null;
   }
   return { kind: 'rtc-ice', shareId, viewerId, candidate, mid, from };
+}
+
+function asPresence(msg: Record<string, unknown>): PresenceFrame | null {
+  if (msg['kind'] !== 'presence' || !Array.isArray(msg['viewers'])) return null;
+  const viewers: PresenceEntry[] = [];
+  for (const raw of msg['viewers']) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const row = raw as Record<string, unknown>;
+    if (typeof row['viewerId'] !== 'string' || typeof row['name'] !== 'string') continue;
+    const role = row['role'] === 'host' ? 'host' : row['role'] === 'viewer' ? 'viewer' : null;
+    if (!role) continue;
+    viewers.push({ viewerId: row['viewerId'], name: row['name'], role });
+  }
+  return { kind: 'presence', viewers };
+}
+
+function asChat(msg: Record<string, unknown>): ChatRelayFrame | null {
+  if (msg['kind'] !== 'chat') return null;
+  if (typeof msg['viewerId'] !== 'string') return null;
+  if (typeof msg['name'] !== 'string') return null;
+  if (typeof msg['text'] !== 'string') return null;
+  const role = msg['role'] === 'host' ? 'host' : msg['role'] === 'viewer' ? 'viewer' : null;
+  if (!role) return null;
+  const ts = typeof msg['ts'] === 'number' ? msg['ts'] : Date.now();
+  return {
+    kind: 'chat',
+    viewerId: msg['viewerId'],
+    name: msg['name'],
+    role,
+    text: msg['text'],
+    ts,
+  };
 }
