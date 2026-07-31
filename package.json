@@ -1,6 +1,6 @@
 {
   "name": "vibeshare-live",
-  "version": "0.2.3",
+  "version": "0.2.6",
   "description": "Share your live agent coding session by URL — spectate read-only or invite into the session. Local-first: runs on your machine, nothing readable leaves without consent. Part of the Vibe Suite.",
   "license": "MIT",
   "type": "module",
@@ -10,8 +10,8 @@
   "bin": {
     "vibeshare-live": "./dist/cli.js",
     "vibeshare": "./dist/cli.js",
-    "vibeshare-live-mcp": "./dist/mcp.js",
-    "vibeshare-mcp": "./dist/mcp.js"
+    "vibeshare-live-mcp": "./dist/mcp-bin.js",
+    "vibeshare-mcp": "./dist/mcp-bin.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -32,16 +32,20 @@
   ],
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p worker/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
     "@pooriaarab/vibe-core": "^0.4.0",
-    "vibelive": "^0.2.0"
+    "node-datachannel": "^0.32.3",
+    "vibelive": "^0.2.0",
+    "ws": "^8.21.1"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
     "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
     "tsup": "^8.3.0",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
@@ -54,5 +58,6 @@
     "cli",
     "mcp",
     "local-first"
-  ]
+  ],
+  "mcpName": "io.github.pooriaarab/vibeshare-live"
 }

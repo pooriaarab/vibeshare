@@ -61,6 +61,12 @@ export interface ActiveShareRecord {
   readonly hostToken: string;
   readonly pid: number;
   readonly startedAt: string;
+  /**
+   * Which transport serves the share. Absent on records written before
+   * `--public` existed — treat as 'local-http'. 'webrtc' shares have no
+   * local control server (port 0 / empty token): `stop` signals their pid.
+   */
+  readonly transport?: 'local-http' | 'webrtc';
 }
 
 function sharesDir(): string {

@@ -5,21 +5,12 @@
  */
 import type { Share } from './types.js';
 
-export function spectatorPage(share: Share): string {
-  const config = JSON.stringify({
-    id: share.id,
-    name: share.name,
-    access: share.access,
-  }).replace(/</g, '\\u003c');
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vibeshare · ${escapeHtml(share.name)}</title>
-<style>
-  :root{ --bg:#0a0b0f; --panel:#12141a; --panel-2:#171a22; --panel-3:#1d2129;
+/**
+ * The shared terminal-view stylesheet: dark panel, mono feed, line classes
+ * (`stderr` / `milestone` / `system`). Reused verbatim by the P2P viewer page
+ * (`src/webrtc/viewerPage.ts`) so both views look and render the same.
+ */
+export const SPECTATOR_CSS = `:root{ --bg:#0a0b0f; --panel:#12141a; --panel-2:#171a22; --panel-3:#1d2129;
     --border:rgba(255,255,255,.08); --border-2:rgba(255,255,255,.14);
     --text:#edeef3; --dim:#9aa0b2; --faint:#666c7c; --cyan:#67e8f9;
     --violet:#c4b5fd; --green:#7ee787; --red:#ff8b85;
@@ -75,7 +66,23 @@ export function spectatorPage(share: Share): string {
   .join-btn:hover{ background:#453a78; }
   .join-btn.pending{ background:var(--panel-3); border-color:var(--border-2); color:var(--dim); }
   .join-btn.joined{ background:rgba(126,231,135,.12); border-color:rgba(126,231,135,.4); color:var(--green); }
-  .hidden{ display:none !important; }
+  .hidden{ display:none !important; }`;
+
+export function spectatorPage(share: Share): string {
+  const config = JSON.stringify({
+    id: share.id,
+    name: share.name,
+    access: share.access,
+  }).replace(/</g, '\\u003c');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibeshare · ${escapeHtml(share.name)}</title>
+<style>
+  ${SPECTATOR_CSS}
 </style>
 </head>
 <body>

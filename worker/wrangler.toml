@@ -1,0 +1,36 @@
+name = "vibeshare-signaling"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# Durable Object: one ShareRoom per shareId does per-share signaling fan-out.
+# Top-level binding is what `wrangler dev` (local) uses. Named environments
+# below redeclare it — wrangler does not inherit durable_objects into envs.
+[[durable_objects.bindings]]
+name = "SHARES"
+class_name = "ShareRoom"
+
+# Migrations are top-level and shared across every environment.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ShareRoom"]
+
+# --- staging: auto-deploys from `main` (staging.getvibe.dev) --------------
+[env.staging]
+name = "vibeshare-signaling-staging"
+routes = [
+  { pattern = "staging.getvibe.dev/vibeshare/*", zone_name = "getvibe.dev" },
+]
+[[env.staging.durable_objects.bindings]]
+name = "SHARES"
+class_name = "ShareRoom"
+
+# --- production: auto-deploys from `release` (getvibe.dev) ----------------
+# Path route /vibeshare/* overrides the getvibe.dev Pages site on that path only.
+[env.production]
+name = "vibeshare-signaling-production"
+routes = [
+  { pattern = "getvibe.dev/vibeshare/*", zone_name = "getvibe.dev" },
+]
+[[env.production.durable_objects.bindings]]
+name = "SHARES"
+class_name = "ShareRoom"
