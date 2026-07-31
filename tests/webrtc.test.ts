@@ -168,19 +168,24 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     expect(key.length).toBe(32);
 
     feed.publish('before connect', { stream: 'stdout' });
+    feed.publishRaw(Buffer.from('raw-bytes', 'utf8'));
+    feed.publishResize(100, 30);
 
     let received!: Promise<Array<Record<string, unknown>>>;
     const viewer = connect(signaling, share.id, 'viewer-1', (dc) => {
-      received = collectEntries(dc, key, 3);
+      received = collectEntries(dc, key, 5);
     });
     await viewer.opened;
     feed.publish('live one');
     feed.publish('live two');
 
     const entries = await received;
-    expect(entries.map((e) => e['text'])).toEqual(['before connect', 'live one', 'live two']);
-    expect(entries.map((e) => e['seq'])).toEqual([1, 2, 3]);
-    expect(entries[0]).toMatchObject({ stream: 'stdout', type: 'output' });
+    expect(entries.map((e) => e['seq'])).toEqual([1, 2, 3, 4, 5]);
+    expect(entries[0]).toMatchObject({ stream: 'stdout', type: 'output', text: 'before connect' });
+    expect(entries[1]).toMatchObject({ type: 'raw' });
+    expect(Buffer.from(String(entries[1]!['data']), 'base64').toString('utf8')).toBe('raw-bytes');
+    expect(entries[2]).toMatchObject({ type: 'resize', cols: 100, rows: 30 });
+    expect(entries.map((e) => e['text']).filter(Boolean)).toEqual(['before connect', 'live one', 'live two']);
     feed.close();
   });
 

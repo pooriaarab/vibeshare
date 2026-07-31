@@ -335,6 +335,8 @@ describe('WsSignaling over a mock rendezvous', () => {
     const key = keyFromUrl(url);
 
     feed.publish('before connect', { stream: 'stdout' });
+    feed.publishRaw(Buffer.from('raw-bytes', 'utf8'));
+    feed.publishResize(90, 28);
 
     const received = new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
       const entries: Array<Record<string, unknown>> = [];
@@ -349,7 +351,7 @@ describe('WsSignaling over a mock rendezvous', () => {
             reject(err instanceof Error ? err : new Error(String(err)));
             return;
           }
-          if (entries.length >= 3) {
+          if (entries.length >= 5) {
             clearTimeout(timer);
             resolve(entries);
           }
@@ -359,8 +361,12 @@ describe('WsSignaling over a mock rendezvous', () => {
     });
 
     const entries = await received;
-    expect(entries.map((e) => e['text'])).toEqual(['before connect', 'live one', 'live two']);
-    expect(entries.map((e) => e['seq'])).toEqual([1, 2, 3]);
+    expect(entries.map((e) => e['seq'])).toEqual([1, 2, 3, 4, 5]);
+    expect(entries[0]).toMatchObject({ type: 'output', text: 'before connect' });
+    expect(entries[1]).toMatchObject({ type: 'raw' });
+    expect(Buffer.from(String(entries[1]!['data']), 'base64').toString('utf8')).toBe('raw-bytes');
+    expect(entries[2]).toMatchObject({ type: 'resize', cols: 90, rows: 28 });
+    expect(entries.map((e) => e['text']).filter(Boolean)).toEqual(['before connect', 'live one', 'live two']);
     feed.close();
   });
 
