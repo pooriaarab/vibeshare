@@ -72,3 +72,42 @@ export function pruneRateLimitMap(
     else if (pruned.length !== stamps.length) map.set(ip, pruned);
   }
 }
+
+/**
+ * Hard ceiling on a share's storage lifetime from last host activity.
+ * Alarm wipes DO storage (hostSecret etc.) so shares don't grow forever.
+ */
+export const MAX_SHARE_LIFE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * After the host leaves with no viewers remaining, reclaim storage shortly
+ * instead of waiting for the hard ceiling.
+ */
+export const ABANDONED_CLEANUP_MS = 60_000;
+
+/** Next hard-deadline timestamp after host connect / activity. */
+export function hostActivityDeadline(now: number, maxShareLifeMs: number = MAX_SHARE_LIFE_MS): number {
+  return now + maxShareLifeMs;
+}
+
+/** Short cleanup deadline after an abandoned host leave. */
+export function abandonedCleanupDeadline(
+  now: number,
+  abandonedMs: number = ABANDONED_CLEANUP_MS,
+): number {
+  return now + abandonedMs;
+}
+
+/**
+ * Earliest alarm time among candidate deadlines (ignores nullish / non-finite).
+ * Returns null when there is nothing to schedule.
+ */
+export function earliestAlarm(...candidates: Array<number | null | undefined>): number | null {
+  let best: number | null = null;
+  for (const c of candidates) {
+    if (typeof c !== 'number' || !Number.isFinite(c)) continue;
+    if (best === null || c < best) best = c;
+  }
+  return best;
+}
+
