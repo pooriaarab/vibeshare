@@ -46,7 +46,11 @@ export async function startProcessTunnel(params: StartProcessTunnelOpts): Promis
 
   const child = spawnImpl(params.command, [...params.args], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: params.env ? { ...process.env, ...params.env } : process.env,
+    env: {
+      ...process.env,
+      ...(params.env ?? {}),
+      ...(params.opts?.env ?? {}),
+    },
     shell: params.shell ?? false,
   }) as TunnelChildProcess;
 

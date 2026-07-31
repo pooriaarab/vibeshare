@@ -30,6 +30,11 @@ export interface TunnelStartOpts {
    * frp provider when `FRP_SERVER_ADDR` is not set.
    */
   readonly serverAddr?: string;
+  /**
+   * Extra env vars for the child process (e.g. `NGROK_AUTHTOKEN`). Merged over
+   * `process.env`. Secrets here are never logged by vibeshare.
+   */
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 /**

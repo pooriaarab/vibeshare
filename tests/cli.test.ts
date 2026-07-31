@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { CliUsageError, parseArgv, run } from '../src/cli.js';
+import { CliUsageError, parseArgv, run, runCommand } from '../src/cli.js';
 import { tempHome } from './helpers.js';
 
 describe('parseArgv', () => {
@@ -13,6 +13,7 @@ describe('parseArgv', () => {
         host: '127.0.0.1',
         yes: false,
         public: false,
+        tunnel: false,
         command: [],
       },
     });
@@ -34,6 +35,7 @@ describe('parseArgv', () => {
         name: 'demo',
         yes: true,
         public: false,
+        tunnel: false,
         command: [],
       },
     });
@@ -50,6 +52,19 @@ describe('parseArgv', () => {
     expect(parseArgv(['--signaling', 'wss://example.com/vibeshare'])).toMatchObject({
       options: { public: false, signaling: 'wss://example.com/vibeshare' },
     });
+  });
+
+  it('parses --tunnel (cascade) and --tunnel <name>', () => {
+    expect(parseArgv(['--tunnel'])).toMatchObject({ cmd: 'start', options: { tunnel: true, public: false } });
+    expect(parseArgv(['--tunnel', 'ngrok'])).toMatchObject({
+      cmd: 'start',
+      options: { tunnel: 'ngrok' },
+    });
+    expect(parseArgv(['--tunnel', 'cloudflared', '--yes'])).toMatchObject({
+      options: { tunnel: 'cloudflared', yes: true },
+    });
+    // --tunnel followed by another flag = cascade
+    expect(parseArgv(['--tunnel', '--yes'])).toMatchObject({ options: { tunnel: true, yes: true } });
   });
 
   it('takes the shared command after --', () => {
@@ -124,6 +139,7 @@ describe('run (with an isolated VIBESHARE_HOME)', () => {
     const h = io();
     expect(await run(['--help'], h.io)).toBe(0);
     expect(h.out.join()).toContain('vibeshare viewers');
+    expect(h.out.join()).toContain('--tunnel');
   });
 
   it('usage errors exit 2 with help on stderr', async () => {
@@ -167,5 +183,62 @@ describe('run (with an isolated VIBESHARE_HOME)', () => {
     process.env['VIBESHARE_HOME'] = home.dir;
     const c = io();
     expect(await run(['stop'], c.io)).toBe(1);
+  });
+
+  it('--tunnel against a mocked provider prints public URL#key and stops the handle', async () => {
+    home = tempHome();
+    process.env['VIBESHARE_HOME'] = home.dir;
+    const c = io();
+
+    let stopCalls = 0;
+    let startedPort = 0;
+    const mockRegistry = {
+      async resolve(preferred?: string) {
+        expect(preferred).toBe('mock-tunnel');
+        return {
+          name: 'mock-tunnel',
+          async start(port: number) {
+            startedPort = port;
+            expect(port).toBeGreaterThan(0);
+            return {
+              url: 'https://mock.example.tunnel',
+              async stop() {
+                stopCalls++;
+              },
+            };
+          },
+        };
+      },
+    };
+
+    const cmd = parseArgv(['--tunnel', 'mock-tunnel', '--yes', '--', 'echo', 'hello-tunnel']);
+    expect(cmd.cmd).toBe('start');
+    if (cmd.cmd !== 'start') throw new Error('expected start');
+    cmd.options.tunnelRegistry = mockRegistry;
+
+    const code = await runCommand(cmd, c.io);
+    expect(code).toBe(0);
+
+    const printed = c.out.join('\n');
+    expect(printed).toMatch(
+      /url:\s+https:\/\/mock\.example\.tunnel\/s\/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+/,
+    );
+    expect(printed).toContain('provider: mock-tunnel');
+    expect(printed).toContain('end-to-end encrypted');
+    expect(startedPort).toBeGreaterThan(0);
+    expect(stopCalls).toBe(1);
+    // No secrets in output.
+    expect(printed.toLowerCase()).not.toContain('authtoken');
+  });
+
+  it('--public and --tunnel together exit 2', async () => {
+    home = tempHome();
+    process.env['VIBESHARE_HOME'] = home.dir;
+    const c = io();
+    const cmd = parseArgv(['--public', '--tunnel', '--yes', '--', 'echo', 'x']);
+    if (cmd.cmd !== 'start') throw new Error('expected start');
+    // parseArgv allows both flags; startShare rejects the combination.
+    expect(await runCommand(cmd, c.io)).toBe(2);
+    expect(c.err.join()).toMatch(/mutually exclusive/i);
   });
 });

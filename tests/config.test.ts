@@ -5,6 +5,7 @@ import {
   DEFAULT_SIGNALING_URL,
   readConfigFile,
   resolveSignalingUrl,
+  resolveTunnelConfig,
 } from '../src/config.js';
 import { tempHome } from './helpers.js';
 
@@ -63,7 +64,7 @@ describe('readConfigFile', () => {
     expect(readConfigFile(file)).toEqual({ signalingUrl: 'wss://mine.example/vibeshare' });
   });
 
-  it('passes the slice-3 tunnel placeholder through verbatim', () => {
+  it('parses the tunnel config shape (provider + account)', () => {
     const tunnel = { provider: 'ngrok', account: { ngrok: { authtoken: 'secret' } } };
     const file = write(JSON.stringify({ signalingUrl: 'wss://mine.example/vibeshare', tunnel }));
     expect(readConfigFile(file)).toEqual({ signalingUrl: 'wss://mine.example/vibeshare', tunnel });
@@ -80,5 +81,80 @@ describe('readConfigFile', () => {
   it('ignores unknown fields', () => {
     const file = write(JSON.stringify({ signalingUrl: 'wss://mine.example/vibeshare', future: true }));
     expect(readConfigFile(file)).toEqual({ signalingUrl: 'wss://mine.example/vibeshare' });
+  });
+});
+
+describe('resolveTunnelConfig', () => {
+  it('cascade when flag is true / empty (no preferred provider)', () => {
+    expect(resolveTunnelConfig({ flag: true }).provider).toBeUndefined();
+    expect(resolveTunnelConfig({ flag: '' }).provider).toBeUndefined();
+    expect(resolveTunnelConfig({}).provider).toBeUndefined();
+  });
+
+  it('precedence: flag > env > file > cascade', () => {
+    const file = { tunnel: { provider: 'file-prov' } };
+    expect(resolveTunnelConfig({ file }).provider).toBe('file-prov');
+    expect(resolveTunnelConfig({ file, env: 'env-prov' }).provider).toBe('env-prov');
+    expect(resolveTunnelConfig({ file, env: 'env-prov', flag: 'flag-prov' }).provider).toBe('flag-prov');
+    // explicit cascade flag wins over env/file (user said --tunnel with no name)
+    expect(resolveTunnelConfig({ file, env: 'env-prov', flag: true }).provider).toBeUndefined();
+  });
+
+  it('maps ngrok authtoken from env and file into startOpts.env', () => {
+    const fromEnv = resolveTunnelConfig({
+      flag: 'ngrok',
+      processEnv: { NGROK_AUTHTOKEN: 'env-secret' },
+    });
+    expect(fromEnv.startOpts.env?.['NGROK_AUTHTOKEN']).toBe('env-secret');
+
+    const fromFile = resolveTunnelConfig({
+      flag: 'ngrok',
+      file: { tunnel: { account: { ngrok: { authtoken: 'file-secret' } } } },
+      processEnv: {},
+    });
+    expect(fromFile.startOpts.env?.['NGROK_AUTHTOKEN']).toBe('file-secret');
+
+    // env wins over file
+    const both = resolveTunnelConfig({
+      flag: 'ngrok',
+      file: { tunnel: { account: { ngrok: { token: 'file-secret' } } } },
+      processEnv: { NGROK_AUTHTOKEN: 'env-secret' },
+    });
+    expect(both.startOpts.env?.['NGROK_AUTHTOKEN']).toBe('env-secret');
+  });
+
+  it('resolves frp serverAddr from env / endpoint / account', () => {
+    expect(
+      resolveTunnelConfig({
+        flag: 'frp',
+        processEnv: { FRP_SERVER_ADDR: 'env.example:7000' },
+      }).startOpts.serverAddr,
+    ).toBe('env.example:7000');
+
+    expect(
+      resolveTunnelConfig({
+        flag: 'frp',
+        file: { tunnel: { endpoint: 'file.example:7000' } },
+        processEnv: {},
+      }).startOpts.serverAddr,
+    ).toBe('file.example:7000');
+
+    expect(
+      resolveTunnelConfig({
+        flag: 'frp',
+        file: { tunnel: { account: { frp: { serverAddr: 'acct.example:7000' } } } },
+        processEnv: {},
+      }).startOpts.serverAddr,
+    ).toBe('acct.example:7000');
+  });
+
+  it('resolves hostname from file / cloudflared account', () => {
+    expect(
+      resolveTunnelConfig({
+        flag: 'cloudflared',
+        file: { tunnel: { hostname: 'share.example.com' } },
+        processEnv: {},
+      }).startOpts.hostname,
+    ).toBe('share.example.com');
   });
 });
