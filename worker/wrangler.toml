@@ -1,0 +1,21 @@
+name = "vibeshare-signaling"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+# One Durable Object per shareId does per-share fan-out.
+[[durable_objects.bindings]]
+name = "SHARES"
+class_name = "ShareRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ShareRoom"]
+
+# ---------------------------------------------------------------------------
+# DEPLOY (the human owns the Cloudflare account — do NOT deploy from CI/agents):
+# uncomment the route so getvibe.dev/vibeshare/* hits this Worker, then
+# `npm run deploy`.
+#
+# routes = [
+#   { pattern = "getvibe.dev/vibeshare/*", zone_name = "getvibe.dev" },
+# ]

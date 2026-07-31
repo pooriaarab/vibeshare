@@ -114,8 +114,8 @@ function collectEntries(
   });
 }
 
-function sendInput(dc: DataChannel, key: Buffer, data: string): void {
-  dc.sendMessageBinary(encryptFrame(key, Buffer.from(JSON.stringify({ kind: 'input', data }), 'utf8')));
+function sendInput(dc: DataChannel, key: Buffer, data: string, seq: number): void {
+  dc.sendMessageBinary(encryptFrame(key, Buffer.from(JSON.stringify({ kind: 'input', data, seq }), 'utf8')));
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -204,12 +204,12 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     expect(viewers.canWrite(participant.id)).toBe(true);
 
     const specDc = await connect(signaling, share.id, spectator.id).opened;
-    sendInput(specDc, key, 'spectator was here');
+    sendInput(specDc, key, 'spectator was here', 1);
     await sleep(250);
     expect(inputs).toEqual([]); // gated out by canWrite, silently
 
     const partDc = await connect(signaling, share.id, participant.id).opened;
-    sendInput(partDc, key, 'ls -la');
+    sendInput(partDc, key, 'ls -la', 1);
     await vi.waitFor(() => {
       expect(inputs).toEqual([{ shareId: share.id, viewerId: participant.id, data: 'ls -la' }]);
     });
@@ -245,7 +245,7 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     viewers.approve(participant.id);
 
     const dc = await connect(signaling, share.id, participant.id).opened;
-    const good = encryptFrame(key, Buffer.from(JSON.stringify({ kind: 'input', data: 'real input' }), 'utf8'));
+    const good = encryptFrame(key, Buffer.from(JSON.stringify({ kind: 'input', data: 'real input', seq: 1 }), 'utf8'));
     const bad = Buffer.from(good);
     bad[14] = bad[14]! ^ 0xff;
 
@@ -257,6 +257,52 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     await vi.waitFor(() => {
       expect(inputs).toEqual([{ shareId: share.id, viewerId: participant.id, data: 'real input' }]);
     });
+    feed.close();
+  });
+
+  it('anti-replay: duplicate, out-of-order, and seq-less input frames are dropped', async () => {
+    transport = new WebRtcTransport({
+      signaling,
+      onInput: (shareId, viewerId, data) => inputs.push({ shareId, viewerId, data }),
+    });
+
+    const share = makeShare('invite');
+    const feed = new SessionFeed();
+    const viewers = new ViewerRegistry(() => share.access);
+    const url = await transport.serve(share, feed, viewers);
+    const key = keyFromUrl(url);
+
+    const participant = viewers.add('Part');
+    viewers.requestJoin(participant.id);
+    viewers.approve(participant.id);
+
+    const dc = await connect(signaling, share.id, participant.id).opened;
+    const raw = (payload: Record<string, unknown>) =>
+      dc.sendMessageBinary(encryptFrame(key, Buffer.from(JSON.stringify(payload), 'utf8')));
+
+    // A legit frame lands and advances the watermark.
+    sendInput(dc, key, 'first', 1);
+    await vi.waitFor(() => {
+      expect(inputs.map((i) => i.data)).toEqual(['first']);
+    });
+
+    // Replay of the exact same seq is dropped (what a captured-ciphertext
+    // replay would look like after decrypt), as is an older seq.
+    sendInput(dc, key, 'first again', 1);
+    sendInput(dc, key, 'older', 0);
+    // A frame with no seq at all (legacy/forged) is dropped too.
+    raw({ kind: 'input', data: 'no seq' });
+    await sleep(250);
+    expect(inputs.map((i) => i.data)).toEqual(['first']);
+
+    // The watermark only moves forward: a fresh seq applies exactly once.
+    sendInput(dc, key, 'second', 2);
+    sendInput(dc, key, 'second replay', 2);
+    await vi.waitFor(() => {
+      expect(inputs.map((i) => i.data)).toEqual(['first', 'second']);
+    });
+    await sleep(250);
+    expect(inputs.map((i) => i.data)).toEqual(['first', 'second']);
     feed.close();
   });
 

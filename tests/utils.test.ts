@@ -11,6 +11,15 @@ describe('newShareId', () => {
     const ids = new Set(Array.from({ length: 2000 }, () => newShareId()));
     expect(ids.size).toBe(2000);
   });
+
+  it('is the single canonical definition (utils.js), not duplicated in url.js', async () => {
+    // Audit finding: url.ts and utils.ts used to BOTH define newShareId with
+    // different entropy. utils.ts is canonical; url.ts must not re-grow one.
+    const urlModule = await import('../src/url.js');
+    expect('newShareId' in urlModule).toBe(false);
+    const indexModule = await import('../src/index.js');
+    expect(indexModule.newShareId).toBe(newShareId);
+  });
 });
 
 describe('newToken', () => {

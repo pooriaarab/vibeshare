@@ -26,11 +26,26 @@ import { ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
 import type { CreateShareOptions } from './types.js';
 
 export { FileConsentStore, loadLedger, vibeHome } from './consent.js';
+export {
+  DEFAULT_SIGNALING_URL,
+  SIGNALING_ENV,
+  readConfigFile,
+  resolveSignaling,
+  resolveSignalingUrl,
+  type SignalingSources,
+  type TunnelConfig,
+  type VibeShareConfig,
+} from './config.js';
 export { SessionFeed, type PublishOptions } from './feed.js';
 export { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.js';
 export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, type ShareManagerDeps } from './manager.js';
 export { ViewerRegistry } from './registry.js';
-export { spectatorPage } from './spectatorPage.js';
+export { SPECTATOR_CSS, spectatorPage } from './spectatorPage.js';
+export type { SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
+export { LoopbackSignaling } from './webrtc/signaling.js';
+export { decryptFrame, encryptFrame, WebRtcTransport, type ViewerInputFrame, type WebRtcTransportOptions } from './webrtc/transport.js';
+export { viewerPage } from './webrtc/viewerPage.js';
+export { WsSignaling, type WsSignalingOptions } from './webrtc/wsSignaling.js';
 export type { ShareTransport } from './transport.js';
 export {
   ShareError,

@@ -12,6 +12,7 @@ describe('parseArgv', () => {
         port: 0,
         host: '127.0.0.1',
         yes: false,
+        public: false,
         command: [],
       },
     });
@@ -32,8 +33,22 @@ describe('parseArgv', () => {
         host: '0.0.0.0',
         name: 'demo',
         yes: true,
+        public: false,
         command: [],
       },
+    });
+  });
+
+  it('parses --public and --signaling', () => {
+    expect(parseArgv(['--public'])).toMatchObject({ cmd: 'start', options: { public: true } });
+    const cmd = parseArgv(['--public', '--signaling', 'ws://localhost:8787/vibeshare']);
+    expect(cmd).toMatchObject({
+      cmd: 'start',
+      options: { public: true, signaling: 'ws://localhost:8787/vibeshare' },
+    });
+    // --signaling without --public is accepted (it just has no effect locally)
+    expect(parseArgv(['--signaling', 'wss://example.com/vibeshare'])).toMatchObject({
+      options: { public: false, signaling: 'wss://example.com/vibeshare' },
     });
   });
 
@@ -71,6 +86,7 @@ describe('parseArgv', () => {
       ['--port', '99999'],
       ['--expire'],
       ['--pass'],
+      ['--signaling'],
       ['viewers', '--approve'],
       ['viewers', '--approve', 'a', '--kick', 'b'],
       ['viewers', '--bogus'],

@@ -6,6 +6,9 @@
  * thing that grants access, so it must be unguessable. The human-facing host is
  * vibeshare's own domain (`vibeshare.stream`); the actual transport is the
  * local/LAN ws relay owned by vibelive, which the URL only *represents*.
+ *
+ * Ids are minted by `newShareId` in `./utils.js` — the single canonical
+ * implementation (an earlier duplicate here diverged in shape and entropy).
  */
 
 /**
@@ -18,23 +21,6 @@ export const SHARE_ORIGIN = 'https://vibeshare.stream';
 
 /** Path prefix for share links: `<origin>/s/<id>`. */
 export const SHARE_PATH_PREFIX = '/s/';
-
-/**
- * Mint an unguessable capability id. Uses the platform CSPRNG (`crypto.randomUUID`,
- * 122 bits of entropy) so a link is a genuine capability — guessing it is
- * infeasible, which is the whole basis of the access model.
- */
-export function newShareId(): string {
-  // globalThis.crypto.randomUUID is available on Node 18+ and in modern runtimes.
-  // Avoids a Node-specific `node:crypto` import so this stays runtime-portable.
-  const uuid = globalThis.crypto?.randomUUID?.();
-  if (uuid) return uuid;
-  // Fallback (older runtimes): stitch 256 bits of randomness into a uuid-ish id.
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
 
 /**
  * Build the human-facing share URL for a capability id.

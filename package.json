@@ -32,17 +32,20 @@
   ],
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p worker/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
     "@pooriaarab/vibe-core": "^0.4.0",
     "node-datachannel": "^0.32.3",
-    "vibelive": "^0.2.0"
+    "vibelive": "^0.2.0",
+    "ws": "^8.21.1"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
     "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
     "tsup": "^8.3.0",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
