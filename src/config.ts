@@ -11,14 +11,14 @@
  *   ~/.vibeshare/config.json  →  { "signalingUrl": "…" }
  *   built-in default  (getvibe.dev)
  *
- * The config file is designed to grow: slice 3's tunnel-provider settings
- * drop into the same file under `tunnel` (see {@link TunnelConfig}) without
- * changing anything here. Secrets (e.g. an ngrok authtoken) live in this
+ * Tunnel-provider settings live in the same file under `tunnel` (see
+ * {@link TunnelConfig}). Secrets (e.g. an ngrok authtoken) live in this
  * file only and are never logged.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { vibeHome } from './consent.js';
+import type { TunnelStartOpts } from './tunnel/provider.js';
 
 /** Default rendezvous: the getvibe.dev signaling Worker (ws base URL). */
 export const DEFAULT_SIGNALING_URL = 'wss://getvibe.dev/vibeshare';
@@ -26,26 +26,59 @@ export const DEFAULT_SIGNALING_URL = 'wss://getvibe.dev/vibeshare';
 /** Env var that overrides the signaling endpoint (below the CLI flag). */
 export const SIGNALING_ENV = 'VIBESHARE_SIGNALING';
 
+/** Env var that pins the tunnel provider (below the CLI `--tunnel` flag). */
+export const TUNNEL_PROVIDER_ENV = 'VIBESHARE_TUNNEL';
+
+/** Env var carrying an ngrok authtoken (below config-file account.ngrok.authtoken). */
+export const NGROK_AUTHTOKEN_ENV = 'NGROK_AUTHTOKEN';
+
+/** Env var for a self-hosted frp server address. */
+export const FRP_SERVER_ADDR_ENV = 'FRP_SERVER_ADDR';
+
 /**
- * Slice-3 placeholder — NOT implemented yet. Documents the shape the tunnel
- * provider registry will read from the same config file: which provider
- * carries the viewer page/signaling when the host is behind NAT, plus the
- * per-provider account material (cloudflare credentials, an ngrok
- * `authtoken`, a tailscale tailnet, or a fully self-hosted endpoint).
+ * Per-provider account material under `tunnel.account` in config.json.
+ * All fields optional; only the provider in use is read. Never logged.
+ */
+export interface TunnelAccountConfig {
+  /** ngrok: `{ "authtoken": "…" }` (also accepted as `token`). */
+  readonly ngrok?: { readonly authtoken?: string; readonly token?: string };
+  /** tailscale: optional funnel hostname / tailnet tag. */
+  readonly tailscale?: { readonly hostname?: string };
+  /** cloudflared named tunnel hostname. */
+  readonly cloudflare?: { readonly hostname?: string };
+  /** cloudflared alias (same keys as cloudflare). */
+  readonly cloudflared?: { readonly hostname?: string };
+  /** self-hosted / frp server address (`host` or `host:port`). */
+  readonly frp?: { readonly serverAddr?: string; readonly hostname?: string };
+  /** self-hosted alias for frp. */
+  readonly ['self-hosted']?: { readonly serverAddr?: string; readonly endpoint?: string };
+  /** Catch-all so unknown provider keys pass through without validation. */
+  readonly [provider: string]: Record<string, string> | undefined;
+}
+
+/**
+ * Tunnel settings from `~/.vibeshare/config.json` (and env). All fields
+ * optional — missing config falls through to the detect-cascade.
  */
 export interface TunnelConfig {
-  readonly provider?: 'cloudflare' | 'ngrok' | 'tailscale' | 'self-hosted';
-  /** Per-provider account material, keyed by provider (e.g. `{ ngrok: { authtoken } }`). */
-  readonly account?: Record<string, Record<string, string>>;
-  /** Self-hosted endpoint override (provider: "self-hosted"). */
+  /** Preferred provider name (default = cascade via TunnelRegistry.resolve()). */
+  readonly provider?: string;
+  /** Per-provider account material, keyed by provider name. Never logged. */
+  readonly account?: TunnelAccountConfig;
+  /**
+   * Self-hosted endpoint override (e.g. frp server addr). Also accepted as
+   * `account.frp.serverAddr` / `FRP_SERVER_ADDR`.
+   */
   readonly endpoint?: string;
+  /** Preferred public hostname for named tunnels (cloudflared / tailscale). */
+  readonly hostname?: string;
 }
 
 /** The parsed contents of `~/.vibeshare/config.json` (all fields optional). */
 export interface VibeShareConfig {
   /** Signaling rendezvous base ws URL for `--public` (default getvibe.dev). */
   readonly signalingUrl?: string;
-  /** Reserved for slice 3 — see {@link TunnelConfig}. Unimplemented. */
+  /** Tunnel provider settings for `vibeshare --tunnel`. */
   readonly tunnel?: TunnelConfig;
 }
 
@@ -54,7 +87,7 @@ export interface VibeShareConfig {
  * missing file, invalid JSON, or wrong-typed fields all yield `{}` rather
  * than throwing — a broken config must never block `vibeshare` from starting
  * with built-in defaults. Unknown fields are ignored; nothing here is logged
- * (the file may carry slice-3 secrets).
+ * (the file may carry secrets).
  */
 export function readConfigFile(file = join(vibeHome(), 'config.json')): VibeShareConfig {
   try {
@@ -66,14 +99,37 @@ export function readConfigFile(file = join(vibeHome(), 'config.json')): VibeShar
     if (typeof raw['signalingUrl'] === 'string' && raw['signalingUrl'].trim().length > 0) {
       config.signalingUrl = raw['signalingUrl'];
     }
-    if (typeof raw['tunnel'] === 'object' && raw['tunnel'] !== null && !Array.isArray(raw['tunnel'])) {
-      // Passed through verbatim — slice 3 owns validation of the shape.
-      config.tunnel = raw['tunnel'] as TunnelConfig;
-    }
+    const tunnel = parseTunnelConfig(raw['tunnel']);
+    if (tunnel) config.tunnel = tunnel;
     return config;
   } catch {
     return {};
   }
+}
+
+function parseTunnelConfig(raw: unknown): TunnelConfig | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const t = raw as Record<string, unknown>;
+  const out: {
+    provider?: string;
+    account?: TunnelAccountConfig;
+    endpoint?: string;
+    hostname?: string;
+  } = {};
+  if (typeof t['provider'] === 'string' && t['provider'].trim().length > 0) {
+    out.provider = t['provider'].trim();
+  }
+  if (typeof t['endpoint'] === 'string' && t['endpoint'].trim().length > 0) {
+    out.endpoint = t['endpoint'].trim();
+  }
+  if (typeof t['hostname'] === 'string' && t['hostname'].trim().length > 0) {
+    out.hostname = t['hostname'].trim();
+  }
+  if (typeof t['account'] === 'object' && t['account'] !== null && !Array.isArray(t['account'])) {
+    // Passed through as a string→string map bag; providers pull what they need.
+    out.account = t['account'] as TunnelAccountConfig;
+  }
+  return Object.keys(out).length > 0 ? out : {};
 }
 
 /** The sources {@link resolveSignalingUrl} consults, in precedence order. */
@@ -101,4 +157,118 @@ export function resolveSignalingUrl(sources: SignalingSources): string {
 /** Convenience for the CLI: resolve from real flag/env/config-file inputs. */
 export function resolveSignaling(flag?: string): string {
   return resolveSignalingUrl({ flag, env: process.env[SIGNALING_ENV], file: readConfigFile() });
+}
+
+/** Sources {@link resolveTunnelConfig} consults, in precedence order. */
+export interface TunnelSources {
+  /**
+   * `--tunnel` / `--tunnel <name>` CLI flag.
+   * - `true` / `''`  → cascade (no preferred name)
+   * - `'ngrok'`      → that provider
+   * - `undefined`    → tunnel mode off (caller decides)
+   */
+  readonly flag?: string | true | undefined;
+  /** `VIBESHARE_TUNNEL` env var (provider name). */
+  readonly env?: string | undefined;
+  /** Parsed config file. */
+  readonly file?: VibeShareConfig | undefined;
+  /** Live process env (for NGROK_AUTHTOKEN / FRP_SERVER_ADDR). Defaults to process.env. */
+  readonly processEnv?: NodeJS.ProcessEnv | undefined;
+}
+
+/** Resolved tunnel knobs ready to go on a provider.start() call. */
+export interface ResolvedTunnel {
+  /**
+   * Preferred provider name, or `undefined` to run the detect-cascade.
+   * Present only when flag/env/file pinned one.
+   */
+  readonly provider?: string;
+  /** Options passed straight into `provider.start(port, opts)`. */
+  readonly startOpts: TunnelStartOpts;
+}
+
+/**
+ * Resolve tunnel provider + start opts from flag > env > file > defaults.
+ * Pure w.r.t. the sources object — secrets in `startOpts.env` are never
+ * stringified by this function.
+ *
+ * Precedence for the provider name: CLI flag > VIBESHARE_TUNNEL > config
+ * `tunnel.provider` > cascade (undefined).
+ *
+ * Account material (authtoken, frp server, hostname) lands in startOpts so
+ * providers can pick it up without reading the config file themselves.
+ */
+export function resolveTunnelConfig(sources: TunnelSources): ResolvedTunnel {
+  const env = sources.processEnv ?? process.env;
+  const fileTunnel = sources.file?.tunnel;
+
+  let provider: string | undefined;
+  if (sources.flag === true || sources.flag === '') {
+    provider = undefined; // explicit cascade
+  } else if (typeof sources.flag === 'string' && sources.flag.trim().length > 0) {
+    provider = sources.flag.trim();
+  } else if (typeof sources.env === 'string' && sources.env.trim().length > 0) {
+    provider = sources.env.trim();
+  } else if (typeof fileTunnel?.provider === 'string' && fileTunnel.provider.trim().length > 0) {
+    provider = fileTunnel.provider.trim();
+  }
+
+  const account = fileTunnel?.account;
+  const startOpts: {
+    hostname?: string;
+    serverAddr?: string;
+    env?: NodeJS.ProcessEnv;
+  } = {};
+
+  // hostname: file-level first, then per-provider account.
+  const hostname =
+    nonEmpty(fileTunnel?.hostname) ??
+    nonEmpty(account?.cloudflared?.hostname) ??
+    nonEmpty(account?.cloudflare?.hostname) ??
+    nonEmpty(account?.tailscale?.hostname);
+  if (hostname) startOpts.hostname = hostname;
+
+  // frp / self-hosted server: env > file endpoint > account.frp > account.self-hosted
+  const serverAddr =
+    nonEmpty(env[FRP_SERVER_ADDR_ENV]) ??
+    nonEmpty(fileTunnel?.endpoint) ??
+    nonEmpty(account?.frp?.serverAddr) ??
+    nonEmpty(account?.frp?.hostname) ??
+    nonEmpty(account?.['self-hosted']?.serverAddr) ??
+    nonEmpty(account?.['self-hosted']?.endpoint);
+  if (serverAddr) startOpts.serverAddr = serverAddr;
+
+  // ngrok authtoken: env > account.ngrok.authtoken|token
+  const ngrokToken =
+    nonEmpty(env[NGROK_AUTHTOKEN_ENV]) ??
+    nonEmpty(account?.ngrok?.authtoken) ??
+    nonEmpty(account?.ngrok?.token);
+  if (ngrokToken) {
+    startOpts.env = { NGROK_AUTHTOKEN: ngrokToken };
+  }
+
+  const resolved: ResolvedTunnel = { startOpts };
+  if (provider !== undefined) (resolved as { provider: string }).provider = provider;
+  // Only include startOpts keys that actually got set.
+  const cleanOpts: TunnelStartOpts = {};
+  if (startOpts.hostname !== undefined) (cleanOpts as { hostname: string }).hostname = startOpts.hostname;
+  if (startOpts.serverAddr !== undefined) (cleanOpts as { serverAddr: string }).serverAddr = startOpts.serverAddr;
+  if (startOpts.env !== undefined) (cleanOpts as { env: NodeJS.ProcessEnv }).env = startOpts.env;
+  return { ...resolved, startOpts: cleanOpts };
+}
+
+/** Convenience for the CLI: resolve from real flag/env/config-file inputs. */
+export function resolveTunnel(flag?: string | true): ResolvedTunnel {
+  return resolveTunnelConfig({
+    flag,
+    env: process.env[TUNNEL_PROVIDER_ENV],
+    file: readConfigFile(),
+    processEnv: process.env,
+  });
+}
+
+function nonEmpty(v: string | undefined): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim();
+  return t.length > 0 ? t : undefined;
 }

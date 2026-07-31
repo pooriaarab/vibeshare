@@ -66,7 +66,7 @@ export interface ActiveShareRecord {
    * `--public` existed — treat as 'local-http'. 'webrtc' shares have no
    * local control server (port 0 / empty token): `stop` signals their pid.
    */
-  readonly transport?: 'local-http' | 'webrtc';
+  readonly transport?: 'local-http' | 'webrtc' | 'tunnel';
 }
 
 function sharesDir(): string {

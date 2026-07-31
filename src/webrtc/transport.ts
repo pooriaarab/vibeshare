@@ -18,45 +18,20 @@
  * only an approved collaborator's input reaches `onInput`. Anything that
  * fails GCM authentication is dropped before it can yield plaintext.
  */
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { PeerConnection, type DataChannel } from 'node-datachannel';
+import { decryptFrame, encryptFrame, E2E_KEY_LEN } from '../e2e.js';
 import type { SessionFeed } from '../feed.js';
 import type { ViewerRegistry } from '../registry.js';
 import type { ShareTransport } from '../transport.js';
 import type { FeedEntry, Share, Viewer } from '../types.js';
 import type { SignalingChannel } from './signaling.js';
 
-const KEY_LEN = 32;
-const NONCE_LEN = 12;
-const TAG_LEN = 16;
+/** Re-export the shared e2e wire format so slice-1 imports keep working. */
+export { decryptFrame, encryptFrame } from '../e2e.js';
 
 /** Default base for share URLs — the public viewer page host. */
 const DEFAULT_BASE_URL = 'https://getvibe.dev/vibeshare';
-
-/**
- * Encrypt one DataChannel frame: `nonce ‖ ciphertext ‖ GCM tag`, with a
- * fresh random nonce per frame. Exported so viewer-side code (and tests)
- * share exactly one wire format.
- */
-export function encryptFrame(key: Buffer, plaintext: Buffer): Buffer {
-  const nonce = randomBytes(NONCE_LEN);
-  const cipher = createCipheriv('aes-256-gcm', key, nonce);
-  return Buffer.concat([nonce, cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
-}
-
-/**
- * Decrypt one DataChannel frame. Throws on truncation, a wrong key, or any
- * tampering — GCM authentication failure yields no plaintext, ever.
- */
-export function decryptFrame(key: Buffer, frame: Buffer): Buffer {
-  if (frame.length < NONCE_LEN + TAG_LEN) throw new Error('webrtc frame too short');
-  const nonce = frame.subarray(0, NONCE_LEN);
-  const ciphertext = frame.subarray(NONCE_LEN, frame.length - TAG_LEN);
-  const tag = frame.subarray(frame.length - TAG_LEN);
-  const decipher = createDecipheriv('aes-256-gcm', key, nonce);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-}
 
 /** A collaborator input frame (viewer → host), decrypted from a DataChannel message. */
 export interface ViewerInputFrame {
@@ -132,7 +107,7 @@ export class WebRtcTransport implements ShareTransport {
       // A second serve would orphan the first share's peers + listeners.
       throw new Error(`share ${share.id} is already being served`);
     }
-    const key = randomBytes(KEY_LEN);
+    const key = randomBytes(E2E_KEY_LEN);
     const ctx: ShareContext = {
       share,
       feed,

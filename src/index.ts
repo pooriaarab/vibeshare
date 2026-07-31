@@ -29,21 +29,30 @@ export { FileConsentStore, loadLedger, vibeHome } from './consent.js';
 export {
   DEFAULT_SIGNALING_URL,
   SIGNALING_ENV,
+  TUNNEL_PROVIDER_ENV,
+  NGROK_AUTHTOKEN_ENV,
+  FRP_SERVER_ADDR_ENV,
   readConfigFile,
   resolveSignaling,
   resolveSignalingUrl,
+  resolveTunnel,
+  resolveTunnelConfig,
+  type ResolvedTunnel,
   type SignalingSources,
+  type TunnelAccountConfig,
   type TunnelConfig,
+  type TunnelSources,
   type VibeShareConfig,
 } from './config.js';
 export { SessionFeed, type PublishOptions } from './feed.js';
 export { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.js';
 export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, type ShareManagerDeps } from './manager.js';
 export { ViewerRegistry } from './registry.js';
-export { SPECTATOR_CSS, spectatorPage } from './spectatorPage.js';
+export { SPECTATOR_CSS, spectatorPage, type SpectatorPageOptions } from './spectatorPage.js';
 export type { SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
 export { LoopbackSignaling } from './webrtc/signaling.js';
-export { decryptFrame, encryptFrame, WebRtcTransport, type ViewerInputFrame, type WebRtcTransportOptions } from './webrtc/transport.js';
+export { decryptFrame, encryptFrame, E2E_KEY_LEN, E2E_NONCE_LEN, E2E_TAG_LEN } from './e2e.js';
+export { WebRtcTransport, type ViewerInputFrame, type WebRtcTransportOptions } from './webrtc/transport.js';
 export { viewerPage } from './webrtc/viewerPage.js';
 export { WsSignaling, type WsSignalingOptions } from './webrtc/wsSignaling.js';
 export type { ShareTransport } from './transport.js';
@@ -60,6 +69,13 @@ export {
   type ViewerRole,
 } from './types.js';
 export { hashPassphrase, newShareId, newToken, parseExpiry, verifyPassphrase } from './utils.js';
+export {
+  createTunnelRegistry,
+  TunnelRegistry,
+  type TunnelHandle,
+  type TunnelProvider,
+  type TunnelStartOpts,
+} from './tunnel/index.js';
 export { VERSION } from './version.js';
 
 let defaultManager: ShareManager | null = null;
