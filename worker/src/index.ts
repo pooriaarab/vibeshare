@@ -17,8 +17,10 @@
  *   - the host authenticates with a host-secret it minted when the share was
  *     created; the first secret presented for a share is bound durably and
  *     later host connections must match (viewers never see it);
- *   - the relay is a whitelist: ONLY rtc-offer / rtc-answer / rtc-ice with
- *     the expected string fields are forwarded, reconstructed server-side.
+ *   - the relay is a whitelist: rtc-offer / rtc-answer / rtc-ice (point-to-point
+ *     handshake) plus presence / hello / chat (multi-party hub frames).
+ *     Chat TEXT is end-to-end ciphertext — the Worker never decrypts it.
+ *     Sender identity on chat is STAMPED from the connection attachment.
  *     Keys, session bytes, and every other frame shape are dropped.
  *
  * Availability / isolation hardening (see ./limits.ts for tunable constants):
@@ -35,6 +37,13 @@
  *   GET /vibeshare/ws/viewer?share=<id>            → viewer socket
  *   GET /vibeshare/health                          → liveness
  */
+// Pure helpers only — no Node Buffer / crypto (Worker-safe).
+import {
+  buildPresenceRoster,
+  defaultPresenceName,
+  sanitizePresenceName,
+  stampChatRelay,
+} from '../../src/presenceChat.js';
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
 import {
   MAX_VIEWERS,
@@ -103,6 +112,8 @@ interface Attachment {
   readonly role: 'host' | 'viewer';
   readonly shareId: string;
   readonly viewerId?: string;
+  /** Display name from a hello frame (sanitized); may be empty until hello. */
+  readonly name?: string;
   /** Epoch ms when this viewer socket connected (for no-host timeout). */
   readonly connectedAt?: number;
 }
@@ -175,12 +186,17 @@ export class ShareRoom implements DurableObject {
         const att = ws.deserializeAttachment() as Attachment | null;
         if (att?.role === 'host') ws.close(1012, 'host reconnected');
       }
-      server.serializeAttachment({ role: 'host', shareId } satisfies Attachment);
+      server.serializeAttachment({
+        role: 'host',
+        shareId,
+        name: 'host',
+      } satisfies Attachment);
       this.ctx.acceptWebSocket(server);
       server.send(JSON.stringify({ kind: 'host-ready' }));
       // Hard ceiling on storage life; reset on every host connect so a live
       // long share isn't wiped. alarm() re-arms while the host is still up.
       await this.ctx.storage.setAlarm(hostActivityDeadline(now));
+      this.broadcastPresence();
     } else {
       // The Worker ASSIGNS the viewerId — the viewer never chooses one.
       const viewerId = crypto.randomUUID();
@@ -188,6 +204,7 @@ export class ShareRoom implements DurableObject {
         role: 'viewer',
         shareId,
         viewerId,
+        name: defaultPresenceName('viewer', viewerId),
         connectedAt: now,
       } satisfies Attachment);
       this.ctx.acceptWebSocket(server);
@@ -199,6 +216,7 @@ export class ShareRoom implements DurableObject {
         // No host yet: schedule a reject so a guessed id doesn't hold a socket.
         await this.ensureViewerHostWaitAlarm(now);
       }
+      this.broadcastPresence();
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -216,8 +234,8 @@ export class ShareRoom implements DurableObject {
     }
     if (typeof parsed !== 'object' || parsed === null) return;
     const msg = parsed as Record<string, unknown>;
-    if (att.role === 'host') this.relayFromHost(att, msg);
-    else if (att.viewerId !== undefined) this.relayFromViewer(att, att.viewerId, msg);
+    if (att.role === 'host') this.relayFromHost(ws, att, msg);
+    else if (att.viewerId !== undefined) this.relayFromViewer(ws, att, att.viewerId, msg);
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
@@ -234,7 +252,10 @@ export class ShareRoom implements DurableObject {
       if (remaining === 0) {
         await this.ctx.storage.setAlarm(abandonedCleanupDeadline(Date.now()));
       }
+      return;
     }
+    // Viewer left: rebroadcast roster so remaining peers drop the name.
+    if (att?.role === 'viewer') this.broadcastPresence();
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
@@ -296,8 +317,10 @@ export class ShareRoom implements DurableObject {
 
   // ------------------------------------------------------------- relay
 
-  /** Host → one viewer. The host addresses a viewer; the share is its own. */
-  private relayFromHost(att: Attachment, msg: Record<string, unknown>): void {
+  /** Host → one viewer (rtc) or multi-party (hello/chat). */
+  private relayFromHost(ws: WebSocket, att: Attachment, msg: Record<string, unknown>): void {
+    if (this.handlePresenceChat(ws, att, msg)) return;
+
     const viewerId = msg['viewerId'];
     if (typeof viewerId !== 'string') return;
     const viewer = this.viewerSocket(viewerId);
@@ -321,8 +344,15 @@ export class ShareRoom implements DurableObject {
     // anything else: dropped — the relay is a whitelist.
   }
 
-  /** Viewer → host. Identity is stamped from the CONNECTION, never the payload. */
-  private relayFromViewer(att: Attachment, viewerId: string, msg: Record<string, unknown>): void {
+  /** Viewer → host (rtc) or multi-party (hello/chat). Identity from CONNECTION. */
+  private relayFromViewer(
+    ws: WebSocket,
+    att: Attachment,
+    viewerId: string,
+    msg: Record<string, unknown>,
+  ): void {
+    if (this.handlePresenceChat(ws, att, msg, viewerId)) return;
+
     const host = this.hostSocket();
     if (!host) return;
     if (msg['kind'] === 'rtc-answer' && typeof msg['sdp'] === 'string') {
@@ -340,6 +370,77 @@ export class ShareRoom implements DurableObject {
           from: 'viewer',
         }),
       );
+    }
+  }
+
+  /**
+   * Multi-party hub frames (hello / chat / presence). Returns true when the
+   * message was handled (so rtc relay should not also try it).
+   */
+  private handlePresenceChat(
+    ws: WebSocket,
+    att: Attachment,
+    msg: Record<string, unknown>,
+    connectionViewerId?: string,
+  ): boolean {
+    if (msg['kind'] === 'hello') {
+      const name =
+        sanitizePresenceName(msg['name']) ||
+        defaultPresenceName(att.role, connectionViewerId ?? att.viewerId ?? 'host');
+      // Update THIS socket's attachment so the next roster picks up the name.
+      const next: Attachment = {
+        role: att.role,
+        shareId: att.shareId,
+        name,
+        ...(att.viewerId !== undefined ? { viewerId: att.viewerId } : {}),
+        ...(att.connectedAt !== undefined ? { connectedAt: att.connectedAt } : {}),
+      };
+      ws.serializeAttachment(next);
+      this.broadcastPresence();
+      return true;
+    }
+
+    if (msg['kind'] === 'chat') {
+      const viewerId =
+        att.role === 'host' ? 'host' : (connectionViewerId ?? att.viewerId ?? '');
+      if (viewerId.length === 0) return true; // drop, handled
+      // Live attachment may have a fresher name than the message-time snapshot.
+      const live = ws.deserializeAttachment() as Attachment | null;
+      const liveName = live?.name ?? att.name ?? '';
+      const stamped = stampChatRelay({
+        viewerId,
+        name: liveName,
+        role: att.role,
+        text: msg['text'],
+      });
+      if (!stamped) return true; // bad ciphertext — drop
+      // Discard any client-supplied identity: reconstruct server-side only.
+      this.broadcastAll(stamped);
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Fan a presence roster snapshot to every connected socket. */
+  private broadcastPresence(): void {
+    const attachments: Attachment[] = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att) attachments.push(att);
+    }
+    const viewers = buildPresenceRoster(attachments);
+    this.broadcastAll({ kind: 'presence', viewers });
+  }
+
+  private broadcastAll(frame: unknown): void {
+    const text = JSON.stringify(frame);
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(text);
+      } catch {
+        // socket already closing
+      }
     }
   }
 
