@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pooriaarab/vibeshare-live",
+  "description": "Share a live agent coding session by URL. Spectate or invite in.",
+  "version": "0.2.4",
+  "repository": {
+    "url": "https://github.com/pooriaarab/vibeshare",
+    "source": "github",
+    "id": "1312340827"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "vibeshare-live",
+      "version": "0.2.4",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "subcommand",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

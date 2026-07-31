@@ -22,9 +22,21 @@ import {
   writeActiveShare,
   type ActiveShareRecord,
 } from './consent.js';
+import { resolveSignaling } from './config.js';
 import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
+import { startMcp } from './mcp.js';
+import type { ShareTransport } from './transport.js';
 import { VERSION } from './version.js';
+import { WebRtcTransport } from './webrtc/transport.js';
+import { WsSignaling } from './webrtc/wsSignaling.js';
+
+/**
+ * ICE server used for `--public` shares (and baked into the viewer page).
+ * Needed for NAT traversal across the internet; local/LAN peers work without
+ * it. Loopback tests pass `iceServers: []` and never touch it.
+ */
+const DEFAULT_STUN_SERVER = 'stun:stun.l.google.com:19302';
 
 // ---------------------------------------------------------------- parsing
 
@@ -36,6 +48,10 @@ export interface StartOptions {
   host: string;
   name?: string;
   yes: boolean;
+  /** Share peer-to-peer over WebRTC via the signaling rendezvous. */
+  public: boolean;
+  /** `--signaling <url>` override for the rendezvous (see src/config.ts). */
+  signaling?: string;
   command: string[];
 }
 
@@ -43,6 +59,7 @@ export type CliCommand =
   | { cmd: 'start'; options: StartOptions }
   | { cmd: 'stop'; share?: string }
   | { cmd: 'viewers'; share?: string; approve?: string; deny?: string; kick?: string; json: boolean }
+  | { cmd: 'mcp' }
   | { cmd: 'help' }
   | { cmd: 'version' };
 
@@ -65,8 +82,13 @@ options:
   --invite          viewers may request to join as collaborators
   --expire <when>   1h, 24h, 7d, … or "stop" (default: until you stop)
   --pass <phrase>   require a passphrase to watch
-  --port <n>        port to serve on (default: random)
-  --host <addr>     bind address (default: 127.0.0.1; 0.0.0.0 shares on LAN)
+  --public          share peer-to-peer over WebRTC; viewers watch in a browser
+                    at https://getvibe.dev/vibeshare/s/<id>#<key> (end-to-end
+                    encrypted — only the handshake crosses the rendezvous)
+  --signaling <url> signaling rendezvous for --public (default wss://getvibe.dev/vibeshare;
+                    also VIBESHARE_SIGNALING or ~/.vibeshare/config.json signalingUrl)
+  --port <n>        port to serve on (default: random; local shares only)
+  --host <addr>     bind address (default: 127.0.0.1; 0.0.0.0 shares on LAN; local only)
   --name <label>    what to call the session
   --yes, -y         grant share:session consent without prompting
   --json            machine-readable output (viewers)
@@ -113,6 +135,7 @@ export function parseArgv(argv: string[]): CliCommand {
     if (actions > 1) throw new CliUsageError('use only one of --approve / --deny / --kick');
     return out;
   }
+  if (sub === 'mcp') return { cmd: 'mcp' };
   if (sub === 'start') rest.shift();
 
   // Default: start.
@@ -122,6 +145,7 @@ export function parseArgv(argv: string[]): CliCommand {
     port: 0,
     host: '127.0.0.1',
     yes: false,
+    public: false,
     command: [],
   };
   for (let i = 0; i < rest.length; i++) {
@@ -136,6 +160,8 @@ export function parseArgv(argv: string[]): CliCommand {
       break;
     } else if (a === '--spectate') options.access = 'spectate';
     else if (a === '--invite') options.access = 'invite';
+    else if (a === '--public') options.public = true;
+    else if (a === '--signaling') options.signaling = value(a);
     else if (a === '--expire' || a === '--expiry') options.expiry = value(a);
     else if (a === '--pass') options.passphrase = value(a);
     else if (a === '--port') {
@@ -240,14 +266,35 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   const watcher = watchCwd(process.cwd(), bus);
 
   let created: CreatedShare | null = null;
-  const transport = new LocalHttpTransport({
-    host: options.host,
-    port: options.port,
-    onStopRequested: () => {
-      // `vibeshare stop` from another process → shut this one down.
-      shutdown(0);
-    },
-  });
+  // --public: pure-P2P over WebRTC — session bytes go host→viewer on an
+  // AES-GCM DataChannel; only the handshake crosses the signaling rendezvous
+  // (getvibe.dev by default, or BYO via --signaling / VIBESHARE_SIGNALING /
+  // config file). Default: the local HTTP spectator server (unchanged).
+  let transport: ShareTransport;
+  let localHttp: LocalHttpTransport | null = null;
+  if (options.public) {
+    const signalingUrl = resolveSignaling(options.signaling);
+    transport = new WebRtcTransport({
+      signaling: new WsSignaling({
+        url: signalingUrl,
+        onError: (e) => io.err(`[vibeshare] signaling: ${e.message}`),
+      }),
+      iceServers: [DEFAULT_STUN_SERVER],
+      // The viewer page is served by the rendezvous itself at /vibeshare/s/<id>
+      // — the share URL is the ws endpoint with an http(s) scheme.
+      baseUrl: signalingUrl.replace(/^ws/, 'http'),
+    });
+  } else {
+    localHttp = new LocalHttpTransport({
+      host: options.host,
+      port: options.port,
+      onStopRequested: () => {
+        // `vibeshare stop` from another process → shut this one down.
+        shutdown(0);
+      },
+    });
+    transport = localHttp;
+  }
   const manager = new ShareManager({ consent: loadLedger(), transport });
 
   try {
@@ -278,22 +325,24 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   const record: ActiveShareRecord = {
     id: created.share.id,
     url: created.url,
-    port: transport.port,
-    hostToken: transport.hostToken,
+    port: localHttp?.port ?? 0,
+    hostToken: localHttp?.hostToken ?? '',
     pid: process.pid,
     startedAt: new Date().toISOString(),
+    transport: options.public ? 'webrtc' : 'local-http',
   };
   writeActiveShare(record);
 
-  const loopback = options.host === '127.0.0.1' || options.host === 'localhost' || options.host === '::1';
+  const loopback = !options.public && (options.host === '127.0.0.1' || options.host === 'localhost' || options.host === '::1');
   io.out(`${badge(loopback ? 'local' : 'p2p')}`);
   io.out(`  sharing:  ${created.share.name}`);
   io.out(`  url:      ${created.url}`);
   io.out(`  access:   ${created.share.access}${created.share.access === 'spectate' ? ' (read-only)' : ' (viewers may request to join)'}`);
   io.out(`  expires:  ${created.share.expiresAt ?? 'until you stop'}`);
   if (created.share.passphraseHash) io.out(`  pass:     required`);
+  if (options.public) io.out(`  mode:     public · end-to-end encrypted p2p (only the handshake crosses the rendezvous)`);
   io.out(`  manage:   vibeshare viewers · vibeshare stop`);
-  if (!loopback) io.err('note: bound to a non-loopback address — anyone who can reach this host with the link can watch.');
+  if (!loopback && !options.public) io.err('note: bound to a non-loopback address — anyone who can reach this host with the link can watch.');
 
   // Spawn the session being shared and tee its output into the feed.
   const cmd = options.command.length > 0 ? options.command : [process.env['SHELL'] ?? '/bin/sh'];
@@ -408,6 +457,18 @@ async function viewersCommand(
   const record = resolveRecord(cmd.share, io);
   if (!record) return 1;
 
+  // --public shares have no local control server: viewers connect p2p to the
+  // host and the registry lives only in the sharing process's memory.
+  if (record.transport === 'webrtc') {
+    if (cmd.approve !== undefined || cmd.deny !== undefined || cmd.kick !== undefined) {
+      io.err('vibeshare: approve/deny/kick is not available for --public shares yet (collaborator approval over p2p lands in a later slice)');
+      return 1;
+    }
+    io.out(`${record.url}`);
+    io.out('  public p2p share — viewers connect end-to-end encrypted; live viewer management is only available for local shares');
+    return 0;
+  }
+
   const action = cmd.approve !== undefined ? 'approve' : cmd.deny !== undefined ? 'deny' : cmd.kick !== undefined ? 'kick' : null;
   const target = cmd.approve ?? cmd.deny ?? cmd.kick;
 
@@ -463,6 +524,18 @@ async function viewersCommand(
 async function stopCommand(cmd: Extract<CliCommand, { cmd: 'stop' }>, io: IO): Promise<number> {
   const record = resolveRecord(cmd.share, io);
   if (!record) return 1;
+  // --public shares have no control server to POST to: signal the process.
+  if (record.transport === 'webrtc') {
+    try {
+      process.kill(record.pid, 'SIGTERM');
+      clearActiveShare(record.id);
+      io.out(`✓ stopped ${record.url}`);
+    } catch {
+      clearActiveShare(record.id);
+      io.err('vibeshare: the share process was not running (record cleaned up)');
+    }
+    return 0;
+  }
   const res = await controlFetch<{ stopped: string }>(record, '/control/stop', {
     method: 'POST',
     body: { share: record.id },
@@ -497,6 +570,9 @@ export async function run(argv: string[], io: IO = stdio): Promise<number> {
       return 0;
     case 'version':
       io.out(`vibeshare ${VERSION}`);
+      return 0;
+    case 'mcp':
+      await startMcp();
       return 0;
     case 'start':
       return startShare(command.options, io);
