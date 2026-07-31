@@ -9,11 +9,11 @@
  * The share runs on your machine only: the consent ledger (@pooriaarab/vibe-core)
  * gates every share, and the spectator stream is served straight from here.
  */
-import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import * as pty from 'node-pty';
 import {
   badge,
   createHookBus,
@@ -277,31 +277,6 @@ async function ensureConsent(io: IO, yes: boolean): Promise<boolean> {
   }
 }
 
-/** Split a stream chunk into complete lines; keeps the tail for next time. */
-function lineBuffer(publish: (line: string) => void): { push(chunk: string): void; flush(): void } {
-  let buf = '';
-  return {
-    push(chunk: string) {
-      buf += chunk;
-      let idx: number;
-      while ((idx = buf.indexOf('\n')) !== -1) {
-        publish(buf.slice(0, idx).replace(/\r$/, ''));
-        buf = buf.slice(idx + 1);
-      }
-      if (buf.length > 8192) {
-        publish(buf);
-        buf = '';
-      }
-    },
-    flush() {
-      if (buf.length > 0) {
-        publish(buf);
-        buf = '';
-      }
-    },
-  };
-}
-
 async function startShare(options: StartOptions, io: IO): Promise<number> {
   if (options.public && options.tunnel) {
     io.err('vibeshare: --public and --tunnel are mutually exclusive');
@@ -441,31 +416,67 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   io.out(`  manage:   vibeshare viewers · vibeshare stop`);
   if (!loopback && !options.public && !tunnelOn) io.err('note: bound to a non-loopback address — anyone who can reach this host with the link can watch.');
 
-  // Spawn the session being shared and tee its output into the feed.
+  // Spawn the session in a real PTY so interactive TUIs (Claude Code / Codex)
+  // render their full terminal UI. Raw bytes (ANSI included) go into the feed;
+  // viewers reconstruct via xterm.js.
   const cmd = options.command.length > 0 ? options.command : [process.env['SHELL'] ?? '/bin/sh'];
-  const child = spawn(cmd[0]!, cmd.slice(1), {
-    stdio: ['inherit', 'pipe', 'pipe'],
-    env: process.env,
+  const cols = process.stdout.columns || 80;
+  const rows = process.stdout.rows || 24;
+  let ptyProcess: pty.IPty;
+  try {
+    ptyProcess = pty.spawn(cmd[0]!, cmd.slice(1), {
+      name: 'xterm-256color',
+      cols,
+      rows,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    io.err(`vibeshare: could not start ${cmd[0]!}: ${msg}`);
+    watcher.stop();
+    clearActiveShare(record.id);
+    await manager.stopAll();
+    if (tunnelHandle) {
+      try { await tunnelHandle.stop(); } catch { /* best effort */ }
+      tunnelHandle = null;
+    }
+    return 2;
+  }
+
+  // Initial size so late viewers can term.resize before replaying bytes.
+  created.feed.publishResize(cols, rows);
+
+  // Tee PTY output to the host terminal and the ordered raw-byte feed.
+  ptyProcess.onData((data) => {
+    process.stdout.write(data);
+    created?.feed.publishRaw(data);
   });
-  const outLines = lineBuffer((l) => created?.feed.publish(l, { stream: 'stdout' }));
-  const errLines = lineBuffer((l) => created?.feed.publish(l, { stream: 'stderr' }));
-  child.stdout?.on('data', (d: Buffer) => {
-    process.stdout.write(d);
-    outLines.push(d.toString('utf8'));
-  });
-  child.stderr?.on('data', (d: Buffer) => {
-    process.stderr.write(d);
-    errLines.push(d.toString('utf8'));
-  });
+
+  // Host stdin → PTY so the host user still drives the session normally.
+  const stdin = process.stdin;
+  const wasRaw = stdin.isTTY ? stdin.isRaw : false;
+  if (stdin.isTTY) {
+    try { stdin.setRawMode(true); } catch { /* non-tty pipes */ }
+  }
+  stdin.resume();
+  const onStdin = (chunk: Buffer | string): void => {
+    try { ptyProcess.write(typeof chunk === 'string' ? chunk : chunk.toString('utf8')); } catch { /* closed */ }
+  };
+  stdin.on('data', onStdin);
+
+  const onWinch = (): void => {
+    const c = process.stdout.columns || 80;
+    const r = process.stdout.rows || 24;
+    try { ptyProcess.resize(c, r); } catch { /* closed */ }
+    created?.feed.publishResize(c, r);
+  };
+  process.on('SIGWINCH', onWinch);
 
   let shuttingDown = false;
   const exitCode = await new Promise<number>((resolve) => {
-    child.on('error', (err) => {
-      io.err(`vibeshare: could not start ${cmd[0]!}: ${err.message}`);
-      resolve(2);
-    });
-    child.on('exit', (code, signal) => {
-      resolve(code ?? (signal !== null ? 128 : 0));
+    ptyProcess.onExit(({ exitCode: code, signal }) => {
+      resolve(typeof code === 'number' ? code : (signal ? 128 : 0));
     });
     process.on('SIGINT', () => shutdown(130));
     process.on('SIGTERM', () => shutdown(143));
@@ -473,15 +484,18 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
     function shutdown(code: number): void {
       if (shuttingDown) return;
       shuttingDown = true;
-      child.kill('SIGTERM');
+      try { ptyProcess.kill(); } catch { /* already gone */ }
       resolve(code);
     }
     // Expose to onStopRequested above.
     shutdownRef = shutdown;
   });
 
-  outLines.flush();
-  errLines.flush();
+  process.off('SIGWINCH', onWinch);
+  stdin.off('data', onStdin);
+  if (stdin.isTTY) {
+    try { stdin.setRawMode(wasRaw); } catch { /* ignore */ }
+  }
   watcher.stop();
   clearActiveShare(record.id);
   await manager.stopAll();
