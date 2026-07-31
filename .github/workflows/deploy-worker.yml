@@ -14,14 +14,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Gate on token presence
+        id: gate
+        run: |
+          if [ -n "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::CLOUDFLARE_API_TOKEN not set — skipping Worker deploy. Add the secret to enable auto-deploy."
+          fi
       - uses: actions/setup-node@v4
+        if: steps.gate.outputs.have == 'true'
         with:
           node-version: '20'
       - name: Install worker deps
+        if: steps.gate.outputs.have == 'true'
         run: npm install
         working-directory: worker
       - name: Deploy staging (main)
-        if: github.ref == 'refs/heads/main'
+        if: steps.gate.outputs.have == 'true' && github.ref == 'refs/heads/main'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -29,7 +40,7 @@ jobs:
           workingDirectory: worker
           command: deploy --env staging
       - name: Deploy production (release)
-        if: github.ref == 'refs/heads/release'
+        if: steps.gate.outputs.have == 'true' && github.ref == 'refs/heads/release'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
