@@ -18,6 +18,8 @@ export default defineConfig({
   target: 'node18',
   outDir: 'dist',
   sourcemap: false,
+  // Native addons must stay external (node-pty, node-datachannel).
+  external: ['node-pty', 'node-datachannel'],
   // Bake package.json version into the bundle so --version can never drift.
   define: {
     __VIBESHARE_VERSION__: JSON.stringify(version),
