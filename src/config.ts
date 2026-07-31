@@ -18,7 +18,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { vibeHome } from './consent.js';
-import type { TunnelStartOpts } from './tunnel/provider.js';
+import type { TunnelStartOpts } from '@pooriaarab/vibe-core';
 
 /** Default rendezvous: the getvibe.dev signaling Worker (ws base URL). */
 export const DEFAULT_SIGNALING_URL = 'wss://getvibe.dev/vibeshare';

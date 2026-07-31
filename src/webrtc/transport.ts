@@ -20,7 +20,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { PeerConnection, type DataChannel } from 'node-datachannel';
-import { decryptFrame, encryptFrame, E2E_KEY_LEN } from '../e2e.js';
+import { decryptFrame, encryptFrame, E2E_KEY_LEN } from '@pooriaarab/vibe-core';
 import type { SessionFeed } from '../feed.js';
 import type { ViewerRegistry } from '../registry.js';
 import type { ShareTransport } from '../transport.js';
@@ -28,7 +28,7 @@ import type { FeedEntry, Share, Viewer } from '../types.js';
 import type { SignalingChannel } from './signaling.js';
 
 /** Re-export the shared e2e wire format so slice-1 imports keep working. */
-export { decryptFrame, encryptFrame } from '../e2e.js';
+export { decryptFrame, encryptFrame } from '@pooriaarab/vibe-core';
 
 /** Default base for share URLs — the public viewer page host. */
 const DEFAULT_BASE_URL = 'https://getvibe.dev/vibeshare';

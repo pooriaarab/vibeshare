@@ -14,7 +14,15 @@ import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { badge, createHookBus, parseConfirm, watchCwd, type TriggerKind } from '@pooriaarab/vibe-core';
+import {
+  badge,
+  createHookBus,
+  createTunnelRegistry,
+  E2E_KEY_LEN,
+  parseConfirm,
+  watchCwd,
+  type TriggerKind,
+} from '@pooriaarab/vibe-core';
 import {
   clearActiveShare,
   listActiveShares,
@@ -24,12 +32,10 @@ import {
   type ActiveShareRecord,
 } from './consent.js';
 import { resolveSignaling, resolveTunnel } from './config.js';
-import { E2E_KEY_LEN } from './e2e.js';
 import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
 import { startMcp } from './mcp.js';
 import type { ShareTransport } from './transport.js';
-import { createTunnelRegistry } from './tunnel/index.js';
 import { VERSION } from './version.js';
 import { WebRtcTransport } from './webrtc/transport.js';
 import { WsSignaling } from './webrtc/wsSignaling.js';
