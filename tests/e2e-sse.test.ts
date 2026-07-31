@@ -92,6 +92,10 @@ describe('LocalHttpTransport e2e SSE mode', () => {
     expect(html).toContain('AES-GCM');
     expect(html).toContain('location.hash');
     expect(html).toContain('"e2e":true');
+    // xterm.js is inlined (CSP-safe) — no CDN script tags.
+    expect(html).toContain('new Terminal');
+    expect(html).toMatch(/\.xterm[^{]*\{/); // xterm CSS present
+    expect(html).not.toMatch(/src=["']https?:\/\//);
     // And the pure helper produces the same shape.
     expect(spectatorPage(created.share, { e2e: true })).toContain('tunnel · end-to-end encrypted');
     expect(spectatorPage(created.share)).not.toContain('tunnel · end-to-end encrypted');
@@ -100,31 +104,31 @@ describe('LocalHttpTransport e2e SSE mode', () => {
   it('encrypts SSE entry payloads; WebCrypto-shaped decrypt recovers JSON', async () => {
     const created = await manager.createShare();
     created.feed.publish('secret line', { stream: 'stdout' });
+    created.feed.publishRaw(Buffer.from('\x1b[32mGREEN\x1b[0m', 'utf8'));
+    created.feed.publishResize(100, 30);
 
     const v = await join(created);
     expect(v.status).toBe(200);
     const stream = await fetch(`${v.url}/stream?token=${v.body['token']}`);
     expect(stream.status).toBe(200);
 
-    const events = await readSse(stream, (ev) => ev.filter((e) => e.event === 'entry').length >= 2);
+    const events = await readSse(stream, (ev) => ev.filter((e) => e.event === 'entry').length >= 4);
     const entries = events.filter((e) => e.event === 'entry');
-    expect(entries.length).toBeGreaterThanOrEqual(2);
+    expect(entries.length).toBeGreaterThanOrEqual(4);
 
-    for (const ev of entries) {
+    const decoded = entries.map((ev) => {
       // Must NOT be plaintext JSON.
       expect(() => JSON.parse(ev.data)).toThrow();
-      // Must be standard base64 of an AES-GCM frame.
       const frame = Buffer.from(ev.data, 'base64');
       const plain = webCryptoShapedDecrypt(key, frame);
-      const obj = JSON.parse(plain.toString('utf8')) as { text?: string };
-      expect(typeof obj.text).toBe('string');
-    }
-
-    const texts = entries.map((ev) => {
-      const plain = decryptFrame(key, Buffer.from(ev.data, 'base64'));
-      return (JSON.parse(plain.toString('utf8')) as { text: string }).text;
+      return JSON.parse(plain.toString('utf8')) as Record<string, unknown>;
     });
-    expect(texts).toContain('secret line');
+
+    expect(decoded.some((o) => o['text'] === 'secret line')).toBe(true);
+    const raw = decoded.find((o) => o['type'] === 'raw');
+    expect(raw).toBeDefined();
+    expect(Buffer.from(String(raw!['data']), 'base64').toString('utf8')).toBe('\x1b[32mGREEN\x1b[0m');
+    expect(decoded.some((o) => o['type'] === 'resize' && o['cols'] === 100 && o['rows'] === 30)).toBe(true);
 
     // Wrong key yields nothing.
     const wrong = randomBytes(E2E_KEY_LEN);
