@@ -215,6 +215,81 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
     expect(JSON.parse(countEvent.data).watching).toBeGreaterThanOrEqual(1);
   });
 
+  it('broadcasts a named presence roster and stamps chat from the viewer token', async () => {
+    const chats: Array<{ viewerId: string; name: string; text: string }> = [];
+    // Rebuild transport with onChat so we can assert host-side delivery.
+    await manager.stopAll();
+    await transport.close();
+    const consent = createConsentLedger();
+    consent.grant(SHARE_SCOPE, 'test');
+    transport = new LocalHttpTransport({
+      hostToken: HOST_TOKEN,
+      onChat: (_id, frame) => chats.push(frame),
+    });
+    await transport.listen();
+    manager = new ShareManager({ consent, transport });
+    base = `http://127.0.0.1:${transport.port}`;
+
+    const created = await manager.createShare();
+    const v1 = await join(created, { name: 'Ada\u001b[31m' }); // injection stripped at registry
+    const v2 = await join(created, { name: 'Bob' });
+
+    const stream2 = await fetch(`${created.url}/stream?token=${v2.body['token']}`);
+    // Single SSE reader: wait for roster + chat (don't lock the body twice).
+    const chatResP = (async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return fetch(`${created.url}/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: v1.body['token'],
+          viewerId: 'forged',
+          name: 'Eve',
+          text: 'hello room\u001b[0m',
+        }),
+      });
+    })();
+    const events = await readSse(
+      stream2,
+      (ev) =>
+        ev.some((e) => e.event === 'presence' || e.event === 'viewers') &&
+        ev.some((e) => e.event === 'chat'),
+    );
+    const chatRes = await chatResP;
+    expect(chatRes.status).toBe(202);
+
+    const presence =
+      events.find((e) => e.event === 'presence') ?? events.find((e) => e.event === 'viewers')!;
+    const payload = JSON.parse(presence.data) as {
+      watching: number;
+      viewers: Array<{ viewerId: string; name: string; role: string }>;
+    };
+    expect(payload.watching).toBeGreaterThanOrEqual(1);
+    expect(Array.isArray(payload.viewers)).toBe(true);
+    expect(payload.viewers.some((r) => r.role === 'host')).toBe(true);
+    const ada = payload.viewers.find((r) => r.viewerId === v1.body['viewerId']);
+    expect(ada).toBeDefined();
+    expect(ada!.name).not.toContain('\u001b');
+    expect(ada!.name.startsWith('Ada')).toBe(true);
+
+    // Chat: client forges identity fields; hub stamps from the token.
+    const chat = JSON.parse(events.find((e) => e.event === 'chat')!.data) as Record<
+      string,
+      unknown
+    >;
+    expect(chat['viewerId']).toBe(v1.body['viewerId']); // connection/token-stamped
+    expect(chat['name']).not.toBe('Eve');
+    expect(String(chat['name'])).not.toContain('\u001b');
+    expect(String(chat['text'])).not.toContain('\u001b');
+    expect(String(chat['text'])).toContain('hello room');
+
+    // Host callback saw the same stamped, sanitized line.
+    expect(chats.length).toBe(1);
+    expect(chats[0]!.viewerId).toBe(v1.body['viewerId']);
+    expect(chats[0]!.text).toContain('hello room');
+    expect(chats[0]!.text).not.toContain('\u001b');
+  });
+
   it('control API requires the host token', async () => {
     const created = await manager.createShare();
     expect((await control(`/control/viewers?share=${created.share.id}`, undefined, null)).status).toBe(401);

@@ -8,6 +8,12 @@
  *   - e2e (tunnel path): SSE data is base64(AES-GCM frame); the page decrypts
  *     with the key from `location.hash` via WebCrypto (mirrors viewerPage.ts)
  *
+ * Presence + chat ride the host multi-party hub (SSE events + POST /chat):
+ *   - presence roster replaces the bare "N watching" count with named watchers
+ *   - chat TEXT is e2e-encrypted with the share key when e2e is on (tunnel);
+ *     on pure-local plaintext path the host still stamps identity from the
+ *     viewer token. Display text is sanitized against terminal/bidi injection.
+ *
  * Terminal rendering uses inlined xterm.js (CSP-safe, no CDN) so raw PTY
  * bytes reconstruct colors/cursor/full-screen TUI redraws faithfully.
  */
@@ -43,6 +49,10 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
     ? '<div class="p2p"><b>●</b> tunnel · end-to-end encrypted</div>'
     : '<div class="p2p"><b>●</b> p2p · nothing stored on a server</div>';
 
+  const chatHint = e2e
+    ? 'Say hi — messages are end-to-end encrypted with the share key.'
+    : 'Say hi — the host stamps who sent what.';
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -64,7 +74,7 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
     <h1>Watch this session live</h1>
     <p>${e2e ? 'Read-only. Stream is end-to-end encrypted — the tunnel only sees ciphertext.' : 'Read-only. The stream comes straight from the host machine.'}</p>
     <div class="row">
-      <input id="nameInput" placeholder="your name (optional)" maxlength="32">
+      <input id="nameInput" placeholder="your name (optional)" maxlength="32" autocomplete="nickname">
       <input id="passInput" placeholder="passphrase" type="password" class="hidden">
       <button id="watchBtn">Watch</button>
     </div>
@@ -73,7 +83,7 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
 
   <div class="meta">
     <span class="badge" id="badge"><span class="d"></span> CONNECTING</span>
-    <span class="count">👁 <b id="watching">0</b> watching</span>
+    <span class="presence" id="presenceLabel">👁 <b id="watching">0</b> watching</span>
   </div>
 
   <div class="term">
@@ -82,6 +92,15 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
   </div>
 
   <button class="join-btn hidden" id="reqBtn">Request to join</button>
+
+  <div class="chat hidden" id="chatBox">
+    <div class="chat-head">Chat${e2e ? ' · e2e encrypted' : ''}</div>
+    <div class="chat-log" id="chatLog"><div class="chat-empty">${chatHint}</div></div>
+    <form class="chat-form" id="chatForm">
+      <input id="chatInput" placeholder="message the room…" maxlength="500" autocomplete="off">
+      <button id="chatSend" type="submit">Send</button>
+    </form>
+  </div>
 </div>
 
 ${xtermScriptTags()}
@@ -94,14 +113,36 @@ ${XTERM_BOOT_JS}
   var viewer = null, source = null;
   var termApi = null;
   var lastSeq = 0;
+  var chatEmpty = true;
+
+  // Mirror of vibe-core sanitizePeerText — peer display text is untrusted.
+  var UNSAFE = /[\\u0000-\\u0008\\u000B-\\u001F\\u007F-\\u009F\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]/g;
+  function sanitizePeerText(text, maxLen){
+    if(typeof text !== "string") return "";
+    var cleaned = text.replace(UNSAFE, "");
+    if(typeof maxLen === "number" && cleaned.length > maxLen) cleaned = cleaned.slice(0, maxLen);
+    return cleaned;
+  }
+  function escapeHtml(s){
+    return String(s)
+      .replace(/&/g, "&" + "amp;")
+      .replace(/</g, "&" + "lt;")
+      .replace(/>/g, "&" + "gt;")
+      .replace(/"/g, "&" + "quot;");
+  }
 
   var joinPanel = document.getElementById("joinPanel");
   var joinErr = document.getElementById("joinErr");
   var passInput = document.getElementById("passInput");
   var badge = document.getElementById("badge");
   var watchingEl = document.getElementById("watching");
+  var presenceLabel = document.getElementById("presenceLabel");
   var termBody = document.getElementById("termBody");
   var reqBtn = document.getElementById("reqBtn");
+  var chatBox = document.getElementById("chatBox");
+  var chatLog = document.getElementById("chatLog");
+  var chatInput = document.getElementById("chatInput");
+  var chatForm = document.getElementById("chatForm");
 
   document.getElementById("sessionName").textContent = " · " + CFG.name;
   document.getElementById("chromePath").textContent = CFG.name + " — live";
@@ -124,6 +165,40 @@ ${XTERM_BOOT_JS}
     __vsHandleEntry(ensureTerm(), e);
   }
 
+  function renderPresence(viewers, watchingFallback){
+    var names = [];
+    var count = 0;
+    if(Array.isArray(viewers)){
+      for(var i = 0; i < viewers.length; i++){
+        var v = viewers[i];
+        if(!v || typeof v.name !== "string") continue;
+        var n = sanitizePeerText(v.name, 32).trim() || "viewer";
+        if(v.role === "viewer" || v.role === "spectator" || v.role === "collaborator") count++;
+        names.push(escapeHtml(n));
+      }
+    } else if(typeof watchingFallback === "number"){
+      count = watchingFallback;
+    }
+    var label = '👁 <b id="watching">' + count + "</b> watching";
+    if(names.length > 0){
+      label += ' <span class="names">· ' + names.map(function(n){ return "<em>" + n + "</em>"; }).join(", ") + "</span>";
+    }
+    presenceLabel.innerHTML = label;
+    watchingEl = document.getElementById("watching") || watchingEl;
+  }
+
+  function appendChatLine(name, text, mine){
+    var safeName = sanitizePeerText(name || "viewer", 32).trim() || "viewer";
+    var safeText = sanitizePeerText(text || "", 500);
+    if(!safeText) return;
+    if(chatEmpty){ chatLog.innerHTML = ""; chatEmpty = false; }
+    var line = document.createElement("div");
+    line.className = "chat-line" + (mine ? " mine" : "");
+    line.innerHTML = '<span class="who">' + escapeHtml(safeName) + '</span>: <span class="msg">' + escapeHtml(safeText) + "</span>";
+    chatLog.appendChild(line);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
   // ---- optional e2e helpers (only when CFG.e2e). Key rides in #fragment.
   var cryptoKey = null;
   function b64urlToBytes(s){
@@ -140,6 +215,11 @@ ${XTERM_BOOT_JS}
     for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
   }
+  function bytesToB64(bytes){
+    var bin = "";
+    for(var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
   function decryptPayload(data){
     if(!cryptoKey) return Promise.resolve(null);
     var bytes;
@@ -151,13 +231,35 @@ ${XTERM_BOOT_JS}
       try { return JSON.parse(new TextDecoder().decode(plain)); } catch(e){ return null; }
     }).catch(function(){ return null; }); // GCM auth failure — drop, never render
   }
+  function decryptChatCipher(cipherB64){
+    if(!cryptoKey) return Promise.resolve(null);
+    var bytes;
+    try { bytes = b64ToBytes(cipherB64); } catch(e){ return Promise.resolve(null); }
+    if(bytes.length < 12 + 16) return Promise.resolve(null);
+    var nonce = bytes.slice(0, 12);
+    var ct = bytes.slice(12);
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, cryptoKey, ct).then(function(plain){
+      return sanitizePeerText(new TextDecoder().decode(plain), 500);
+    }).catch(function(){ return null; });
+  }
+  function encryptChatPlain(text){
+    if(!cryptoKey) return Promise.resolve(null);
+    var payload = new TextEncoder().encode(text);
+    var nonce = crypto.getRandomValues(new Uint8Array(12));
+    return crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, cryptoKey, payload).then(function(ct){
+      var out = new Uint8Array(12 + ct.byteLength);
+      out.set(nonce, 0);
+      out.set(new Uint8Array(ct), 12);
+      return bytesToB64(out);
+    });
+  }
   if(CFG.e2e){
     var keyB64 = location.hash.slice(1);
     if(!keyB64){
       setBadge("ended", "MISSING KEY");
       showErr("This link is incomplete — the decryption key lives in the #fragment of the URL.");
     } else {
-      crypto.subtle.importKey("raw", b64urlToBytes(keyB64), { name: "AES-GCM" }, false, ["decrypt"]).then(function(k){
+      crypto.subtle.importKey("raw", b64urlToBytes(keyB64), { name: "AES-GCM" }, false, ["decrypt", "encrypt"]).then(function(k){
         cryptoKey = k;
       }).catch(function(){
         setBadge("ended", "BAD KEY");
@@ -174,7 +276,8 @@ ${XTERM_BOOT_JS}
   fetch(base + "/meta").then(function(r){ return r.json(); }).then(function(meta){
     if(meta.state !== "live"){ ended(meta.state); joinPanel.classList.add("hidden"); return; }
     if(meta.requiresPassphrase) passInput.classList.remove("hidden");
-    watchingEl.textContent = meta.watching;
+    if(Array.isArray(meta.viewers)) renderPresence(meta.viewers, meta.watching);
+    else if(typeof meta.watching === "number") renderPresence(null, meta.watching);
   }).catch(function(){ setBadge("ended", "UNREACHABLE"); });
 
   document.getElementById("watchBtn").addEventListener("click", function(){
@@ -191,6 +294,7 @@ ${XTERM_BOOT_JS}
       if(!res) return;
       viewer = res;
       joinPanel.classList.add("hidden");
+      chatBox.classList.remove("hidden");
       setBadge("", "SPECTATING · read-only");
       if(CFG.access === "invite") reqBtn.classList.remove("hidden");
       ensureTerm();
@@ -204,7 +308,30 @@ ${XTERM_BOOT_JS}
       parseEventData(ev.data).then(function(e){ applyEntry(e); });
     });
     source.addEventListener("viewers", function(ev){
-      parseEventData(ev.data).then(function(d){ if(d) watchingEl.textContent = d.watching; });
+      parseEventData(ev.data).then(function(d){
+        if(!d) return;
+        if(Array.isArray(d.viewers)) renderPresence(d.viewers, d.watching);
+        else if(typeof d.watching === "number") renderPresence(null, d.watching);
+      });
+    });
+    source.addEventListener("presence", function(ev){
+      parseEventData(ev.data).then(function(d){
+        if(d && Array.isArray(d.viewers)) renderPresence(d.viewers, d.watching);
+      });
+    });
+    source.addEventListener("chat", function(ev){
+      parseEventData(ev.data).then(function(d){
+        if(!d) return;
+        var mine = viewer && d.viewerId === viewer.viewerId;
+        if(CFG.e2e && typeof d.text === "string"){
+          // text is ciphertext; decrypt with share key
+          decryptChatCipher(d.text).then(function(plain){
+            if(plain) appendChatLine(d.name, plain, mine);
+          });
+        } else if(typeof d.text === "string"){
+          appendChatLine(d.name, d.text, mine);
+        }
+      });
     });
     source.addEventListener("join-approved", function(){
       setBadge("collab", "COLLABORATING · live");
@@ -234,9 +361,34 @@ ${XTERM_BOOT_JS}
     }).catch(function(){ reqBtn.className = "join-btn"; reqBtn.disabled = false; });
   });
 
+  chatForm.addEventListener("submit", function(ev){
+    ev.preventDefault();
+    if(!viewer) return;
+    var text = sanitizePeerText(chatInput.value || "", 500).trim();
+    if(!text) return;
+    chatInput.value = "";
+    function post(body){
+      return fetch(base + "/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    }
+    if(CFG.e2e){
+      encryptChatPlain(text).then(function(cipher){
+        if(!cipher) return;
+        // ONLY ciphertext + token — host stamps identity from the token.
+        return post({ token: viewer.token, text: cipher });
+      });
+    } else {
+      post({ token: viewer.token, text: text });
+    }
+  });
+
   function ended(state){
     setBadge("ended", state === "kicked" ? "REMOVED BY HOST" : "SHARE ENDED");
     reqBtn.classList.add("hidden");
+    chatInput.disabled = true;
     applyEntry({ type: "system", text: state === "kicked" ? "— the host removed you from this share —" : "— the host ended this share —" });
   }
 
