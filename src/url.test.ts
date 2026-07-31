@@ -4,24 +4,9 @@ import {
   SHARE_PATH_PREFIX,
   ShareUrlParseError,
   buildShareUrl,
-  newShareId,
   parseShareUrl,
 } from './url.js';
-
-describe('newShareId', () => {
-  it('produces unguessable, unique, uuid-shaped ids', () => {
-    const a = newShareId();
-    const b = newShareId();
-    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    expect(b).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    expect(a).not.toEqual(b);
-  });
-
-  it('has enough entropy to be a genuine capability (122 bits)', () => {
-    // 32 hex chars = 128 bits, minus 6 fixed bits in a v4 uuid ≈ 122 bits.
-    expect(newShareId().replace(/-/g, '').length).toBe(32);
-  });
-});
+import { newShareId } from './utils.js';
 
 describe('buildShareUrl', () => {
   it('mints a URL on the vibeshare.stream domain by default', () => {

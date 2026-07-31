@@ -18,7 +18,8 @@ import { SHARE_SESSION_SCOPE as VIBELIVE_SHARE_SCOPE } from 'vibelive';
 import type { ConsentLedger } from '@pooriaarab/vibe-core';
 import type { AccessMode } from './access.js';
 import { createAccessGate, type AccessGate, type ViewerRole } from './access.js';
-import { buildShareUrl, newShareId } from './url.js';
+import { buildShareUrl } from './url.js';
+import { newShareId } from './utils.js';
 
 /** The consent scope that gates sharing a session off the host machine. */
 export const SHARE_SESSION_SCOPE = VIBELIVE_SHARE_SCOPE;

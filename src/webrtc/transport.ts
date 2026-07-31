@@ -63,6 +63,12 @@ export interface ViewerInputFrame {
   readonly kind: 'input';
   /** UTF-8 input the collaborator wants applied to the session. */
   readonly data: string;
+  /**
+   * Per-peer monotonic sequence number. The host rejects any input frame
+   * whose seq is ≤ the last one accepted from that peer, so a captured
+   * ciphertext replayed on the same DataChannel is dropped, not re-applied.
+   */
+  readonly seq: number;
 }
 
 export interface WebRtcTransportOptions {
@@ -90,6 +96,8 @@ interface PeerContext {
   /** Live entries buffered between feed subscribe and channel open. */
   pending: FeedEntry[];
   open: boolean;
+  /** Last accepted collaborator-input seq (anti-replay watermark). */
+  lastInputSeq: number;
 }
 
 interface ShareContext {
@@ -237,6 +245,7 @@ export class WebRtcTransport implements ShareTransport {
       unsubscribeFeed: null,
       pending: [],
       open: false,
+      lastInputSeq: -1,
     };
     ctx.peers.set(viewerId, peer);
 
@@ -312,8 +321,9 @@ export class WebRtcTransport implements ShareTransport {
 
   /**
    * Inbound collaborator input. Decrypt + authenticate first (failures are
-   * dropped silently — no plaintext, no error surface), then the
-   * write-arbitration gate: only `canWrite()` viewers reach `onInput`.
+   * dropped silently — no plaintext, no error surface), then the anti-replay
+   * watermark (a replayed or out-of-order ciphertext never reaches the gate),
+   * then the write-arbitration gate: only `canWrite()` viewers reach `onInput`.
    */
   #handleInbound(ctx: ShareContext, viewerId: string, msg: string | Buffer | ArrayBuffer): void {
     let plaintext: Buffer;
@@ -331,8 +341,16 @@ export class WebRtcTransport implements ShareTransport {
       return; // not an input frame
     }
     if (typeof input !== 'object' || input === null) return;
-    const { kind, data } = input as Record<string, unknown>;
+    const { kind, data, seq } = input as Record<string, unknown>;
     if (kind !== 'input' || typeof data !== 'string') return;
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) return; // seq is mandatory
+    const peer = ctx.peers.get(viewerId);
+    if (!peer) return; // peer already torn down
+    // Anti-replay: drop a re-sent or out-of-order frame BEFORE any gating
+    // side effects. DataChannels are ordered, so a legit peer's seq only ever
+    // advances; anything ≤ the watermark is a replay (or a stale duplicate).
+    if (seq <= peer.lastInputSeq) return;
+    peer.lastInputSeq = seq;
     if (!ctx.viewers.canWrite(viewerId)) return; // spectator — drop silently
     this.#onInput?.(ctx.share.id, viewerId, data);
   }
