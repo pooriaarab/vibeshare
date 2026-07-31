@@ -38,7 +38,8 @@ describe('ShareManager', () => {
     expect(manager.get(created.share.id)).toBe(created);
     expect(manager.list()).toHaveLength(1);
     // The log records the opening for late-joiner replay.
-    expect(created.feed.backlog().at(-1)?.text).toContain('share opened');
+    const last = created.feed.backlog().at(-1);
+    expect(last && 'text' in last ? last.text : '').toContain('share opened');
   });
 
   it('defaults to spectate, until-stopped, no passphrase', async () => {
