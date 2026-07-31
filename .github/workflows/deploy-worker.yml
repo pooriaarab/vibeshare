@@ -29,7 +29,9 @@ jobs:
           node-version: '20'
       - name: Install worker deps
         if: steps.gate.outputs.have == 'true'
-        run: npm install
+        # --legacy-peer-deps: wrangler's peerOptional @cloudflare/workers-types@^4
+        # conflicts with our devDep @^5; the mismatch is types-only and harmless.
+        run: npm install --legacy-peer-deps
         working-directory: worker
       - name: Deploy staging (main)
         if: steps.gate.outputs.have == 'true' && github.ref == 'refs/heads/main'
