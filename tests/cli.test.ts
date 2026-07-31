@@ -251,7 +251,7 @@ describe('VERSION matches package.json', () => {
     };
     const { VERSION } = await import('../src/version.js');
     expect(VERSION).toBe(pkg.version);
-    expect(pkg.version).toBe('0.2.7');
+    expect(pkg.version).toBe('0.2.8');
 
     const out: string[] = [];
     const err: string[] = [];

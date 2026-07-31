@@ -5,8 +5,14 @@
  */
 import { createDecipheriv, randomBytes } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createConsentLedger } from '@pooriaarab/vibe-core';
-import { decryptFrame, encryptFrame, E2E_KEY_LEN, E2E_NONCE_LEN, E2E_TAG_LEN } from '../src/e2e.js';
+import {
+  createConsentLedger,
+  decryptFrame,
+  encryptFrame,
+  E2E_KEY_LEN,
+  E2E_NONCE_LEN,
+  E2E_TAG_LEN,
+} from '@pooriaarab/vibe-core';
 import { LocalHttpTransport } from '../src/localHttp.js';
 import { ShareManager, SHARE_SCOPE, type CreatedShare } from '../src/manager.js';
 import { spectatorPage } from '../src/spectatorPage.js';

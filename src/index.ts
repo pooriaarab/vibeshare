@@ -51,7 +51,18 @@ export { ViewerRegistry } from './registry.js';
 export { SPECTATOR_CSS, spectatorPage, type SpectatorPageOptions } from './spectatorPage.js';
 export type { SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
 export { LoopbackSignaling } from './webrtc/signaling.js';
-export { decryptFrame, encryptFrame, E2E_KEY_LEN, E2E_NONCE_LEN, E2E_TAG_LEN } from './e2e.js';
+export {
+  createTunnelRegistry,
+  decryptFrame,
+  encryptFrame,
+  E2E_KEY_LEN,
+  E2E_NONCE_LEN,
+  E2E_TAG_LEN,
+  TunnelRegistry,
+  type TunnelHandle,
+  type TunnelProvider,
+  type TunnelStartOpts,
+} from '@pooriaarab/vibe-core';
 export { WebRtcTransport, type ViewerInputFrame, type WebRtcTransportOptions } from './webrtc/transport.js';
 export { viewerPage } from './webrtc/viewerPage.js';
 export { WsSignaling, type WsSignalingOptions } from './webrtc/wsSignaling.js';
@@ -69,13 +80,6 @@ export {
   type ViewerRole,
 } from './types.js';
 export { hashPassphrase, newShareId, newToken, parseExpiry, verifyPassphrase } from './utils.js';
-export {
-  createTunnelRegistry,
-  TunnelRegistry,
-  type TunnelHandle,
-  type TunnelProvider,
-  type TunnelStartOpts,
-} from './tunnel/index.js';
 export { VERSION } from './version.js';
 
 let defaultManager: ShareManager | null = null;
