@@ -31,14 +31,20 @@
     "README.md"
   ],
   "scripts": {
+    "prebuild": "node scripts/embed-xterm.mjs",
     "build": "tsup",
     "typecheck": "tsc --noEmit && tsc --noEmit -p worker/tsconfig.json",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "embed-xterm": "node scripts/embed-xterm.mjs",
+    "postinstall": "node scripts/fix-node-pty.mjs"
   },
   "dependencies": {
     "@pooriaarab/vibe-core": "^0.6.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "node-datachannel": "^0.32.3",
+    "node-pty": "^1.1.0",
     "vibelive": "^0.2.0",
     "ws": "^8.21.1"
   },

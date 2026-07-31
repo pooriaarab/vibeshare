@@ -49,6 +49,10 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
     const html = await page.text();
     expect(html).toContain('vibeshare');
     expect(html).toContain(created.share.id);
+    // Inlined xterm.js (CSP-safe) — no external script CDN.
+    expect(html).toContain('new Terminal');
+    expect(html).toContain('__vsHandleEntry');
+    expect(html).not.toMatch(/src=["']https?:\/\//);
 
     const meta = await (await fetch(`${created.url}/meta`)).json() as Record<string, unknown>;
     expect(meta).toMatchObject({
@@ -82,15 +86,22 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
   it('streams published entries live and replays the backlog for late joiners', async () => {
     const created = await manager.createShare();
     created.feed.publish('early line');
+    created.feed.publishRaw(Buffer.from('\x1b[32mhi\x1b[0m', 'utf8'));
+    created.feed.publishResize(80, 24);
 
     const v1 = await join(created, { name: 'first' });
     const stream1 = await fetch(`${created.url}/stream?token=${v1.body['token']}`);
     expect(stream1.status).toBe(200);
 
     // First viewer gets the replayed backlog (share-opened line, then ours).
-    const replay = await readSse(stream1, (ev) => ev.length >= 2);
+    const replay = await readSse(stream1, (ev) => ev.filter((e) => e.event === 'entry').length >= 4);
     expect(replay[0]).toMatchObject({ event: 'entry' });
-    expect(JSON.parse(replay[1]!.data)).toMatchObject({ text: 'early line' });
+    const replayEntries = replay.filter((e) => e.event === 'entry').map((e) => JSON.parse(e.data) as Record<string, unknown>);
+    expect(replayEntries.some((e) => e['text'] === 'early line')).toBe(true);
+    const raw = replayEntries.find((e) => e['type'] === 'raw');
+    expect(raw).toBeDefined();
+    expect(Buffer.from(String(raw!['data']), 'base64').toString('utf8')).toBe('\x1b[32mhi\x1b[0m');
+    expect(replayEntries.some((e) => e['type'] === 'resize' && e['cols'] === 80 && e['rows'] === 24)).toBe(true);
 
     created.feed.publish('live one', { stream: 'stdout' });
     created.feed.system('checkpoint');
@@ -98,14 +109,17 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
     // A second viewer joining now replays everything so far, in order.
     const v2 = await join(created, { name: 'second' });
     const stream2 = await fetch(`${created.url}/stream?token=${v2.body['token']}`);
-    const backlog = await readSse(stream2, (ev) => ev.filter((e) => e.event === 'entry').length >= 3);
-    const texts = backlog.filter((e) => e.event === 'entry').map((e) => JSON.parse(e.data).text);
+    const backlog = await readSse(stream2, (ev) => ev.filter((e) => e.event === 'entry').length >= 5);
+    const entries = backlog.filter((e) => e.event === 'entry').map((e) => JSON.parse(e.data) as Record<string, unknown>);
+    const texts = entries.filter((e) => typeof e['text'] === 'string').map((e) => e['text']);
     expect(texts.slice(0, 4)).toEqual([
       'share opened · access=spectate · until stopped',
       'early line',
       'live one',
       'checkpoint',
     ]);
+    expect(entries.some((e) => e['type'] === 'raw')).toBe(true);
+    expect(entries.some((e) => e['type'] === 'resize')).toBe(true);
 
     // And both see a new live entry.
     const v3 = await join(created, { name: 'third' });
