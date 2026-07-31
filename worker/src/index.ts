@@ -33,7 +33,15 @@
  *   GET /vibeshare/health                          → liveness
  */
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
-import { MAX_VIEWERS, atViewerCap, countViewers, pruneRateLimitMap, recordConnection } from './limits.js';
+import {
+  MAX_VIEWERS,
+  abandonedCleanupDeadline,
+  atViewerCap,
+  countViewers,
+  hostActivityDeadline,
+  pruneRateLimitMap,
+  recordConnection,
+} from './limits.js';
 
 export interface Env {
   readonly SHARES: DurableObjectNamespace;
@@ -163,6 +171,9 @@ export class ShareRoom implements DurableObject {
       server.serializeAttachment({ role: 'host', shareId } satisfies Attachment);
       this.ctx.acceptWebSocket(server);
       server.send(JSON.stringify({ kind: 'host-ready' }));
+      // Hard ceiling on storage life; reset on every host connect so a live
+      // long share isn't wiped. alarm() re-arms while the host is still up.
+      await this.ctx.storage.setAlarm(hostActivityDeadline(now));
     } else {
       // The Worker ASSIGNS the viewerId — the viewer never chooses one.
       const viewerId = crypto.randomUUID();
@@ -196,8 +207,14 @@ export class ShareRoom implements DurableObject {
     if (att?.role === 'host') {
       // Host left: the share is over — close every viewer so pages show it.
       for (const other of this.ctx.getWebSockets()) {
+        if (other === ws) continue;
         const otherAtt = other.deserializeAttachment() as Attachment | null;
         if (otherAtt?.role === 'viewer') other.close(1012, 'host left');
+      }
+      // No remaining sockets → reclaim storage shortly (don't hold hostSecret forever).
+      const remaining = this.ctx.getWebSockets().filter((s) => s !== ws).length;
+      if (remaining === 0) {
+        await this.ctx.storage.setAlarm(abandonedCleanupDeadline(Date.now()));
       }
     }
   }
@@ -208,6 +225,27 @@ export class ShareRoom implements DurableObject {
     } catch {
       // already closed
     }
+  }
+
+  /**
+   * Alarm: storage reclaim at hard ceiling or abandoned short timer.
+   * While a host is still connected, never wipe — re-arm the hard ceiling
+   * so long live shares stay up.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    if (this.hostSocket()) {
+      await this.ctx.storage.setAlarm(hostActivityDeadline(now));
+      return;
+    }
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(1013, 'share expired');
+      } catch {
+        // already closed
+      }
+    }
+    await this.ctx.storage.deleteAll();
   }
 
   // ------------------------------------------------------------- relay

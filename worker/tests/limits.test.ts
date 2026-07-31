@@ -1,19 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ABANDONED_CLEANUP_MS,
   MAX_CONN_PER_IP,
+  MAX_SHARE_LIFE_MS,
   MAX_VIEWERS,
   RATE_WINDOW_MS,
+  abandonedCleanupDeadline,
   atViewerCap,
   countViewers,
+  earliestAlarm,
+  hostActivityDeadline,
   pruneRateLimitMap,
   recordConnection,
 } from '../src/limits.js';
 
 describe('constants (tunable)', () => {
-  it('exposes the expected max-viewers and rate-limit defaults', () => {
+  it('exposes the expected max-viewers, rate-limit, and cleanup defaults', () => {
     expect(MAX_VIEWERS).toBe(50);
     expect(MAX_CONN_PER_IP).toBe(30);
     expect(RATE_WINDOW_MS).toBe(60_000);
+    expect(MAX_SHARE_LIFE_MS).toBe(24 * 60 * 60 * 1000);
+    expect(ABANDONED_CLEANUP_MS).toBe(60_000);
   });
 });
 
@@ -106,3 +113,21 @@ describe('pruneRateLimitMap', () => {
     expect(map.get('c')).toEqual([9_900]);
   });
 });
+
+describe('deadline helpers', () => {
+  it('hostActivityDeadline adds MAX_SHARE_LIFE_MS', () => {
+    expect(hostActivityDeadline(1_000)).toBe(1_000 + MAX_SHARE_LIFE_MS);
+  });
+
+  it('abandonedCleanupDeadline adds ABANDONED_CLEANUP_MS', () => {
+    expect(abandonedCleanupDeadline(1_000)).toBe(1_000 + ABANDONED_CLEANUP_MS);
+  });
+
+  it('earliestAlarm picks the minimum finite candidate', () => {
+    expect(earliestAlarm()).toBeNull();
+    expect(earliestAlarm(undefined, null)).toBeNull();
+    expect(earliestAlarm(50, 10, 20)).toBe(10);
+    expect(earliestAlarm(NaN, 5)).toBe(5);
+  });
+});
+
