@@ -18,6 +18,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { timingSafeEqual } from 'node:crypto';
+import { encryptFrame } from './e2e.js';
 import type { SessionFeed } from './feed.js';
 import type { ViewerRegistry } from './registry.js';
 import { spectatorPage } from './spectatorPage.js';
@@ -44,6 +45,17 @@ export interface LocalHttpTransportOptions {
    * feed itself.
    */
   readonly onStopRequested?: (shareId: string) => void;
+  /**
+   * Opt-in end-to-end encryption for the spectator path (used by `--tunnel`).
+   * When set:
+   *   - every SSE event's data payload is `encryptFrame(key, …)` encoded as
+   *     standard base64 (the tunnel provider sees only ciphertext);
+   *   - the spectator page decrypts via WebCrypto using the key from the
+   *     share URL `#fragment`.
+   * When absent (the default pure-local loopback path) behaviour is
+   * unchanged — plaintext SSE, existing tests stay green.
+   */
+  readonly e2e?: { readonly key: Buffer };
 }
 
 interface ShareContext {
@@ -64,6 +76,7 @@ export class LocalHttpTransport implements ShareTransport {
   readonly #port: number;
   readonly #baseUrl: string | undefined;
   readonly #onStop: ((shareId: string) => void) | undefined;
+  readonly #e2eKey: Buffer | undefined;
   readonly #shares = new Map<string, ShareContext>();
   readonly #gone = new Set<string>();
   readonly #sockets = new Set<import('node:net').Socket>();
@@ -76,6 +89,12 @@ export class LocalHttpTransport implements ShareTransport {
     this.#baseUrl = opts.baseUrl;
     this.hostToken = opts.hostToken ?? newToken(24);
     this.#onStop = opts.onStopRequested;
+    this.#e2eKey = opts.e2e?.key;
+  }
+
+  /** True when this transport encrypts SSE payloads end-to-end. */
+  get e2eEnabled(): boolean {
+    return this.#e2eKey !== undefined;
   }
 
   /** Bind the listener. Must be called before serve(). Idempotent. */
@@ -108,7 +127,11 @@ export class LocalHttpTransport implements ShareTransport {
     this.#shares.set(share.id, ctx);
     this.#gone.delete(share.id);
     this.#wire(ctx);
-    return `${this.#publicBase()}/s/${share.id}`;
+    const base = `${this.#publicBase()}/s/${share.id}`;
+    // Key rides ONLY in the URL fragment — never on the wire to the tunnel
+    // provider (fragments are stripped by browsers before the request).
+    if (this.#e2eKey) return `${base}#${this.#e2eKey.toString('base64url')}`;
+    return base;
   }
 
   async unserve(shareId: string): Promise<void> {
@@ -194,7 +217,7 @@ export class LocalHttpTransport implements ShareTransport {
       case 'page': {
         if (req.method !== 'GET') return void sendJson(res, 405, { error: 'method not allowed' });
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        res.end(spectatorPage(ctx.share));
+        res.end(spectatorPage(ctx.share, { e2e: this.#e2eKey !== undefined }));
         return;
       }
       case 'meta': {
@@ -346,9 +369,9 @@ export class LocalHttpTransport implements ShareTransport {
       connection: 'keep-alive',
     });
     // Replay the recent log so late joiners see context, then go live.
-    for (const entry of ctx.feed.backlog()) sseSend(res, 'entry', entry, entry.seq);
+    for (const entry of ctx.feed.backlog()) this.#sse(res, 'entry', entry, entry.seq);
 
-    const unsubscribe = ctx.feed.subscribe((entry) => sseSend(res, 'entry', entry, entry.seq));
+    const unsubscribe = ctx.feed.subscribe((entry) => this.#sse(res, 'entry', entry, entry.seq));
     let set = ctx.streams.get(viewer.id);
     if (!set) {
       set = new Set();
@@ -366,14 +389,14 @@ export class LocalHttpTransport implements ShareTransport {
   }
 
   #sendToViewer(ctx: ShareContext, viewer: Viewer, event: string, data: unknown): void {
-    for (const res of ctx.streams.get(viewer.id) ?? []) sseSend(res, event, data);
+    for (const res of ctx.streams.get(viewer.id) ?? []) this.#sse(res, event, data);
   }
 
   #closeViewerStreams(ctx: ShareContext, viewer: Viewer, event: string | null): void {
     const set = ctx.streams.get(viewer.id);
     if (!set) return;
     for (const res of set) {
-      if (event !== null) sseSend(res, event, {});
+      if (event !== null) this.#sse(res, event, {});
       res.end();
     }
     ctx.streams.delete(viewer.id);
@@ -382,18 +405,32 @@ export class LocalHttpTransport implements ShareTransport {
   #broadcastViewers(ctx: ShareContext): void {
     const watching = streamCount(ctx);
     for (const set of ctx.streams.values()) {
-      for (const res of set) sseSend(res, 'viewers', { watching });
+      for (const res of set) this.#sse(res, 'viewers', { watching });
     }
   }
 
   #endAllStreams(ctx: ShareContext, state: string): void {
     for (const set of ctx.streams.values()) {
       for (const res of set) {
-        sseSend(res, 'ended', { state });
+        this.#sse(res, 'ended', { state });
         res.end();
       }
     }
     ctx.streams.clear();
+  }
+
+  /**
+   * Emit one SSE event. When e2e is on, the data line is the base64 of
+   * `encryptFrame(key, JSON.stringify(data))` so a tunnel provider never
+   * sees plaintext; otherwise it's plain JSON (default local path).
+   */
+  #sse(res: ServerResponse, event: string, data: unknown, id?: number): void {
+    if (res.writableEnded) return;
+    const idLine = id === undefined ? '' : `id: ${id}\n`;
+    const payload = this.#e2eKey
+      ? encryptFrame(this.#e2eKey, Buffer.from(JSON.stringify(data), 'utf8')).toString('base64')
+      : JSON.stringify(data);
+    res.write(`${idLine}event: ${event}\ndata: ${payload}\n\n`);
   }
 
   // -------------------------------------------------------------
@@ -413,12 +450,6 @@ function streamCount(ctx: ShareContext): number {
 
 function publicViewer(v: Viewer): Record<string, unknown> {
   return { id: v.id, name: v.name, role: v.role, joinRequest: v.joinRequest, joinedAt: v.joinedAt };
-}
-
-function sseSend(res: ServerResponse, event: string, data: unknown, id?: number): void {
-  if (res.writableEnded) return;
-  const idLine = id === undefined ? '' : `id: ${id}\n`;
-  res.write(`${idLine}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
