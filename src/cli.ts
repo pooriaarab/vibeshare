@@ -29,7 +29,7 @@ import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
 import { startMcp } from './mcp.js';
 import type { ShareTransport } from './transport.js';
-import { createTunnelRegistry, type TunnelHandle } from './tunnel/index.js';
+import { createTunnelRegistry } from './tunnel/index.js';
 import { VERSION } from './version.js';
 import { WebRtcTransport } from './webrtc/transport.js';
 import { WsSignaling } from './webrtc/wsSignaling.js';
@@ -67,7 +67,12 @@ export interface StartOptions {
    * Injectable tunnel registry (tests). Production uses createTunnelRegistry().
    * Accepts anything with the resolve() shape so mocks stay light.
    */
-  tunnelRegistry?: { resolve(preferred?: string): Promise<{ name: string; start(port: number, opts?: import('./tunnel/provider.js').TunnelStartOpts): Promise<TunnelHandle> }> };
+  tunnelRegistry?: {
+    resolve(preferred?: string): Promise<{
+      name: string;
+      start(port: number, opts?: { hostname?: string; serverAddr?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal; timeoutMs?: number }): Promise<{ url: string; stop(): Promise<void> }>;
+    }>;
+  };
   command: string[];
 }
 
@@ -308,7 +313,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   //   default  → local HTTP spectator server on loopback (unchanged)
   let transport: ShareTransport;
   let localHttp: LocalHttpTransport | null = null;
-  let tunnelHandle: TunnelHandle | null = null;
+  let tunnelHandle: { url: string; stop(): Promise<void> } | null = null;
   let tunnelProviderName: string | null = null;
   let publicShareUrl: string | null = null;
   const tunnelOn = options.tunnel !== false;
