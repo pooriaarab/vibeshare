@@ -21,6 +21,13 @@
  *     the expected string fields are forwarded, reconstructed server-side.
  *     Keys, session bytes, and every other frame shape are dropped.
  *
+ * Availability / isolation hardening (see ./limits.ts for tunable constants):
+ *
+ *   - max viewers per share (host exempt);
+ *   - per-IP sliding-window connection rate limit (CF-Connecting-IP);
+ *   - DO storage cleanup alarm (hard ceiling + abandoned short reclaim);
+ *   - viewer-with-no-host timeout (guessed/expired ids fail closed).
+ *
  * Protocol (mirrored by src/webrtc/wsSignaling.ts + src/webrtc/viewerPage.ts):
  *
  *   GET /vibeshare/s/<id>                          → the viewer page (HTML)
@@ -29,6 +36,17 @@
  *   GET /vibeshare/health                          → liveness
  */
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
+import {
+  MAX_VIEWERS,
+  VIEWER_HOST_WAIT_MS,
+  abandonedCleanupDeadline,
+  atViewerCap,
+  countViewers,
+  hostActivityDeadline,
+  pruneRateLimitMap,
+  recordConnection,
+  viewerHostWaitExpired,
+} from './limits.js';
 
 export interface Env {
   readonly SHARES: DurableObjectNamespace;
@@ -85,6 +103,8 @@ interface Attachment {
   readonly role: 'host' | 'viewer';
   readonly shareId: string;
   readonly viewerId?: string;
+  /** Epoch ms when this viewer socket connected (for no-host timeout). */
+  readonly connectedAt?: number;
 }
 
 /**
@@ -92,6 +112,12 @@ interface Attachment {
  * for a single share and fans the handshake out between them.
  */
 export class ShareRoom implements DurableObject {
+  /**
+   * Best-effort in-memory sliding window of recent connection timestamps per
+   * CF-Connecting-IP. Resets on DO hibernation — defense-in-depth only.
+   */
+  private readonly connByIp = new Map<string, number[]>();
+
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env,
@@ -104,6 +130,18 @@ export class ShareRoom implements DurableObject {
     }
     const shareId = url.searchParams.get('share') ?? '';
     const isHost = url.pathname.endsWith('/ws/host');
+    const now = Date.now();
+
+    // Per-IP upgrade rate limit (host + viewer). Missing header shares one
+    // "unknown" bucket so non-CF / local clients are still capped (fail closed).
+    const ip = (request.headers.get('CF-Connecting-IP') ?? '').trim() || 'unknown';
+    pruneRateLimitMap(this.connByIp, now);
+    const prior = this.connByIp.get(ip) ?? [];
+    const decision = recordConnection(prior, now);
+    this.connByIp.set(ip, decision.timestamps);
+    if (!decision.allowed) {
+      return new Response('rate limit exceeded', { status: 429 });
+    }
 
     if (isHost) {
       const secret = url.searchParams.get('secret') ?? '';
@@ -117,6 +155,12 @@ export class ShareRoom implements DurableObject {
         await this.ctx.storage.put('hostSecret', secret);
       } else if (bound !== secret) {
         return new Response('forbidden: this share already has a host', { status: 403 });
+      }
+    } else {
+      // Max viewers per share — refuse the upgrade before accepting (fail closed).
+      const roles = this.socketRoles();
+      if (atViewerCap(countViewers(roles), MAX_VIEWERS)) {
+        return new Response('too many viewers', { status: 429 });
       }
     }
 
@@ -134,13 +178,27 @@ export class ShareRoom implements DurableObject {
       server.serializeAttachment({ role: 'host', shareId } satisfies Attachment);
       this.ctx.acceptWebSocket(server);
       server.send(JSON.stringify({ kind: 'host-ready' }));
+      // Hard ceiling on storage life; reset on every host connect so a live
+      // long share isn't wiped. alarm() re-arms while the host is still up.
+      await this.ctx.storage.setAlarm(hostActivityDeadline(now));
     } else {
       // The Worker ASSIGNS the viewerId — the viewer never chooses one.
       const viewerId = crypto.randomUUID();
-      server.serializeAttachment({ role: 'viewer', shareId, viewerId } satisfies Attachment);
+      server.serializeAttachment({
+        role: 'viewer',
+        shareId,
+        viewerId,
+        connectedAt: now,
+      } satisfies Attachment);
       this.ctx.acceptWebSocket(server);
       server.send(JSON.stringify({ kind: 'assigned', viewerId }));
-      this.hostSocket()?.send(JSON.stringify({ kind: 'viewer-joined', viewerId }));
+      const host = this.hostSocket();
+      if (host) {
+        host.send(JSON.stringify({ kind: 'viewer-joined', viewerId }));
+      } else {
+        // No host yet: schedule a reject so a guessed id doesn't hold a socket.
+        await this.ensureViewerHostWaitAlarm(now);
+      }
     }
 
     return new Response(null, { status: 101, webSocket: client });
@@ -167,8 +225,14 @@ export class ShareRoom implements DurableObject {
     if (att?.role === 'host') {
       // Host left: the share is over — close every viewer so pages show it.
       for (const other of this.ctx.getWebSockets()) {
+        if (other === ws) continue;
         const otherAtt = other.deserializeAttachment() as Attachment | null;
         if (otherAtt?.role === 'viewer') other.close(1012, 'host left');
+      }
+      // No remaining sockets → reclaim storage shortly (don't hold hostSecret forever).
+      const remaining = this.ctx.getWebSockets().filter((s) => s !== ws).length;
+      if (remaining === 0) {
+        await this.ctx.storage.setAlarm(abandonedCleanupDeadline(Date.now()));
       }
     }
   }
@@ -179,6 +243,55 @@ export class ShareRoom implements DurableObject {
     } catch {
       // already closed
     }
+  }
+
+  /**
+   * Alarm fires for:
+   *   1) viewer no-host wait expiry (close with 1013 "share not found");
+   *   2) hard ceiling / abandoned cleanup (close leftovers + deleteAll).
+   *
+   * While a host is connected, never wipe — re-arm the hard ceiling instead
+   * so long live shares stay up.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+
+    // Host still here: keep the share alive (extend hard ceiling). Live
+    // viewers that arrived while host was up do not use the no-host timer.
+    if (this.hostSocket()) {
+      await this.ctx.storage.setAlarm(hostActivityDeadline(now));
+      return;
+    }
+
+    // Close viewers whose no-host wait has elapsed.
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.role !== 'viewer' || att.connectedAt === undefined) continue;
+      if (viewerHostWaitExpired(att.connectedAt, now)) {
+        try {
+          ws.close(1013, 'share not found');
+        } catch {
+          // already closed
+        }
+      }
+    }
+
+    // More viewers still inside their wait window → schedule the next expiry.
+    const nextWait = this.nextViewerHostWaitAlarm(now);
+    if (nextWait !== null) {
+      await this.ctx.storage.setAlarm(nextWait);
+      return;
+    }
+
+    // No host and no pending viewer wait → wipe durable state + leftover sockets.
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.close(1013, 'share expired');
+      } catch {
+        // already closed
+      }
+    }
+    await this.ctx.storage.deleteAll();
   }
 
   // ------------------------------------------------------------- relay
@@ -230,6 +343,17 @@ export class ShareRoom implements DurableObject {
     }
   }
 
+  // ------------------------------------------------------------- helpers
+
+  private socketRoles(): Array<'host' | 'viewer'> {
+    const roles: Array<'host' | 'viewer'> = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.role === 'host' || att?.role === 'viewer') roles.push(att.role);
+    }
+    return roles;
+  }
+
   private hostSocket(): WebSocket | undefined {
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
@@ -244,5 +368,31 @@ export class ShareRoom implements DurableObject {
       if (att?.role === 'viewer' && att.viewerId === viewerId) return ws;
     }
     return undefined;
+  }
+
+  /**
+   * Ensure a DO alarm will fire by the soonest viewer no-host deadline.
+   * setAlarm replaces any previous alarm; only bump if we need an earlier one
+   * (do not postpone an abandoned/hard-ceiling cleanup already scheduled sooner).
+   */
+  private async ensureViewerHostWaitAlarm(connectedAt: number): Promise<void> {
+    const due = connectedAt + VIEWER_HOST_WAIT_MS;
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null || due < existing) {
+      await this.ctx.storage.setAlarm(due);
+    }
+  }
+
+  /** Next connectedAt+VIEWER_HOST_WAIT_MS among still-waiting viewers, or null. */
+  private nextViewerHostWaitAlarm(now: number): number | null {
+    let next: number | null = null;
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.role !== 'viewer' || att.connectedAt === undefined) continue;
+      const due = att.connectedAt + VIEWER_HOST_WAIT_MS;
+      if (due <= now) continue;
+      if (next === null || due < next) next = due;
+    }
+    return next;
   }
 }
