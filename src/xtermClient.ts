@@ -65,6 +65,25 @@ button:disabled{ opacity:.6; cursor:default; }
 .join-btn.joined{ background:rgba(126,231,135,.12); border-color:rgba(126,231,135,.4); color:var(--green); }
 .hidden{ display:none !important; }
 .input-row{ display:flex; gap:10px; margin-top:14px; }
+.presence{ font-family:var(--mono); font-size:12.5px; color:var(--dim); max-width:100%; }
+.presence b{ color:var(--text); }
+.presence .names{ color:var(--dim); }
+.presence .names em{ font-style:normal; color:var(--text); }
+.side{ display:flex; gap:14px; margin-top:14px; flex-wrap:wrap; align-items:stretch; }
+.chat{ flex:1; min-width:240px; background:var(--panel); border:1px solid var(--border);
+  border-radius:12px; display:flex; flex-direction:column; max-height:220px; overflow:hidden; }
+.chat-head{ font-size:11.5px; font-weight:700; letter-spacing:.04em; color:var(--dim);
+  padding:10px 12px; border-bottom:1px solid var(--border); text-transform:uppercase; }
+.chat-log{ flex:1; overflow-y:auto; padding:10px 12px; font-family:var(--mono); font-size:12.5px;
+  display:flex; flex-direction:column; gap:6px; min-height:80px; }
+.chat-line{ color:var(--text); word-break:break-word; line-height:1.35; }
+.chat-line .who{ color:var(--cyan); font-weight:600; }
+.chat-line.mine .who{ color:var(--violet); }
+.chat-line .msg{ color:var(--text); }
+.chat-empty{ color:var(--faint); font-size:12px; font-family:var(--sans); }
+.chat-form{ display:flex; gap:8px; padding:10px; border-top:1px solid var(--border); }
+.chat-form input{ flex:1; min-width:0; }
+.chat-form button{ flex-shrink:0; }
 ${extraCss}`;
 }
 

@@ -18,8 +18,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { timingSafeEqual } from 'node:crypto';
-import { encryptFrame } from '@pooriaarab/vibe-core';
+import { encryptFrame, sanitizePeerText } from '@pooriaarab/vibe-core';
 import type { SessionFeed } from './feed.js';
+import {
+  MAX_CHAT_PLAINTEXT_LEN,
+  sanitizePresenceName,
+  stampChatRelay,
+  type ChatRelayFrame,
+  type PresenceEntry,
+} from './presenceChat.js';
+import { decryptChatText } from './presenceChatCrypto.js';
 import type { ViewerRegistry } from './registry.js';
 import { spectatorPage } from './spectatorPage.js';
 import type { ShareTransport } from './transport.js';
@@ -56,6 +64,11 @@ export interface LocalHttpTransportOptions {
    * unchanged — plaintext SSE, existing tests stay green.
    */
   readonly e2e?: { readonly key: Buffer };
+  /**
+   * Incoming chat lines (already decrypted when e2e is on) for the host
+   * terminal. Identity is stamped from the viewer token — never the payload.
+   */
+  readonly onChat?: (shareId: string, frame: { viewerId: string; name: string; text: string }) => void;
 }
 
 interface ShareContext {
@@ -77,6 +90,9 @@ export class LocalHttpTransport implements ShareTransport {
   readonly #baseUrl: string | undefined;
   readonly #onStop: ((shareId: string) => void) | undefined;
   readonly #e2eKey: Buffer | undefined;
+  readonly #onChat:
+    | ((shareId: string, frame: { viewerId: string; name: string; text: string }) => void)
+    | undefined;
   readonly #shares = new Map<string, ShareContext>();
   readonly #gone = new Set<string>();
   readonly #sockets = new Set<import('node:net').Socket>();
@@ -90,6 +106,7 @@ export class LocalHttpTransport implements ShareTransport {
     this.hostToken = opts.hostToken ?? newToken(24);
     this.#onStop = opts.onStopRequested;
     this.#e2eKey = opts.e2e?.key;
+    this.#onChat = opts.onChat;
   }
 
   /** True when this transport encrypts SSE payloads end-to-end. */
@@ -168,17 +185,20 @@ export class LocalHttpTransport implements ShareTransport {
       this.#endAllStreams(ctx, ctx.share.state);
     });
 
-    const broadcastCount = () => this.#broadcastViewers(ctx);
-    ctx.viewers.on('join', broadcastCount);
+    const broadcastPresence = () => this.#broadcastPresence(ctx);
+    ctx.viewers.on('join', broadcastPresence);
     ctx.viewers.on('leave', (v) => {
       this.#closeViewerStreams(ctx, v, null);
-      broadcastCount();
+      broadcastPresence();
     });
     ctx.viewers.on('kick', (v) => {
       this.#closeViewerStreams(ctx, v, 'kicked');
-      broadcastCount();
+      broadcastPresence();
     });
-    ctx.viewers.on('approve', (v) => this.#sendToViewer(ctx, v, 'join-approved', {}));
+    ctx.viewers.on('approve', (v) => {
+      this.#sendToViewer(ctx, v, 'join-approved', {});
+      broadcastPresence();
+    });
     ctx.viewers.on('deny', (v) => this.#sendToViewer(ctx, v, 'join-denied', {}));
   }
 
@@ -194,7 +214,7 @@ export class LocalHttpTransport implements ShareTransport {
       return;
     }
 
-    const m = /^\/s\/([A-Za-z0-9_-]+)(?:\/(meta|stream|join|request-join|leave))?\/?$/.exec(path);
+    const m = /^\/s\/([A-Za-z0-9_-]+)(?:\/(meta|stream|join|request-join|leave|chat))?\/?$/.exec(path);
     if (!m) {
       sendJson(res, 404, { error: 'not found' });
       return;
@@ -221,6 +241,7 @@ export class LocalHttpTransport implements ShareTransport {
         return;
       }
       case 'meta': {
+        const roster = this.#roster(ctx);
         sendJson(res, 200, {
           id: ctx.share.id,
           name: ctx.share.name,
@@ -228,6 +249,7 @@ export class LocalHttpTransport implements ShareTransport {
           state: ctx.share.state,
           requiresPassphrase: ctx.share.passphraseHash !== null,
           watching: streamCount(ctx),
+          viewers: roster,
         });
         return;
       }
@@ -272,6 +294,54 @@ export class LocalHttpTransport implements ShareTransport {
         const viewer = ctx.viewers.getByToken(token);
         if (viewer) ctx.viewers.leave(viewer.id);
         sendJson(res, 200, { ok: true });
+        return;
+      }
+      case 'chat': {
+        if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
+        if (ctx.share.state !== 'live') throw new ShareError('not-live', 'share has ended');
+        const body = await readJsonBody(req);
+        const viewer = ctx.viewers.getByToken(typeof body['token'] === 'string' ? body['token'] : '');
+        if (!viewer) return void sendJson(res, 401, { error: 'unknown viewer token' });
+        // Identity from the TOKEN / registry — never from the payload.
+        const wireText = typeof body['text'] === 'string' ? body['text'] : '';
+        let relayText: string;
+        let displayText: string;
+        if (this.#e2eKey) {
+          // Tunnel path: client sent ciphertext; relay it opaque, decrypt only
+          // for the host terminal callback.
+          const stamped = stampChatRelay({
+            viewerId: viewer.id,
+            name: viewer.name,
+            role: 'viewer',
+            text: wireText,
+          });
+          if (!stamped) throw new ShareError('bad-request', 'invalid chat payload');
+          relayText = stamped.text;
+          displayText = decryptChatText(this.#e2eKey, stamped.text) ?? '';
+          this.#broadcastChat(ctx, stamped);
+        } else {
+          // Local plaintext path: sanitize and stamp; no share key on the URL.
+          displayText = sanitizePeerText(wireText, MAX_CHAT_PLAINTEXT_LEN).trim();
+          if (displayText.length === 0) throw new ShareError('bad-request', 'empty chat');
+          relayText = displayText;
+          const frame: ChatRelayFrame = {
+            kind: 'chat',
+            viewerId: viewer.id,
+            name: sanitizePresenceName(viewer.name) || viewer.name,
+            role: 'viewer',
+            text: relayText,
+            ts: Date.now(),
+          };
+          this.#broadcastChat(ctx, frame);
+        }
+        if (displayText.length > 0) {
+          this.#onChat?.(ctx.share.id, {
+            viewerId: viewer.id,
+            name: sanitizePresenceName(viewer.name) || viewer.name,
+            text: displayText,
+          });
+        }
+        sendJson(res, 202, { ok: true });
         return;
       }
     }
@@ -378,13 +448,13 @@ export class LocalHttpTransport implements ShareTransport {
       ctx.streams.set(viewer.id, set);
     }
     set.add(res);
-    this.#broadcastViewers(ctx);
+    this.#broadcastPresence(ctx);
 
     res.on('close', () => {
       unsubscribe();
       set.delete(res);
       if (set.size === 0) ctx.streams.delete(viewer.id);
-      this.#broadcastViewers(ctx);
+      this.#broadcastPresence(ctx);
     });
   }
 
@@ -402,10 +472,37 @@ export class LocalHttpTransport implements ShareTransport {
     ctx.streams.delete(viewer.id);
   }
 
-  #broadcastViewers(ctx: ShareContext): void {
+  #roster(ctx: ShareContext): PresenceEntry[] {
+    // Local hub: viewers from the registry (named at join). Host is implied.
+    const viewers: PresenceEntry[] = [
+      { viewerId: 'host', name: 'host', role: 'host' },
+    ];
+    for (const v of ctx.viewers.list()) {
+      viewers.push({
+        viewerId: v.id,
+        name: sanitizePresenceName(v.name) || v.name,
+        role: 'viewer',
+      });
+    }
+    return viewers;
+  }
+
+  #broadcastPresence(ctx: ShareContext): void {
     const watching = streamCount(ctx);
+    const viewers = this.#roster(ctx);
+    const payload = { watching, viewers };
     for (const set of ctx.streams.values()) {
-      for (const res of set) this.#sse(res, 'viewers', { watching });
+      for (const res of set) {
+        // Keep legacy `viewers` event (count) + add `presence` roster.
+        this.#sse(res, 'viewers', payload);
+        this.#sse(res, 'presence', payload);
+      }
+    }
+  }
+
+  #broadcastChat(ctx: ShareContext, frame: ChatRelayFrame): void {
+    for (const set of ctx.streams.values()) {
+      for (const res of set) this.#sse(res, 'chat', frame);
     }
   }
 
