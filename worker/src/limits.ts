@@ -14,6 +14,24 @@ export const MAX_CONN_PER_IP = 30;
 /** Sliding window for the per-IP connection rate limit. */
 export const RATE_WINDOW_MS = 60_000;
 
+/**
+ * Hard ceiling on a share's storage lifetime from last host activity.
+ * Alarm wipes DO storage (hostSecret etc.) so shares don't grow forever.
+ */
+export const MAX_SHARE_LIFE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * After the host leaves with no viewers remaining, reclaim storage shortly
+ * instead of waiting for the hard ceiling.
+ */
+export const ABANDONED_CLEANUP_MS = 60_000;
+
+/**
+ * If a viewer connects and no host is present within this window, close the
+ * viewer (1013 / "share not found") — guessed/expired ids fail closed.
+ */
+export const VIEWER_HOST_WAIT_MS = 30_000;
+
 /** Count viewer roles in a list of socket roles. */
 export function countViewers(roles: readonly ('host' | 'viewer')[]): number {
   let n = 0;
@@ -73,18 +91,6 @@ export function pruneRateLimitMap(
   }
 }
 
-/**
- * Hard ceiling on a share's storage lifetime from last host activity.
- * Alarm wipes DO storage (hostSecret etc.) so shares don't grow forever.
- */
-export const MAX_SHARE_LIFE_MS = 24 * 60 * 60 * 1000;
-
-/**
- * After the host leaves with no viewers remaining, reclaim storage shortly
- * instead of waiting for the hard ceiling.
- */
-export const ABANDONED_CLEANUP_MS = 60_000;
-
 /** Next hard-deadline timestamp after host connect / activity. */
 export function hostActivityDeadline(now: number, maxShareLifeMs: number = MAX_SHARE_LIFE_MS): number {
   return now + maxShareLifeMs;
@@ -99,6 +105,18 @@ export function abandonedCleanupDeadline(
 }
 
 /**
+ * When a viewer that connected at `connectedAt` should be closed because no
+ * host ever showed up. Fail closed when the wait has elapsed.
+ */
+export function viewerHostWaitExpired(
+  connectedAt: number,
+  now: number,
+  waitMs: number = VIEWER_HOST_WAIT_MS,
+): boolean {
+  return now - connectedAt >= waitMs;
+}
+
+/**
  * Earliest alarm time among candidate deadlines (ignores nullish / non-finite).
  * Returns null when there is nothing to schedule.
  */
@@ -110,4 +128,3 @@ export function earliestAlarm(...candidates: Array<number | null | undefined>): 
   }
   return best;
 }
-

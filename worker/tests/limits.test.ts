@@ -5,6 +5,7 @@ import {
   MAX_SHARE_LIFE_MS,
   MAX_VIEWERS,
   RATE_WINDOW_MS,
+  VIEWER_HOST_WAIT_MS,
   abandonedCleanupDeadline,
   atViewerCap,
   countViewers,
@@ -12,15 +13,17 @@ import {
   hostActivityDeadline,
   pruneRateLimitMap,
   recordConnection,
+  viewerHostWaitExpired,
 } from '../src/limits.js';
 
 describe('constants (tunable)', () => {
-  it('exposes the expected max-viewers, rate-limit, and cleanup defaults', () => {
+  it('exposes the expected production defaults', () => {
     expect(MAX_VIEWERS).toBe(50);
     expect(MAX_CONN_PER_IP).toBe(30);
     expect(RATE_WINDOW_MS).toBe(60_000);
     expect(MAX_SHARE_LIFE_MS).toBe(24 * 60 * 60 * 1000);
     expect(ABANDONED_CLEANUP_MS).toBe(60_000);
+    expect(VIEWER_HOST_WAIT_MS).toBe(30_000);
   });
 });
 
@@ -123,6 +126,12 @@ describe('deadline helpers', () => {
     expect(abandonedCleanupDeadline(1_000)).toBe(1_000 + ABANDONED_CLEANUP_MS);
   });
 
+  it('viewerHostWaitExpired fail-closed at the boundary', () => {
+    expect(viewerHostWaitExpired(0, VIEWER_HOST_WAIT_MS - 1)).toBe(false);
+    expect(viewerHostWaitExpired(0, VIEWER_HOST_WAIT_MS)).toBe(true);
+    expect(viewerHostWaitExpired(0, VIEWER_HOST_WAIT_MS + 1)).toBe(true);
+  });
+
   it('earliestAlarm picks the minimum finite candidate', () => {
     expect(earliestAlarm()).toBeNull();
     expect(earliestAlarm(undefined, null)).toBeNull();
@@ -130,4 +139,3 @@ describe('deadline helpers', () => {
     expect(earliestAlarm(NaN, 5)).toBe(5);
   });
 });
-
