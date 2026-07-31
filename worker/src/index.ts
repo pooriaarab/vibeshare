@@ -21,6 +21,10 @@
  *     the expected string fields are forwarded, reconstructed server-side.
  *     Keys, session bytes, and every other frame shape are dropped.
  *
+ * Availability / isolation hardening (see ./limits.ts for tunable constants):
+ *
+ *   - max viewers per share (host exempt).
+ *
  * Protocol (mirrored by src/webrtc/wsSignaling.ts + src/webrtc/viewerPage.ts):
  *
  *   GET /vibeshare/s/<id>                          → the viewer page (HTML)
@@ -29,6 +33,7 @@
  *   GET /vibeshare/health                          → liveness
  */
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
+import { MAX_VIEWERS, atViewerCap, countViewers } from './limits.js';
 
 export interface Env {
   readonly SHARES: DurableObjectNamespace;
@@ -117,6 +122,12 @@ export class ShareRoom implements DurableObject {
         await this.ctx.storage.put('hostSecret', secret);
       } else if (bound !== secret) {
         return new Response('forbidden: this share already has a host', { status: 403 });
+      }
+    } else {
+      // Max viewers per share — refuse the upgrade before accepting (fail closed).
+      const roles = this.socketRoles();
+      if (atViewerCap(countViewers(roles), MAX_VIEWERS)) {
+        return new Response('too many viewers', { status: 429 });
       }
     }
 
@@ -228,6 +239,15 @@ export class ShareRoom implements DurableObject {
         }),
       );
     }
+  }
+
+  private socketRoles(): Array<'host' | 'viewer'> {
+    const roles: Array<'host' | 'viewer'> = [];
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.role === 'host' || att?.role === 'viewer') roles.push(att.role);
+    }
+    return roles;
   }
 
   private hostSocket(): WebSocket | undefined {
