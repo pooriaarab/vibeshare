@@ -13,7 +13,13 @@
  *   - every DataChannel frame is decrypted with WebCrypto using the slice-1
  *     wire format `nonce(12) ‖ ciphertext ‖ tag(16)`,
  *   - collaborator input carries a per-peer monotonic `seq` INSIDE the
- *     encrypted payload (the host drops replays; see `transport.ts`).
+ *     encrypted payload (the host drops replays; see `transport.ts`),
+ *   - presence + chat ride the Worker multi-party hub (NOT the DataChannel):
+ *     chat TEXT is e2e-encrypted with the share key so the Worker relays
+ *     ciphertext only; sender identity is stamped by the Worker from the
+ *     connection (never trusted from the payload). Display text is sanitized
+ *     client-side against terminal/bidi injection (mirrors vibe-core
+ *     sanitizePeerText).
  *
  * Terminal rendering uses the same inlined xterm.js bootstrap as the local
  * spectator page so raw PTY bytes reconstruct the real TUI on both transports.
@@ -38,6 +44,15 @@ export function viewerPage(): string {
     <div class="p2p"><b>●</b> p2p · end-to-end encrypted</div>
   </header>
 
+  <div class="panel" id="namePanel">
+    <h1>Watch this session live</h1>
+    <p>End-to-end encrypted peer-to-peer. Pick a display name so others know who's watching.</p>
+    <div class="row">
+      <input id="nameInput" placeholder="your name (optional)" maxlength="32" autocomplete="nickname">
+      <button id="joinBtn">Watch</button>
+    </div>
+  </div>
+
   <div class="panel hidden" id="errPanel">
     <h1>Can't watch this share</h1>
     <p id="errText"></p>
@@ -45,7 +60,7 @@ export function viewerPage(): string {
 
   <div class="meta">
     <span class="badge" id="badge"><span class="d"></span> CONNECTING</span>
-    <span class="count" id="viewerIdLabel"></span>
+    <span class="presence" id="presenceLabel">👁 <b id="watching">0</b> watching</span>
   </div>
 
   <div class="term">
@@ -57,6 +72,15 @@ export function viewerPage(): string {
     <input id="cmdInput" placeholder="send input to the session (applied only if the host approved you)" disabled>
     <button id="sendBtn" disabled>Send</button>
   </div>
+
+  <div class="chat" id="chatBox">
+    <div class="chat-head">Chat · e2e encrypted</div>
+    <div class="chat-log" id="chatLog"><div class="chat-empty">Say hi — messages are end-to-end encrypted with the share key.</div></div>
+    <form class="chat-form" id="chatForm">
+      <input id="chatInput" placeholder="message the room…" maxlength="500" disabled autocomplete="off">
+      <button id="chatSend" type="submit" disabled>Send</button>
+    </form>
+  </div>
 </div>
 
 ${xtermScriptTags()}
@@ -65,17 +89,47 @@ ${XTERM_BOOT_JS}
 (function(){
   "use strict";
 
+  // Mirror of vibe-core sanitizePeerText — peer display text is untrusted.
+  var UNSAFE = /[\\u0000-\\u0008\\u000B-\\u001F\\u007F-\\u009F\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]/g;
+  function sanitizePeerText(text, maxLen){
+    if(typeof text !== "string") return "";
+    var cleaned = text.replace(UNSAFE, "");
+    if(typeof maxLen === "number" && cleaned.length > maxLen) cleaned = cleaned.slice(0, maxLen);
+    return cleaned;
+  }
+  function escapeHtml(s){
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   var badge = document.getElementById("badge");
   var termBody = document.getElementById("termBody");
   var cmdInput = document.getElementById("cmdInput");
   var sendBtn = document.getElementById("sendBtn");
+  var namePanel = document.getElementById("namePanel");
+  var nameInput = document.getElementById("nameInput");
+  var joinBtn = document.getElementById("joinBtn");
+  var watchingEl = document.getElementById("watching");
+  var presenceLabel = document.getElementById("presenceLabel");
+  var chatLog = document.getElementById("chatLog");
+  var chatInput = document.getElementById("chatInput");
+  var chatSend = document.getElementById("chatSend");
+  var chatForm = document.getElementById("chatForm");
   var termApi = null;
   var lastEntrySeq = 0;
+  var myViewerId = null;
+  var myName = "";
+  var joined = false;
+  var chatEmpty = true;
 
   function setBadge(cls, text){ badge.className = "badge" + (cls ? " " + cls : ""); badge.innerHTML = '<span class="d"></span> ' + text; }
   function fatal(msg){
     document.getElementById("errText").textContent = msg;
     document.getElementById("errPanel").classList.remove("hidden");
+    namePanel.classList.add("hidden");
     setBadge("ended", "UNAVAILABLE");
   }
   function ensureTerm(){
@@ -110,6 +164,17 @@ ${XTERM_BOOT_JS}
     for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
   }
+  function bytesToB64(bytes){
+    var bin = "";
+    for(var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  function b64ToBytes(s){
+    var bin = atob(s);
+    var out = new Uint8Array(bin.length);
+    for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
 
   var keyPromise;
   try {
@@ -119,27 +184,86 @@ ${XTERM_BOOT_JS}
     return;
   }
 
-  // ---- signaling: the Worker assigns our viewerId and relays the handshake
+  // ---- signaling: the Worker assigns our viewerId and relays handshake + presence/chat
   var wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/vibeshare/ws/viewer?share=" + encodeURIComponent(shareId);
   var ws = new WebSocket(wsUrl);
   var pc = null, dc = null, key = null;
   var remoteDescSet = false;
   var iceQueue = [];
   var inputSeq = 0;      // per-peer monotonic, inside the encrypted payload
+  var pendingHello = null;
+
+  function send(obj){ if(ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  function renderPresence(viewers){
+    if(!Array.isArray(viewers)) return;
+    var names = [];
+    var count = 0;
+    for(var i = 0; i < viewers.length; i++){
+      var v = viewers[i];
+      if(!v || typeof v.name !== "string") continue;
+      var n = sanitizePeerText(v.name, 32).trim() || "viewer";
+      if(v.role === "viewer") count++;
+      names.push(escapeHtml(n) + (v.role === "host" ? " (host)" : ""));
+    }
+    watchingEl.textContent = String(count);
+    var label = '👁 <b id="watching">' + count + "</b> watching";
+    if(names.length > 0){
+      label += ' <span class="names">· ' + names.map(function(n){ return "<em>" + n + "</em>"; }).join(", ") + "</span>";
+    }
+    presenceLabel.innerHTML = label;
+    watchingEl = document.getElementById("watching") || watchingEl;
+  }
+
+  function appendChat(frame){
+    if(!frame) return;
+    var name = sanitizePeerText(frame.name || "viewer", 32).trim() || "viewer";
+    var mine = myViewerId && frame.viewerId === myViewerId;
+    function show(text){
+      if(chatEmpty){ chatLog.innerHTML = ""; chatEmpty = false; }
+      var line = document.createElement("div");
+      line.className = "chat-line" + (mine ? " mine" : "");
+      line.innerHTML = '<span class="who">' + escapeHtml(name) + '</span>: <span class="msg">' + escapeHtml(text) + "</span>";
+      chatLog.appendChild(line);
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+    // Decrypt ciphertext with the share key; Worker never saw plaintext.
+    if(!key || typeof frame.text !== "string") return;
+    var bytes;
+    try { bytes = b64ToBytes(frame.text); } catch(e){ return; }
+    if(bytes.length < 12 + 16) return;
+    var nonce = bytes.slice(0, 12);
+    var ct = bytes.slice(12);
+    crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ct).then(function(plain){
+      var text = sanitizePeerText(new TextDecoder().decode(plain), 500);
+      if(text.length > 0) show(text);
+    }).catch(function(){ /* GCM auth failure — drop */ });
+  }
+
+  function enableChat(){
+    chatInput.disabled = false;
+    chatSend.disabled = false;
+  }
 
   ws.onmessage = function(ev){
     var msg;
     try { msg = JSON.parse(ev.data); } catch(e){ return; }
     if(!msg || typeof msg.kind !== "string") return;
     if(msg.kind === "assigned"){
-      document.getElementById("viewerIdLabel").textContent = "viewer " + msg.viewerId.slice(0, 8);
-      startPeer();
+      myViewerId = msg.viewerId;
+      if(joined) startPeer();
     } else if(msg.kind === "rtc-offer"){
       onOffer(msg.sdp);
     } else if(msg.kind === "rtc-ice"){
       onRemoteIce(msg.candidate, msg.mid);
+    } else if(msg.kind === "presence"){
+      renderPresence(msg.viewers);
+    } else if(msg.kind === "chat"){
+      appendChat(msg);
     }
-    // anything else: the Worker relays only these kinds anyway — ignore.
+  };
+  ws.onopen = function(){
+    if(pendingHello){ send(pendingHello); pendingHello = null; }
   };
   ws.onclose = function(ev){
     if(ev.code === 1012) ended("SHARE ENDED", "— the host ended this share —");
@@ -147,7 +271,19 @@ ${XTERM_BOOT_JS}
   };
   ws.onerror = function(){ setBadge("ended", "OFFLINE"); };
 
-  function send(obj){ if(ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+  joinBtn.addEventListener("click", function(){
+    if(joined) return;
+    joined = true;
+    myName = sanitizePeerText(nameInput.value || "", 32).trim();
+    if(!myName) myName = "viewer";
+    namePanel.classList.add("hidden");
+    var hello = { kind: "hello", name: myName };
+    if(ws.readyState === 1) send(hello);
+    else pendingHello = hello;
+    if(myViewerId) startPeer();
+    enableChat();
+    setBadge("", "CONNECTING · waiting for host");
+  });
 
   function startPeer(){
     if(pc) return;
@@ -227,16 +363,35 @@ ${XTERM_BOOT_JS}
   sendBtn.addEventListener("click", sendInput);
   cmdInput.addEventListener("keydown", function(ev){ if(ev.key === "Enter") sendInput(); });
 
+  // ---- chat: encrypt plaintext with share key; Worker stamps identity
+  chatForm.addEventListener("submit", function(ev){
+    ev.preventDefault();
+    var text = sanitizePeerText(chatInput.value || "", 500).trim();
+    if(!text || !key || ws.readyState !== 1) return;
+    chatInput.value = "";
+    var payload = new TextEncoder().encode(text);
+    var nonce = crypto.getRandomValues(new Uint8Array(12));
+    crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, payload).then(function(ct){
+      var out = new Uint8Array(12 + ct.byteLength);
+      out.set(nonce, 0);
+      out.set(new Uint8Array(ct), 12);
+      // Send ONLY ciphertext — never claim viewerId/name (Worker stamps them).
+      send({ kind: "chat", text: bytesToB64(out) });
+    });
+  });
+
   function ended(state, msg){
     setBadge("ended", state);
     cmdInput.disabled = true;
     sendBtn.disabled = true;
+    chatInput.disabled = true;
+    chatSend.disabled = true;
     applyEntry({ type: "system", text: msg });
   }
 
   keyPromise.then(function(k){
     key = k;
-    setBadge("", "CONNECTING · waiting for host");
+    setBadge("", "CONNECTING · enter a name to watch");
   }).catch(function(){
     fatal("The link's key fragment could not be imported as an AES-GCM key.");
   });

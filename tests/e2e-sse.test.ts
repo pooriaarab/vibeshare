@@ -145,5 +145,64 @@ describe('LocalHttpTransport e2e SSE mode', () => {
     const plain = decryptFrame(key, Buffer.from(viewers.data, 'base64'));
     expect(JSON.parse(plain.toString('utf8'))).toMatchObject({ watching: expect.any(Number) });
   });
+
+  it('relays e2e chat ciphertext and stamps sender from the viewer token', async () => {
+    const { encryptChatText, decryptChatText } = await import('../src/presenceChatCrypto.js');
+    const chats: Array<{ viewerId: string; name: string; text: string }> = [];
+    await manager.stopAll();
+    await transport.close();
+    const consent = createConsentLedger();
+    consent.grant(SHARE_SCOPE, 'test');
+    key = randomBytes(E2E_KEY_LEN);
+    transport = new LocalHttpTransport({
+      hostToken: 'e2e-host-token',
+      e2e: { key },
+      onChat: (_id, frame) => chats.push(frame),
+    });
+    await transport.listen();
+    manager = new ShareManager({ consent, transport });
+
+    const created = await manager.createShare();
+    const v = await join(created);
+    const stream = await fetch(`${v.url}/stream?token=${v.body['token']}`);
+
+    const cipher = encryptChatText(key, 'secret hello');
+    expect(cipher).not.toContain('secret hello');
+
+    const chatWait = readSse(stream, (ev) => ev.some((e) => e.event === 'chat'));
+    const res = await fetch(`${v.url}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token: v.body['token'],
+        viewerId: 'forged',
+        name: 'Eve',
+        text: cipher,
+      }),
+    });
+    expect(res.status).toBe(202);
+
+    const events = await chatWait;
+    const chatEv = events.find((e) => e.event === 'chat')!;
+    // Outer SSE envelope is e2e-encrypted too.
+    expect(() => JSON.parse(chatEv.data)).toThrow();
+    const envelope = JSON.parse(
+      decryptFrame(key, Buffer.from(chatEv.data, 'base64')).toString('utf8'),
+    ) as Record<string, unknown>;
+    expect(envelope['viewerId']).toBe(v.body['viewerId']); // stamped
+    expect(envelope['name']).not.toBe('Eve');
+    // Inner chat text is STILL ciphertext (double-blind for tunnel provider).
+    expect(typeof envelope['text']).toBe('string');
+    expect(String(envelope['text'])).not.toContain('secret hello');
+    expect(decryptChatText(key, String(envelope['text']))).toBe('secret hello');
+
+    // Host callback received plaintext for the terminal.
+    expect(chats).toEqual([
+      expect.objectContaining({
+        viewerId: v.body['viewerId'],
+        text: 'secret hello',
+      }),
+    ]);
+  });
 });
 
