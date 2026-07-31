@@ -4,6 +4,12 @@ import { SessionFeed } from '../src/feed.js';
 import { ViewerRegistry } from '../src/registry.js';
 import { ShareError, type ShareAccess } from '../src/types.js';
 
+function entryText(e: { type: string; text?: string; data?: string }): string {
+  if (e.type === 'raw') return Buffer.from(e.data!, 'base64').toString('utf8');
+  if ('text' in e && typeof e.text === 'string') return e.text;
+  return '';
+}
+
 describe('SessionFeed', () => {
   it('publishes entries with monotonic seq numbers', () => {
     const feed = new SessionFeed();
@@ -11,14 +17,27 @@ describe('SessionFeed', () => {
     const b = feed.publish('two', { stream: 'stderr' });
     expect(a.seq).toBe(1);
     expect(b.seq).toBe(2);
-    expect(b.stream).toBe('stderr');
-    expect(feed.backlog().map((e) => e.text)).toEqual(['one', 'two']);
+    expect(b.type).toBe('output');
+    if (b.type === 'output') expect(b.stream).toBe('stderr');
+    expect(feed.backlog().map(entryText)).toEqual(['one', 'two']);
+  });
+
+  it('publishes raw PTY bytes as base64 and resize events', () => {
+    const feed = new SessionFeed();
+    const raw = feed.publishRaw(Buffer.from('\x1b[32mGREEN\x1b[0m', 'utf8'));
+    const resize = feed.publishResize(120, 40);
+    expect(raw).toMatchObject({ seq: 1, type: 'raw' });
+    if (raw.type === 'raw') {
+      expect(Buffer.from(raw.data, 'base64').toString('utf8')).toBe('\x1b[32mGREEN\x1b[0m');
+    }
+    expect(resize).toMatchObject({ seq: 2, type: 'resize', cols: 120, rows: 40 });
+    expect(feed.backlog()).toHaveLength(2);
   });
 
   it('fans out to subscribers and stops after unsubscribe', () => {
     const feed = new SessionFeed();
     const seen: string[] = [];
-    const unsub = feed.subscribe((e) => seen.push(e.text));
+    const unsub = feed.subscribe((e) => seen.push(entryText(e)));
     feed.publish('a');
     unsub();
     feed.publish('b');
@@ -29,7 +48,7 @@ describe('SessionFeed', () => {
   it('caps the replay log (ring buffer)', () => {
     const feed = new SessionFeed(3);
     for (let i = 1; i <= 5; i++) feed.publish(`line ${i}`);
-    expect(feed.backlog().map((e) => e.text)).toEqual(['line 3', 'line 4', 'line 5']);
+    expect(feed.backlog().map(entryText)).toEqual(['line 3', 'line 4', 'line 5']);
     expect(feed.backlog()[0]!.seq).toBe(3);
   });
 
@@ -37,7 +56,7 @@ describe('SessionFeed', () => {
     const feed = new SessionFeed();
     const entry = feed.publishEvent(makeEvent('task-done', 'kimi', '/tmp', { detail: 'commit abc' }));
     expect(entry.type).toBe('milestone');
-    expect(entry.text).toBe('◆ task-done · kimi — commit abc');
+    if (entry.type === 'milestone') expect(entry.text).toBe('◆ task-done · kimi — commit abc');
   });
 
   it('system lines are typed', () => {
@@ -53,6 +72,8 @@ describe('SessionFeed', () => {
     expect(onClose).toHaveBeenCalledOnce();
     expect(feed.closed).toBe(true);
     expect(() => feed.publish('nope')).toThrow(/closed/);
+    expect(() => feed.publishRaw('x')).toThrow(/closed/);
+    expect(() => feed.publishResize(80, 24)).toThrow(/closed/);
     feed.close(); // idempotent
     expect(onClose).toHaveBeenCalledOnce();
   });
