@@ -29,11 +29,19 @@ export { FileConsentStore, loadLedger, vibeHome } from './consent.js';
 export {
   DEFAULT_SIGNALING_URL,
   SIGNALING_ENV,
+  TUNNEL_PROVIDER_ENV,
+  NGROK_AUTHTOKEN_ENV,
+  FRP_SERVER_ADDR_ENV,
   readConfigFile,
   resolveSignaling,
   resolveSignalingUrl,
+  resolveTunnel,
+  resolveTunnelConfig,
+  type ResolvedTunnel,
   type SignalingSources,
+  type TunnelAccountConfig,
   type TunnelConfig,
+  type TunnelSources,
   type VibeShareConfig,
 } from './config.js';
 export { SessionFeed, type PublishOptions } from './feed.js';
@@ -61,6 +69,13 @@ export {
   type ViewerRole,
 } from './types.js';
 export { hashPassphrase, newShareId, newToken, parseExpiry, verifyPassphrase } from './utils.js';
+export {
+  createTunnelRegistry,
+  TunnelRegistry,
+  type TunnelHandle,
+  type TunnelProvider,
+  type TunnelStartOpts,
+} from './tunnel/index.js';
 export { VERSION } from './version.js';
 
 let defaultManager: ShareManager | null = null;

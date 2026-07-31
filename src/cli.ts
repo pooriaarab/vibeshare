@@ -10,6 +10,7 @@
  * gates every share, and the spectator stream is served straight from here.
  */
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -22,11 +23,13 @@ import {
   writeActiveShare,
   type ActiveShareRecord,
 } from './consent.js';
-import { resolveSignaling } from './config.js';
+import { resolveSignaling, resolveTunnel } from './config.js';
+import { E2E_KEY_LEN } from './e2e.js';
 import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
 import { startMcp } from './mcp.js';
 import type { ShareTransport } from './transport.js';
+import { createTunnelRegistry, type TunnelHandle } from './tunnel/index.js';
 import { VERSION } from './version.js';
 import { WebRtcTransport } from './webrtc/transport.js';
 import { WsSignaling } from './webrtc/wsSignaling.js';
@@ -50,8 +53,21 @@ export interface StartOptions {
   yes: boolean;
   /** Share peer-to-peer over WebRTC via the signaling rendezvous. */
   public: boolean;
+  /**
+   * Tunnel mode: expose the local session server through a TunnelProvider.
+   * - `true`  → detect-cascade (`TunnelRegistry.resolve()`)
+   * - string  → that named provider (error if undetected)
+   * - false   → off
+   * Mutually exclusive with `--public`.
+   */
+  tunnel: boolean | string;
   /** `--signaling <url>` override for the rendezvous (see src/config.ts). */
   signaling?: string;
+  /**
+   * Injectable tunnel registry (tests). Production uses createTunnelRegistry().
+   * Accepts anything with the resolve() shape so mocks stay light.
+   */
+  tunnelRegistry?: { resolve(preferred?: string): Promise<{ name: string; start(port: number, opts?: import('./tunnel/provider.js').TunnelStartOpts): Promise<TunnelHandle> }> };
   command: string[];
 }
 
@@ -85,6 +101,10 @@ options:
   --public          share peer-to-peer over WebRTC; viewers watch in a browser
                     at https://getvibe.dev/vibeshare/s/<id>#<key> (end-to-end
                     encrypted — only the handshake crosses the rendezvous)
+  --tunnel [name]   expose the local server via a tunnel from this machine
+                    (cloudflared/ngrok/tailscale/…); end-to-end encrypted so the
+                    provider sees only ciphertext. No name = detect cascade.
+                    BYO accounts in ~/.vibeshare/config.json under "tunnel".
   --signaling <url> signaling rendezvous for --public (default wss://getvibe.dev/vibeshare;
                     also VIBESHARE_SIGNALING or ~/.vibeshare/config.json signalingUrl)
   --port <n>        port to serve on (default: random; local shares only)
@@ -146,6 +166,7 @@ export function parseArgv(argv: string[]): CliCommand {
     host: '127.0.0.1',
     yes: false,
     public: false,
+    tunnel: false,
     command: [],
   };
   for (let i = 0; i < rest.length; i++) {
@@ -161,6 +182,17 @@ export function parseArgv(argv: string[]): CliCommand {
     } else if (a === '--spectate') options.access = 'spectate';
     else if (a === '--invite') options.access = 'invite';
     else if (a === '--public') options.public = true;
+    else if (a === '--tunnel') {
+      // Optional value: `--tunnel` (cascade) or `--tunnel ngrok`.
+      // A following bare non-flag token is the provider name; anything
+      // starting with `-` or end-of-args means cascade with no name.
+      const next = rest[i + 1];
+      if (next !== undefined && !next.startsWith('-') && next !== '--') {
+        options.tunnel = rest[++i]!;
+      } else {
+        options.tunnel = true;
+      }
+    }
     else if (a === '--signaling') options.signaling = value(a);
     else if (a === '--expire' || a === '--expiry') options.expiry = value(a);
     else if (a === '--pass') options.passphrase = value(a);
@@ -260,18 +292,27 @@ function lineBuffer(publish: (line: string) => void): { push(chunk: string): voi
 }
 
 async function startShare(options: StartOptions, io: IO): Promise<number> {
+  if (options.public && options.tunnel) {
+    io.err('vibeshare: --public and --tunnel are mutually exclusive');
+    return 2;
+  }
   if (!(await ensureConsent(io, options.yes))) return 1;
 
   const bus = createHookBus({ onError: (e) => io.err(`[vibeshare] hook error: ${String(e)}`) });
   const watcher = watchCwd(process.cwd(), bus);
 
   let created: CreatedShare | null = null;
-  // --public: pure-P2P over WebRTC — session bytes go host→viewer on an
-  // AES-GCM DataChannel; only the handshake crosses the signaling rendezvous
-  // (getvibe.dev by default, or BYO via --signaling / VIBESHARE_SIGNALING /
-  // config file). Default: the local HTTP spectator server (unchanged).
+  // Three modes:
+  //   --public → pure-P2P WebRTC (AES-GCM DataChannel; handshake via signaling)
+  //   --tunnel → local HTTP + e2e AES-GCM SSE exposed via a TunnelProvider
+  //   default  → local HTTP spectator server on loopback (unchanged)
   let transport: ShareTransport;
   let localHttp: LocalHttpTransport | null = null;
+  let tunnelHandle: TunnelHandle | null = null;
+  let tunnelProviderName: string | null = null;
+  let publicShareUrl: string | null = null;
+  const tunnelOn = options.tunnel !== false;
+
   if (options.public) {
     const signalingUrl = resolveSignaling(options.signaling);
     transport = new WebRtcTransport({
@@ -284,6 +325,19 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
       // — the share URL is the ws endpoint with an http(s) scheme.
       baseUrl: signalingUrl.replace(/^ws/, 'http'),
     });
+  } else if (tunnelOn) {
+    // Fresh per-share key — tunnel provider never sees it (URL #fragment only).
+    const e2eKey = randomBytes(E2E_KEY_LEN);
+    localHttp = new LocalHttpTransport({
+      // Always bind loopback for tunnel mode — the provider is what punches out.
+      host: '127.0.0.1',
+      port: options.port,
+      e2e: { key: e2eKey },
+      onStopRequested: () => {
+        shutdown(0);
+      },
+    });
+    transport = localHttp;
   } else {
     localHttp = new LocalHttpTransport({
       host: options.host,
@@ -315,6 +369,33 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
     throw err;
   }
 
+  if (tunnelOn && localHttp) {
+    try {
+      const resolved = resolveTunnel(
+        options.tunnel === true ? true : typeof options.tunnel === 'string' ? options.tunnel : undefined,
+      );
+      const registry = options.tunnelRegistry ?? createTunnelRegistry();
+      const provider = await registry.resolve(resolved.provider);
+      tunnelProviderName = provider.name;
+      // Local URL looks like http://127.0.0.1:PORT/s/ID#KEY — only path+fragment survive.
+      const localUrl = new URL(created.url.replace(/#.*$/, '')); // strip fragment for URL parsing
+      const fragment = created.url.includes('#') ? created.url.slice(created.url.indexOf('#') + 1) : '';
+      tunnelHandle = await provider.start(localHttp.port, resolved.startOpts);
+      const publicBase = tunnelHandle.url.replace(/\/$/, '');
+      publicShareUrl = `${publicBase}${localUrl.pathname}${fragment ? `#${fragment}` : ''}`;
+      // Rewrite so viewers / the state file point at the public URL.
+      created = { ...created, url: publicShareUrl };
+    } catch (err) {
+      watcher.stop();
+      clearActiveShare(created.share.id);
+      await manager.stopAll();
+      const msg = err instanceof Error ? err.message : String(err);
+      // Never echo secrets — startOpts.env is not in the error path.
+      io.err(`vibeshare: tunnel failed: ${msg}`);
+      return 2;
+    }
+  }
+
   // Milestones from the vibe-core watcher floor (commits, sentinel signals).
   for (const kind of HOOK_KINDS) {
     bus.on(kind, (e) => {
@@ -329,11 +410,12 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
     hostToken: localHttp?.hostToken ?? '',
     pid: process.pid,
     startedAt: new Date().toISOString(),
-    transport: options.public ? 'webrtc' : 'local-http',
+    transport: options.public ? 'webrtc' : tunnelOn ? 'tunnel' : 'local-http',
   };
   writeActiveShare(record);
 
-  const loopback = !options.public && (options.host === '127.0.0.1' || options.host === 'localhost' || options.host === '::1');
+  const loopback = !options.public && !tunnelOn && (options.host === '127.0.0.1' || options.host === 'localhost' || options.host === '::1');
+  // vibe-core badge() only knows 'local' | 'p2p' today; tunnel reuses p2p chrome.
   io.out(`${badge(loopback ? 'local' : 'p2p')}`);
   io.out(`  sharing:  ${created.share.name}`);
   io.out(`  url:      ${created.url}`);
@@ -341,8 +423,12 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   io.out(`  expires:  ${created.share.expiresAt ?? 'until you stop'}`);
   if (created.share.passphraseHash) io.out(`  pass:     required`);
   if (options.public) io.out(`  mode:     public · end-to-end encrypted p2p (only the handshake crosses the rendezvous)`);
+  if (tunnelOn && tunnelProviderName) {
+    io.out(`  mode:     tunnel · end-to-end encrypted (provider: ${tunnelProviderName})`);
+    io.out(`  provider: ${tunnelProviderName}`);
+  }
   io.out(`  manage:   vibeshare viewers · vibeshare stop`);
-  if (!loopback && !options.public) io.err('note: bound to a non-loopback address — anyone who can reach this host with the link can watch.');
+  if (!loopback && !options.public && !tunnelOn) io.err('note: bound to a non-loopback address — anyone who can reach this host with the link can watch.');
 
   // Spawn the session being shared and tee its output into the feed.
   const cmd = options.command.length > 0 ? options.command : [process.env['SHELL'] ?? '/bin/sh'];
@@ -388,6 +474,10 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   watcher.stop();
   clearActiveShare(record.id);
   await manager.stopAll();
+  if (tunnelHandle) {
+    try { await tunnelHandle.stop(); } catch { /* best effort */ }
+    tunnelHandle = null;
+  }
   return exitCode;
 }
 
@@ -551,19 +641,8 @@ async function stopCommand(cmd: Extract<CliCommand, { cmd: 'stop' }>, io: IO): P
 
 // ---------------------------------------------------------------- main
 
-export async function run(argv: string[], io: IO = stdio): Promise<number> {
-  let command: CliCommand;
-  try {
-    command = parseArgv(argv);
-  } catch (err) {
-    if (err instanceof CliUsageError) {
-      io.err(`vibeshare: ${err.message}\n`);
-      io.err(USAGE);
-      return 2;
-    }
-    throw err;
-  }
-
+/** Dispatch a parsed command (exported so tests can inject StartOptions seams). */
+export async function runCommand(command: CliCommand, io: IO = stdio): Promise<number> {
   switch (command.cmd) {
     case 'help':
       io.out(USAGE);
@@ -581,6 +660,21 @@ export async function run(argv: string[], io: IO = stdio): Promise<number> {
     case 'stop':
       return stopCommand(command, io);
   }
+}
+
+export async function run(argv: string[], io: IO = stdio): Promise<number> {
+  let command: CliCommand;
+  try {
+    command = parseArgv(argv);
+  } catch (err) {
+    if (err instanceof CliUsageError) {
+      io.err(`vibeshare: ${err.message}\n`);
+      io.err(USAGE);
+      return 2;
+    }
+    throw err;
+  }
+  return runCommand(command, io);
 }
 
 /* c8 ignore next 3 — entry guard */
