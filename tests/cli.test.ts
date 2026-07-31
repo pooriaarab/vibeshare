@@ -242,3 +242,24 @@ describe('run (with an isolated VIBESHARE_HOME)', () => {
     expect(c.err.join()).toMatch(/mutually exclusive/i);
   });
 });
+
+describe('VERSION matches package.json', () => {
+  it('--version prints package.json version', async () => {
+    const { readFileSync } = await import('node:fs');
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      version: string;
+    };
+    const { VERSION } = await import('../src/version.js');
+    expect(VERSION).toBe(pkg.version);
+    expect(pkg.version).toBe('0.2.7');
+
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await run(['--version'], {
+      out: (t) => out.push(t),
+      err: (t) => err.push(t),
+    });
+    expect(code).toBe(0);
+    expect(out.join()).toBe(`vibeshare ${pkg.version}`);
+  });
+});
