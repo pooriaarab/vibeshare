@@ -33,7 +33,7 @@
  *   GET /vibeshare/health                          → liveness
  */
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
-import { MAX_VIEWERS, atViewerCap, countViewers } from './limits.js';
+import { MAX_VIEWERS, atViewerCap, countViewers, pruneRateLimitMap, recordConnection } from './limits.js';
 
 export interface Env {
   readonly SHARES: DurableObjectNamespace;
@@ -97,6 +97,12 @@ interface Attachment {
  * for a single share and fans the handshake out between them.
  */
 export class ShareRoom implements DurableObject {
+  /**
+   * Best-effort in-memory sliding window of recent connection timestamps per
+   * CF-Connecting-IP. Resets on DO hibernation — defense-in-depth only.
+   */
+  private readonly connByIp = new Map<string, number[]>();
+
   constructor(
     private readonly ctx: DurableObjectState,
     private readonly env: Env,
@@ -109,6 +115,18 @@ export class ShareRoom implements DurableObject {
     }
     const shareId = url.searchParams.get('share') ?? '';
     const isHost = url.pathname.endsWith('/ws/host');
+    const now = Date.now();
+
+    // Per-IP upgrade rate limit (host + viewer). Missing header shares one
+    // "unknown" bucket so non-CF / local clients are still capped (fail closed).
+    const ip = (request.headers.get('CF-Connecting-IP') ?? '').trim() || 'unknown';
+    pruneRateLimitMap(this.connByIp, now);
+    const prior = this.connByIp.get(ip) ?? [];
+    const decision = recordConnection(prior, now);
+    this.connByIp.set(ip, decision.timestamps);
+    if (!decision.allowed) {
+      return new Response('rate limit exceeded', { status: 429 });
+    }
 
     if (isHost) {
       const secret = url.searchParams.get('secret') ?? '';
