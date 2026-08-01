@@ -75,6 +75,11 @@ export function viewerPage(): string {
     <div class="term-body" id="termBody"></div>
   </div>
 
+  <div class="export-bar" id="exportBar">
+    <button type="button" id="exportPngBtn" title="Download a PNG of the visible terminal">Export PNG</button>
+    <button type="button" id="exportTextBtn" title="Download the full terminal scrollback as plain text">Export text</button>
+  </div>
+
   <button class="join-btn hidden" id="reqBtn">Request to drive</button>
 
   <div class="input-row">
@@ -149,6 +154,18 @@ ${XTERM_BOOT_JS}
     termApi = __vsCreateTerm(termBody);
     return termApi;
   }
+  function exportBaseName(){
+    var n = shareId ? String(shareId) : "session";
+    n = n.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+    if(!n) n = "session";
+    return "vibeshare-" + n + "-" + Date.now();
+  }
+  document.getElementById("exportPngBtn").addEventListener("click", function(){
+    try { __vsExportPng(ensureTerm(), exportBaseName() + ".png"); } catch(e){}
+  });
+  document.getElementById("exportTextBtn").addEventListener("click", function(){
+    try { __vsExportText(ensureTerm(), exportBaseName() + ".txt"); } catch(e){}
+  });
   function applyEntry(entry){
     if(!entry) return;
     if(typeof entry.seq === "number"){
