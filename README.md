@@ -6,6 +6,24 @@ Part of the **Vibe Suite** — companion tools for agentic coding CLIs (Claude C
 
 **Local-first: the share runs on your machine.** The consent ledger gates every share (`share:session` scope), the stream is served straight from your host, and nothing is stored on a server.
 
+## Works with any harness
+
+vibeshare shares a LIVE TERMINAL SESSION. It wraps a PTY, so the program inside is irrelevant — any agent CLI, shell, or TUI renders faithfully (colors, cursor, full-screen) via xterm.js in the browser.
+
+**Two ways to share a session:**
+- **Wrap at launch (no tmux):** `vibeshare --public -- <harness>` — vibeshare is the parent, PTY-captures. Examples: `vibeshare --public -- claude`, `-- codex`, `-- gemini`, `-- aider`, `-- opencode`, `-- kimi`, `-- amp`, or any shell/command.
+- **Attach to an already-running session (needs tmux):** run the harness inside tmux, then `vibeshare attach <pane>` taps it live. Harness-agnostic — it captures the terminal, not the app.
+
+**Verified harnesses** (all render the real TUI live): Claude Code (`claude`), OpenAI Codex (`codex`), Gemini CLI (`gemini`), aider (requires `pip install aider-chat`), opencode, Moonshot Kimi (`kimi`), pi (grok/glm), Sourcegraph amp (requires its own PATH setup). Others (Continue, Goose, Crush, Qwen, Cursor Agent, Warp, Zed, …) wrap identically — they're just terminal programs.
+
+| Need | Command |
+| :--- | :--- |
+| Share a new claude session | `vibeshare --public -- claude` |
+| Share a running session | Run it in tmux + `vibeshare attach <pane>` |
+| Local-only sharing | `vibeshare -- <cmd>` |
+
+*Modes:* `--public` (WebRTC P2P + e2e via getvibe.dev), `--tunnel <provider>` (12 providers, e2e), or local loopback/LAN. Presence + attributed chat included.
+
 ## Demo
 
 [▶ Watch the launch video](branding/launch-video.mp4) — claude is multiplayer now.
