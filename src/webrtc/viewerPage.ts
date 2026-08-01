@@ -60,11 +60,18 @@ export function viewerPage(): string {
 
   <div class="meta">
     <span class="badge" id="badge"><span class="d"></span> CONNECTING</span>
-    <span class="presence" id="presenceLabel">👁 <b id="watching">0</b> watching</span>
+    <button type="button" class="presence toggleable" id="presenceLabel" aria-expanded="false" title="Show who's watching">👁 <b id="watching">0</b> watching</button>
   </div>
 
   <div class="term">
-    <div class="chrome"><span></span><span></span><span></span><span class="path" id="chromePath"></span></div>
+    <div class="chrome">
+      <span></span><span></span><span></span>
+      <span class="path" id="chromePath"></span>
+      <div class="term-tools" role="group" aria-label="Terminal font size">
+        <button type="button" class="font-btn" id="fontDec" title="Smaller text" aria-label="Decrease terminal font size">A−</button>
+        <button type="button" class="font-btn" id="fontInc" title="Larger text" aria-label="Increase terminal font size">A+</button>
+      </div>
+    </div>
     <div class="term-body" id="termBody"></div>
   </div>
 
@@ -200,6 +207,14 @@ ${XTERM_BOOT_JS}
 
   function send(obj){ if(ws.readyState === 1) ws.send(JSON.stringify(obj)); }
 
+  var presenceExpanded = false;
+  presenceLabel.addEventListener("click", function(){
+    presenceExpanded = !presenceExpanded;
+    if(presenceExpanded) presenceLabel.classList.add("expanded");
+    else presenceLabel.classList.remove("expanded");
+    presenceLabel.setAttribute("aria-expanded", presenceExpanded ? "true" : "false");
+  });
+
   function renderPresence(viewers){
     if(!Array.isArray(viewers)) return;
     var names = [];
@@ -217,6 +232,9 @@ ${XTERM_BOOT_JS}
       label += ' <span class="names">· ' + names.map(function(n){ return "<em>" + n + "</em>"; }).join(", ") + "</span>";
     }
     presenceLabel.innerHTML = label;
+    if(presenceExpanded) presenceLabel.classList.add("expanded");
+    else presenceLabel.classList.remove("expanded");
+    presenceLabel.setAttribute("aria-expanded", presenceExpanded ? "true" : "false");
     watchingEl = document.getElementById("watching") || watchingEl;
   }
 
