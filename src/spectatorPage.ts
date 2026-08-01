@@ -93,6 +93,11 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
 
   <button class="join-btn hidden" id="reqBtn">Request to join</button>
 
+  <div class="input-row hidden" id="inputRow">
+    <input id="cmdInput" placeholder="type to drive the session" disabled autocomplete="off">
+    <button id="sendBtn" disabled>Send</button>
+  </div>
+
   <div class="chat hidden" id="chatBox">
     <div class="chat-head">Chat${e2e ? ' · e2e encrypted' : ''}</div>
     <div class="chat-log" id="chatLog"><div class="chat-empty">${chatHint}</div></div>
@@ -114,6 +119,10 @@ ${XTERM_BOOT_JS}
   var termApi = null;
   var lastSeq = 0;
   var chatEmpty = true;
+  var canDrive = false;
+  var cmdInput = document.getElementById("cmdInput");
+  var sendBtn = document.getElementById("sendBtn");
+  var inputRow = document.getElementById("inputRow");
 
   // Mirror of vibe-core sanitizePeerText — peer display text is untrusted.
   var UNSAFE = /[\\u0000-\\u0008\\u000B-\\u001F\\u007F-\\u009F\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069\\uFEFF]/g;
@@ -334,11 +343,18 @@ ${XTERM_BOOT_JS}
       });
     });
     source.addEventListener("join-approved", function(){
-      setBadge("collab", "COLLABORATING · live");
-      reqBtn.className = "join-btn joined"; reqBtn.disabled = true; reqBtn.textContent = "You’re in — live";
-      applyEntry({ type: "system", text: "→ handed off: the host approved you as a collaborator." });
+      setBadge("collab", "COLLABORATING · you can drive");
+      reqBtn.className = "join-btn joined"; reqBtn.disabled = true; reqBtn.textContent = "You’re in — driving";
+      canDrive = true;
+      inputRow.classList.remove("hidden");
+      cmdInput.disabled = false;
+      sendBtn.disabled = false;
+      applyEntry({ type: "system", text: "→ the host approved you — your keystrokes drive the session." });
     });
     source.addEventListener("join-denied", function(){
+      canDrive = false;
+      cmdInput.disabled = true;
+      sendBtn.disabled = true;
       reqBtn.className = "join-btn"; reqBtn.disabled = false; reqBtn.textContent = "Request denied — try again";
     });
     source.addEventListener("kicked", function(){ source.close(); ended("kicked"); });
@@ -357,8 +373,40 @@ ${XTERM_BOOT_JS}
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token: viewer.token })
     }).then(function(r){
-      if(!r.ok){ reqBtn.className = "join-btn"; reqBtn.disabled = false; reqBtn.textContent = "Request to join"; }
+      if(!r.ok){
+        reqBtn.className = "join-btn"; reqBtn.disabled = false; reqBtn.textContent = "Request to join";
+        if(r.status === 403) reqBtn.textContent = "This share is spectate-only";
+      }
     }).catch(function(){ reqBtn.className = "join-btn"; reqBtn.disabled = false; });
+  });
+
+  // Collaborator input — identity from viewer token on the host; payload is just data.
+  function postInput(data){
+    if(!canDrive || !viewer || !data) return;
+    fetch(base + "/input", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: viewer.token, data: data })
+    }).catch(function(){ /* host gone */ });
+  }
+  function sendInputLine(){
+    var text = cmdInput.value;
+    if(!text) return;
+    cmdInput.value = "";
+    postInput(text + "\r");
+  }
+  sendBtn.addEventListener("click", sendInputLine);
+  cmdInput.addEventListener("keydown", function(ev){
+    if(!canDrive) return;
+    if(ev.key === "Enter"){ ev.preventDefault(); sendInputLine(); return; }
+    if(ev.ctrlKey && ev.key.length === 1){
+      ev.preventDefault();
+      postInput(String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64));
+      return;
+    }
+    if(ev.key === "Escape"){ ev.preventDefault(); postInput("\u001b"); return; }
+    if(ev.key === "Tab"){ ev.preventDefault(); postInput("\t"); return; }
+    if(ev.key === "Backspace"){ ev.preventDefault(); postInput("\u007f"); return; }
   });
 
   chatForm.addEventListener("submit", function(ev){
@@ -388,6 +436,10 @@ ${XTERM_BOOT_JS}
   function ended(state){
     setBadge("ended", state === "kicked" ? "REMOVED BY HOST" : "SHARE ENDED");
     reqBtn.classList.add("hidden");
+    canDrive = false;
+    cmdInput.disabled = true;
+    sendBtn.disabled = true;
+    inputRow.classList.add("hidden");
     chatInput.disabled = true;
     applyEntry({ type: "system", text: state === "kicked" ? "— the host removed you from this share —" : "— the host ended this share —" });
   }
