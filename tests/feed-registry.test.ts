@@ -92,6 +92,37 @@ describe('ViewerRegistry', () => {
     expect(reg.getByToken(v.token)?.id).toBe(v.id);
   });
 
+  it('ensure binds a hub-stamped viewerId so canWrite tracks the same id', () => {
+    const reg = registryOf('invite');
+    const hubId = 'hub-minted-uuid-aaaa';
+    const v = reg.ensure(hubId, 'Ada');
+    expect(v.id).toBe(hubId);
+    expect(v.role).toBe('spectator');
+    expect(reg.get(hubId)?.name).toBe('Ada');
+
+    // Presence re-hello is idempotent and refreshes the name.
+    const again = reg.ensure(hubId, 'Ada Lovelace');
+    expect(again).toBe(v);
+    expect(v.name).toBe('Ada Lovelace');
+    expect(reg.count()).toBe(1);
+
+    // Join-request + approve under the STAMPED id flips canWrite.
+    reg.requestJoin(hubId);
+    expect(reg.canWrite(hubId)).toBe(false);
+    reg.approve(hubId);
+    expect(reg.canWrite(hubId)).toBe(true);
+    expect(reg.get(hubId)?.role).toBe('collaborator');
+  });
+
+  it('ensure never upgrades role on its own', () => {
+    const reg = registryOf('invite');
+    const v = reg.ensure('id-1', 'Bob');
+    expect(v.role).toBe('spectator');
+    reg.ensure('id-1', 'Bobby');
+    expect(v.role).toBe('spectator');
+    expect(reg.canWrite('id-1')).toBe(false);
+  });
+
   it('sanitizes names and falls back to anon', () => {
     const reg = registryOf('spectate');
     expect(reg.add('   ').name).toMatch(/^anon-[0-9a-f]{4}$/);
