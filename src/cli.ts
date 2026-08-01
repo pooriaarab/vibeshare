@@ -45,10 +45,12 @@ import {
   type ActiveShareRecord,
 } from './consent.js';
 import { resolveSignaling, resolveTunnel } from './config.js';
+import { HostControlServer } from './hostControl.js';
 import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
 import { startMcp } from './mcp.js';
 import type { ShareTransport } from './transport.js';
+import type { Viewer } from './types.js';
 import { VERSION } from './version.js';
 import { WebRtcTransport } from './webrtc/transport.js';
 import { WsSignaling } from './webrtc/wsSignaling.js';
@@ -159,7 +161,7 @@ options:
 
 attach:
   target is a tmux pane id (session:window.pane or %pane_id). Omit it to use
-  $TMUX_PANE when inside tmux, or to list panes. v0 is read-only (no send-keys).
+  $TMUX_PANE when inside tmux, or to list panes. --invite enables drive via send-keys.
   Needs tmux — GNU screen is not supported yet. To share a fresh command instead:
     vibeshare -- <cmd>
 
@@ -369,6 +371,13 @@ async function ensureConsent(io: IO, yes: boolean): Promise<boolean> {
   }
 }
 
+/**
+ * Where gated collaborator input is applied. Set by startShare (PTY write) or
+ * attachShare (tmux send-keys) after the capture source is live. Transports
+ * only call this after ViewerRegistry.canWrite(viewerId) is true.
+ */
+export type SessionInputSink = (data: string) => void;
+
 /** Runtime produced by mintShareRuntime — shared by start (PTY) and attach (tmux). */
 interface ShareRuntime {
   created: CreatedShare;
@@ -378,6 +387,11 @@ interface ShareRuntime {
   watcher: { stop(): void };
   tunnelOn: boolean;
   tunnelProviderName: string | null;
+  /**
+   * Install the live session input sink (PTY.write / tmux send-keys).
+   * Called once the capture source is up; cleared on cleanup.
+   */
+  setInputSink(sink: SessionInputSink | null): void;
   /** Tear down transport + state. Idempotent enough for error paths. */
   cleanup(): Promise<void>;
 }
@@ -423,12 +437,41 @@ async function mintShareRuntime(
   let publicSignaling: WsSignaling | null = null;
   // Filled after createShare for --public (key lives in the URL #fragment).
   let publicShareKey: Buffer | null = null;
+  // Live session write target — installed by startShare/attachShare once the
+  // PTY or tmux capture is up. Transports only call this after canWrite.
+  let inputSink: SessionInputSink | null = null;
+  const applyInput: SessionInputSink = (data) => {
+    try {
+      inputSink?.(data);
+    } catch {
+      /* session closed mid-write */
+    }
+  };
+  const printJoinRequest = (_shareId: string, viewer: Viewer): void => {
+    const who = sanitizePeerText(viewer.name, 32).trim() || 'viewer';
+    io.err(
+      `\r\x1b[2m[join] ${who} wants to drive — approve: vibeshare viewers --approve ${viewer.id}\x1b[0m`,
+    );
+  };
+  // Loopback control for --public (viewers/approve/stop). Local-http already
+  // exposes /control/* on its own server.
+  let hostControl: HostControlServer | null = null;
 
   if (options.public) {
     const signalingUrl = resolveSignaling(options.signaling);
+    // Presence binds hub-minted viewerIds into the host registry so canWrite
+    // tracks the SAME id the Worker stamps on input frames.
+    const bindPresence = (frame: { viewers: ReadonlyArray<{ viewerId: string; name: string; role: string }> }): void => {
+      if (!created) return;
+      for (const row of frame.viewers) {
+        if (row.role === 'host' || row.viewerId === 'host') continue;
+        created.viewers.ensure(row.viewerId, row.name);
+      }
+    };
     publicSignaling = new WsSignaling({
       url: signalingUrl,
       onError: (e) => io.err(`[vibeshare] signaling: ${e.message}`),
+      onPresence: bindPresence,
       onChat: (frame) => {
         // Decrypt with the share key once we have the created URL fragment.
         // Until createShare returns the key is unknown — drop early frames.
@@ -437,6 +480,17 @@ async function mintShareRuntime(
         const plain = decryptChatText(key, frame.text);
         if (plain) printChat(frame.name, plain);
       },
+      onJoinRequest: (frame) => {
+        if (!created) return;
+        // Spectate shares reject at the registry; invite shares go pending.
+        try {
+          const v = created.viewers.ensure(frame.viewerId, frame.name);
+          created.viewers.requestJoin(v.id);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          io.err(`\r\x1b[2m[join] ${sanitizePeerText(frame.name, 32) || 'viewer'}: ${msg}\x1b[0m`);
+        }
+      },
     });
     transport = new WebRtcTransport({
       signaling: publicSignaling,
@@ -444,7 +498,14 @@ async function mintShareRuntime(
       // The viewer page is served by the rendezvous itself at /vibeshare/s/<id>
       // — the share URL is the ws endpoint with an http(s) scheme.
       baseUrl: signalingUrl.replace(/^ws/, 'http'),
+      onInput: (_shareId, _viewerId, data) => applyInput(data),
     });
+    hostControl = new HostControlServer({
+      onStopRequested: () => {
+        shutdown(0);
+      },
+    });
+    await hostControl.listen();
   } else if (tunnelOn) {
     // Fresh per-share key — tunnel provider never sees it (URL #fragment only).
     const e2eKey = randomBytes(E2E_KEY_LEN);
@@ -454,6 +515,8 @@ async function mintShareRuntime(
       port: options.port,
       e2e: { key: e2eKey },
       onChat: (_shareId, frame) => printChat(frame.name, frame.text),
+      onInput: (_shareId, _viewerId, data) => applyInput(data),
+      onJoinRequest: printJoinRequest,
       onStopRequested: () => {
         shutdown(0);
       },
@@ -464,6 +527,8 @@ async function mintShareRuntime(
       host: options.host,
       port: options.port,
       onChat: (_shareId, frame) => printChat(frame.name, frame.text),
+      onInput: (_shareId, _viewerId, data) => applyInput(data),
+      onJoinRequest: printJoinRequest,
       onStopRequested: () => {
         // `vibeshare stop` from another process → shut this one down.
         shutdown(0);
@@ -493,6 +558,25 @@ async function mintShareRuntime(
         }
       }
       publicSignaling.setHostName(created.share.id, created.share.name || 'host');
+      if (hostControl) hostControl.track({ id: created.share.id, viewers: created.viewers });
+      // Approve/deny must notify the viewer over the hub so their UI flips.
+      const shareId = created.share.id;
+      const signaling = publicSignaling;
+      created.viewers.on('request', (v) => printJoinRequest(shareId, v));
+      created.viewers.on('approve', (v) => {
+        signaling.sendRoleUpdate(shareId, {
+          viewerId: v.id,
+          role: 'collaborator',
+          joinRequest: 'approved',
+        });
+      });
+      created.viewers.on('deny', (v) => {
+        signaling.sendRoleUpdate(shareId, {
+          viewerId: v.id,
+          role: 'spectator',
+          joinRequest: 'denied',
+        });
+      });
     }
   } catch (err) {
     watcher.stop();
@@ -541,8 +625,8 @@ async function mintShareRuntime(
   const record: ActiveShareRecord = {
     id: created.share.id,
     url: created.url,
-    port: localHttp?.port ?? 0,
-    hostToken: localHttp?.hostToken ?? '',
+    port: localHttp?.port ?? hostControl?.port ?? 0,
+    hostToken: localHttp?.hostToken ?? hostControl?.hostToken ?? '',
     pid: process.pid,
     startedAt: new Date().toISOString(),
     transport: options.public ? 'webrtc' : tunnelOn ? 'tunnel' : 'local-http',
@@ -569,9 +653,14 @@ async function mintShareRuntime(
   const cleanup = async (): Promise<void> => {
     if (cleaned) return;
     cleaned = true;
+    inputSink = null;
     watcher.stop();
     clearActiveShare(record.id);
     await manager.stopAll();
+    if (hostControl) {
+      try { await hostControl.close(); } catch { /* best effort */ }
+      hostControl = null;
+    }
     if (tunnelHandle) {
       try { await tunnelHandle.stop(); } catch { /* best effort */ }
       tunnelHandle = null;
@@ -588,6 +677,9 @@ async function mintShareRuntime(
       watcher,
       tunnelOn,
       tunnelProviderName,
+      setInputSink(sink: SessionInputSink | null) {
+        inputSink = sink;
+      },
       cleanup,
     },
   };
@@ -629,6 +721,11 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   ptyProcess.onData((data) => {
     process.stdout.write(data);
     created.feed.publishRaw(data);
+  });
+
+  // Approved collaborator input → PTY stdin (transport already gated canWrite).
+  runtime.setInputSink((data) => {
+    try { ptyProcess.write(data); } catch { /* closed */ }
   });
 
   // Host stdin → PTY so the host user still drives the session normally.
@@ -681,7 +778,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
 /**
  * `vibeshare attach [target]` — share an already-running tmux pane.
  * Capture source only; transports/e2e/xterm/presence-chat are unchanged.
- * Read-only v0 (no tmux send-keys).
+ * Approved collaborator input is applied via `tmux send-keys -l`.
  */
 async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
   const tmux = options.tmux ?? createProcessTmuxClient();
@@ -703,7 +800,10 @@ async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
   const { runtime } = minted;
   const { created } = runtime;
 
-  io.out(`  source:   tmux ${target} (read-only attach)`);
+  io.out(
+    `  source:   tmux ${target}` +
+      (options.access === 'invite' ? ' (attach · viewers may request to drive)' : ' (attach · read-only)'),
+  );
 
   let captureStop: (() => Promise<void>) | null = null;
   try {
@@ -714,6 +814,12 @@ async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
     });
     const handle = await source.start(created.feed);
     captureStop = () => handle.stop();
+    // Approved collaborator input → tmux send-keys -l (literal).
+    if (handle.writeInput) {
+      runtime.setInputSink((data) => {
+        void handle.writeInput?.(data);
+      });
+    }
   } catch (err) {
     const msg = err instanceof AttachError || err instanceof Error ? err.message : String(err);
     io.err(msg.startsWith('vibeshare') ? msg : `vibeshare attach: ${msg}`);
@@ -809,16 +915,11 @@ async function viewersCommand(
   const record = resolveRecord(cmd.share, io);
   if (!record) return 1;
 
-  // --public shares have no local control server: viewers connect p2p to the
-  // host and the registry lives only in the sharing process's memory.
-  if (record.transport === 'webrtc') {
-    if (cmd.approve !== undefined || cmd.deny !== undefined || cmd.kick !== undefined) {
-      io.err('vibeshare: approve/deny/kick is not available for --public shares yet (collaborator approval over p2p lands in a later slice)');
-      return 1;
-    }
-    io.out(`${record.url}`);
-    io.out('  public p2p share — viewers connect end-to-end encrypted; live viewer management is only available for local shares');
-    return 0;
+  // --public shares expose a loopback HostControlServer (port + hostToken in
+  // the active-share record) so approve/deny/kick work the same as local-http.
+  if (record.transport === 'webrtc' && (!record.port || !record.hostToken)) {
+    io.err('vibeshare: this public share has no host control endpoint (upgrade the sharing process)');
+    return 1;
   }
 
   const action = cmd.approve !== undefined ? 'approve' : cmd.deny !== undefined ? 'deny' : cmd.kick !== undefined ? 'kick' : null;
@@ -876,8 +977,9 @@ async function viewersCommand(
 async function stopCommand(cmd: Extract<CliCommand, { cmd: 'stop' }>, io: IO): Promise<number> {
   const record = resolveRecord(cmd.share, io);
   if (!record) return 1;
-  // --public shares have no control server to POST to: signal the process.
-  if (record.transport === 'webrtc') {
+  // Prefer loopback control (works for local-http, tunnel, and modern --public).
+  // Fall back to SIGTERM for legacy public records with no control port.
+  if (record.transport === 'webrtc' && (!record.port || !record.hostToken)) {
     try {
       process.kill(record.pid, 'SIGTERM');
       clearActiveShare(record.id);
