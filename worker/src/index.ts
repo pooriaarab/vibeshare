@@ -18,11 +18,12 @@
  *     created; the first secret presented for a share is bound durably and
  *     later host connections must match (viewers never see it);
  *   - the relay is a whitelist: rtc-offer / rtc-answer / rtc-ice (point-to-point
- *     handshake) plus presence / hello / chat / join-request / role-update
- *     (multi-party hub frames). Chat TEXT is end-to-end ciphertext — the
- *     Worker never decrypts it. Sender identity on chat/join-request is
- *     STAMPED from the connection attachment. Keys, session bytes, and every
- *     other frame shape are dropped.
+ *     handshake) plus presence / hello / chat / annotation / join-request /
+ *     role-update (multi-party hub frames). Chat + annotation TEXT is
+ *     end-to-end ciphertext — the Worker never decrypts it. Sender identity on
+ *     chat/annotation/join-request is STAMPED from the connection attachment;
+ *     annotation ids are minted here. Keys, session bytes, and every other
+ *     frame shape are dropped.
  *
  * Availability / isolation hardening (see ./limits.ts for tunable constants):
  *
@@ -39,6 +40,7 @@
  *   GET /vibeshare/health                          → liveness
  */
 // Pure helpers only — no Node Buffer / crypto (Worker-safe).
+import { stampAnnotation } from '../../src/annotations.js';
 import {
   buildPresenceRoster,
   defaultPresenceName,
@@ -375,9 +377,9 @@ export class ShareRoom implements DurableObject {
   }
 
   /**
-   * Multi-party hub frames (hello / chat / join-request / role-update).
-   * Returns true when the message was handled (so rtc relay should not also
-   * try it).
+   * Multi-party hub frames (hello / chat / annotation / join-request /
+   * role-update). Returns true when the message was handled (so rtc relay
+   * should not also try it).
    */
   private handlePresenceChat(
     ws: WebSocket,
@@ -417,6 +419,30 @@ export class ShareRoom implements DurableObject {
       });
       if (!stamped) return true; // bad ciphertext — drop
       // Discard any client-supplied identity: reconstruct server-side only.
+      this.broadcastAll(stamped);
+      return true;
+    }
+
+    // Viewer/host → everyone: a pinned comment anchored to a feed seq.
+    // Identity stamped from the CONNECTION; id minted here; text stays
+    // ciphertext. Only seq (anchor) + replyTo (threading) pass through.
+    if (msg['kind'] === 'annotation') {
+      const viewerId =
+        att.role === 'host' ? 'host' : (connectionViewerId ?? att.viewerId ?? '');
+      if (viewerId.length === 0) return true; // drop, handled
+      // Live attachment may have a fresher name than the message-time snapshot.
+      const live = ws.deserializeAttachment() as Attachment | null;
+      const liveName = live?.name ?? att.name ?? '';
+      const stamped = stampAnnotation({
+        id: crypto.randomUUID(),
+        viewerId,
+        name: liveName,
+        role: att.role,
+        seq: msg['seq'],
+        text: msg['text'],
+        replyTo: msg['replyTo'],
+      });
+      if (!stamped) return true; // bad payload — drop
       this.broadcastAll(stamped);
       return true;
     }

@@ -1,10 +1,16 @@
 /**
  * Annotations: pure validation + store (anchor seq, threading), connection-
- * stamped relay frames, and e2e encrypt/decrypt of annotation text.
+ * stamped relay frames, e2e encrypt/decrypt of annotation text, and the
+ * LocalHttpTransport hub route (plaintext + e2e wire).
  */
 import { randomBytes } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
-import { E2E_KEY_LEN, sanitizePeerText } from '@pooriaarab/vibe-core';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  createConsentLedger,
+  decryptFrame,
+  E2E_KEY_LEN,
+  sanitizePeerText,
+} from '@pooriaarab/vibe-core';
 import {
   AnnotationStore,
   MAX_ANNOTATION_PLAINTEXT_LEN,
@@ -17,6 +23,9 @@ import {
   type Annotation,
 } from '../src/annotations.js';
 import { decryptAnnotationText, encryptAnnotationText } from '../src/annotationsCrypto.js';
+import { LocalHttpTransport } from '../src/localHttp.js';
+import { ShareManager, SHARE_SCOPE, type CreatedShare } from '../src/manager.js';
+import { readSse } from './helpers.js';
 
 const B64 = 'YWJjZGVmZ2hpamtsbW5vcA==';
 
@@ -223,5 +232,189 @@ describe('annotation text e2e', () => {
     const buf = Buffer.from(cipher, 'base64');
     buf[buf.length - 1]! ^= 0xff;
     expect(decryptAnnotationText(key, buf.toString('base64'))).toBeNull();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Hub integration: POST /s/:id/annotate through LocalHttpTransport.
+// ---------------------------------------------------------------------------
+
+interface AnnCallback {
+  viewerId: string;
+  name: string;
+  seq: number;
+  text: string;
+  replyTo?: string;
+}
+
+describe('LocalHttpTransport annotation hub (plaintext path)', () => {
+  let transport: LocalHttpTransport;
+  let manager: ShareManager;
+  let anns: AnnCallback[];
+
+  beforeEach(async () => {
+    const consent = createConsentLedger();
+    consent.grant(SHARE_SCOPE, 'test');
+    anns = [];
+    transport = new LocalHttpTransport({
+      hostToken: 'ann-host-token',
+      onAnnotation: (_id, frame) => anns.push(frame),
+    });
+    await transport.listen();
+    manager = new ShareManager({ consent, transport });
+  });
+
+  afterEach(async () => {
+    await manager.stopAll();
+    await transport.close();
+  });
+
+  const join = async (created: CreatedShare, name: string) => {
+    const res = await fetch(`${created.url}/join`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+
+  it('stamps sender from the token, anchors seq, keeps replyTo, sanitizes text', async () => {
+    const created = await manager.createShare();
+    const v1 = await join(created, 'Ada[31m');
+    const v2 = await join(created, 'Bob');
+    const stream2 = await fetch(`${created.url}/stream?token=${v2.body['token']}`);
+
+    const postP = (async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return fetch(`${created.url}/annotate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: v1.body['token'],
+          id: 'forged-id',
+          viewerId: 'forged',
+          name: 'Eve',
+          seq: 137,
+          replyTo: 'parent-1',
+          text: 'this moment is broken[0m',
+        }),
+      });
+    })();
+    const events = await readSse(stream2, (ev) => ev.some((e) => e.event === 'annotation'));
+    const res = await postP;
+    expect(res.status).toBe(202);
+
+    const ann = JSON.parse(events.find((e) => e.event === 'annotation')!.data) as Record<string, unknown>;
+    expect(ann['kind']).toBe('annotation');
+    // Hub-minted id + token-stamped identity — forged fields discarded.
+    expect(ann['id']).not.toBe('forged-id');
+    expect(typeof ann['id']).toBe('string');
+    expect(ann['viewerId']).toBe(v1.body['viewerId']);
+    expect(String(ann['name'])).not.toBe('Eve');
+    expect(String(ann['name'])).not.toContain('');
+    // Anchor + threading pass through.
+    expect(ann['seq']).toBe(137);
+    expect(ann['replyTo']).toBe('parent-1');
+    // Plaintext path relays sanitized text.
+    expect(String(ann['text'])).toContain('this moment is broken');
+    expect(String(ann['text'])).not.toContain('');
+    expect(typeof ann['ts']).toBe('number');
+
+    // Host callback saw the same stamped, sanitized annotation.
+    expect(anns.length).toBe(1);
+    expect(anns[0]).toMatchObject({
+      viewerId: v1.body['viewerId'],
+      seq: 137,
+      replyTo: 'parent-1',
+    });
+    expect(anns[0]!.text).toContain('this moment is broken');
+  });
+
+  it('rejects bad anchor, empty text, and unknown tokens', async () => {
+    const created = await manager.createShare();
+    const v1 = await join(created, 'Ada');
+    const post = (body: Record<string, unknown>) =>
+      fetch(`${created.url}/annotate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    expect((await post({ token: v1.body['token'], seq: -1, text: 'x' })).status).toBe(400);
+    expect((await post({ token: v1.body['token'], text: 'x' })).status).toBe(400);
+    expect((await post({ token: v1.body['token'], seq: 1, text: '   ' })).status).toBe(400);
+    expect((await post({ token: 'nope', seq: 1, text: 'x' })).status).toBe(401);
+    expect(anns.length).toBe(0);
+  });
+});
+
+describe('LocalHttpTransport annotation hub (e2e path)', () => {
+  it('relays ciphertext opaque; stamped identity + seq survive; host gets plaintext', async () => {
+    const consent = createConsentLedger();
+    consent.grant(SHARE_SCOPE, 'test');
+    const key = randomBytes(E2E_KEY_LEN);
+    const anns: AnnCallback[] = [];
+    const transport = new LocalHttpTransport({
+      hostToken: 'ann-e2e-token',
+      e2e: { key },
+      onAnnotation: (_id, frame) => anns.push(frame),
+    });
+    await transport.listen();
+    const manager = new ShareManager({ consent, transport });
+    try {
+      const created = await manager.createShare();
+      const url = created.url.split('#')[0]!;
+      const joinRes = await fetch(`${url}/join`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Maya' }),
+      });
+      const viewer = (await joinRes.json()) as Record<string, unknown>;
+      const stream = await fetch(`${url}/stream?token=${viewer['token']}`);
+
+      const cipher = encryptAnnotationText(key, 'pin this exact frame');
+      expect(cipher).not.toContain('pin this exact frame');
+
+      const wait = readSse(stream, (ev) => ev.some((e) => e.event === 'annotation'));
+      const res = await fetch(`${url}/annotate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          token: viewer['token'],
+          viewerId: 'forged',
+          name: 'Eve',
+          seq: 88,
+          text: cipher,
+        }),
+      });
+      expect(res.status).toBe(202);
+      const events = await wait;
+
+      const annEv = events.find((e) => e.event === 'annotation')!;
+      // Outer SSE envelope is e2e-encrypted too.
+      expect(() => JSON.parse(annEv.data)).toThrow();
+      const envelope = JSON.parse(
+        decryptFrame(key, Buffer.from(annEv.data, 'base64')).toString('utf8'),
+      ) as Record<string, unknown>;
+      expect(envelope['kind']).toBe('annotation');
+      expect(envelope['viewerId']).toBe(viewer['viewerId']); // stamped
+      expect(envelope['name']).not.toBe('Eve');
+      expect(envelope['seq']).toBe(88);
+      // Inner text is STILL ciphertext (double-blind for the tunnel provider).
+      expect(String(envelope['text'])).not.toContain('pin this exact frame');
+      expect(decryptAnnotationText(key, String(envelope['text']))).toBe('pin this exact frame');
+
+      // Host callback received decrypted plaintext with the anchor.
+      expect(anns).toEqual([
+        expect.objectContaining({
+          viewerId: viewer['viewerId'],
+          seq: 88,
+          text: 'pin this exact frame',
+        }),
+      ]);
+    } finally {
+      await manager.stopAll();
+      await transport.close();
+    }
   });
 });
