@@ -9,11 +9,19 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
   let manager: ShareManager;
   let base: string;
   const HOST_TOKEN = 'test-host-token';
+  const inputs: Array<{ shareId: string; viewerId: string; data: string }> = [];
+  const joinReqs: Array<{ shareId: string; id: string; name: string }> = [];
 
   beforeEach(async () => {
+    inputs.length = 0;
+    joinReqs.length = 0;
     const consent = createConsentLedger();
     consent.grant(SHARE_SCOPE, 'test');
-    transport = new LocalHttpTransport({ hostToken: HOST_TOKEN });
+    transport = new LocalHttpTransport({
+      hostToken: HOST_TOKEN,
+      onInput: (shareId, viewerId, data) => inputs.push({ shareId, viewerId, data }),
+      onJoinRequest: (shareId, v) => joinReqs.push({ shareId, id: v.id, name: v.name }),
+    });
     await transport.listen();
     manager = new ShareManager({ consent, transport });
     base = `http://127.0.0.1:${transport.port}`;
@@ -160,6 +168,7 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
       body: JSON.stringify({ token: v.body['token'] }),
     });
     expect(req.status).toBe(202);
+    expect(joinReqs).toEqual([{ shareId: created.share.id, id: viewerId, name: 'Nick' }]);
 
     // Host sees the pending request through the control API…
     const viewers = await (await control(`/control/viewers?share=${created.share.id}`)).json() as {
@@ -180,6 +189,61 @@ describe('LocalHttpTransport (end-to-end over real HTTP)', () => {
     const events = await reading;
     expect(events.some((e) => e.event === 'join-approved')).toBe(true);
     expect(created.viewers.canWrite(viewerId)).toBe(true);
+  });
+
+  it('approved input reaches onInput; spectate/unapproved are rejected', async () => {
+    // Spectate share: no input route ever opens.
+    const spectate = await manager.createShare({ access: 'spectate' });
+    const sv = await join(spectate, { name: 'Spec' });
+    const sRes = await fetch(`${spectate.url}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: sv.body['token'], data: 'nope' }),
+    });
+    expect(sRes.status).toBe(403);
+    expect(inputs).toEqual([]);
+
+    // Invite share: unapproved input is 403; after approve, onInput fires.
+    const created = await manager.createShare({ access: 'invite' });
+    const v = await join(created, { name: 'Driver' });
+    const token = v.body['token'] as string;
+    const viewerId = v.body['viewerId'] as string;
+
+    const before = await fetch(`${created.url}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, data: 'before-approve' }),
+    });
+    expect(before.status).toBe(403);
+    expect(inputs).toEqual([]);
+
+    await fetch(`${created.url}/request-join`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    await control('/control/approve', {
+      method: 'POST',
+      body: JSON.stringify({ share: created.share.id, viewer: viewerId }),
+    });
+    expect(created.viewers.canWrite(viewerId)).toBe(true);
+
+    const ok = await fetch(`${created.url}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, data: 'ls\r' }),
+    });
+    expect(ok.status).toBe(202);
+    expect(inputs).toEqual([{ shareId: created.share.id, viewerId, data: 'ls\r' }]);
+
+    // Payload cannot spoof identity — token stamps viewerId.
+    const forged = await fetch(`${created.url}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, data: 'whoami', viewerId: 'someone-else' }),
+    });
+    expect(forged.status).toBe(202);
+    expect(inputs[1]).toEqual({ shareId: created.share.id, viewerId, data: 'whoami' });
   });
 
   it('kick closes the viewer stream with a kicked event', async () => {

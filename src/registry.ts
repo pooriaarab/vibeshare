@@ -4,9 +4,9 @@
  * Write-arbitration invariant (shared with vibelive §4): the host is the
  * server of record, and `canWrite()` is the single gate any input path must
  * consult. A spectator can never pass it; promotion happens only through a
- * host-approved join request on an `invite`-access share. v0 exposes no
- * remote input route at all — the gate exists so the vibelive handoff has
- * exactly one choke point when it lands.
+ * host-approved join request on an `invite`-access share. Remote input is
+ * gated here: transports call `canWrite()` before applying anything to the
+ * session (PTY stdin / tmux send-keys).
  */
 import { EventEmitter } from 'node:events';
 import { sanitizePeerText } from '@pooriaarab/vibe-core';
@@ -37,8 +37,36 @@ export class ViewerRegistry extends EventEmitter {
 
   /** Register a new spectator. Everyone enters read-only — no exceptions. */
   add(name?: string): Viewer {
+    return this.#put(newShareId(), name);
+  }
+
+  /**
+   * Ensure a viewer row exists under a hub/connection-stamped id.
+   * Used when the rendezvous (or another identity authority) mints viewerIds
+   * the host did not create — presence delivers {viewerId,name}, and later
+   * input frames arrive stamped with the same id. `canWrite()` only works
+   * when the registry tracks THAT id. Idempotent: refreshes the display name
+   * when the peer re-hellos; never upgrades role.
+   */
+  ensure(id: string, name?: string): Viewer {
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new ShareError('bad-request', 'viewer id required');
+    }
+    const existing = this.#viewers.get(id);
+    if (existing) {
+      if (name !== undefined) {
+        const cleaned = sanitizeName(name);
+        // Keep a real hello name over the synthetic anon-/viewer- fallback.
+        if (cleaned && !cleaned.startsWith('anon-')) existing.name = cleaned;
+      }
+      return existing;
+    }
+    return this.#put(id, name);
+  }
+
+  #put(id: string, name?: string): Viewer {
     const viewer: Viewer = {
-      id: newShareId(),
+      id,
       name: sanitizeName(name),
       role: 'spectator',
       token: newToken(),

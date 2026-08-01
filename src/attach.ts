@@ -6,8 +6,10 @@
  *   2. `tmux capture-pane -pe`   → current screen → feed.publishRaw (backlog)
  *   3. `tmux pipe-pane -o`       → live raw bytes → feed.publishRaw
  *
- * Read-only v0: we never write to the pane. Collaborator input via
- * `tmux send-keys` is intentionally not built — leave as a future flag.
+ * Capture is always on; collaborator input (when the host approves a viewer
+ * on an `--invite` share) is applied via `tmux send-keys -l` through
+ * {@link TmuxClient.sendKeys}. Spectate shares never reach that path — the
+ * write gate lives in ViewerRegistry.canWrite(), not here.
  *
  * All tmux IO goes through {@link TmuxClient} so tests can mock without a
  * real tmux binary. Production uses fifo + `pipe-pane`; mocks return an
@@ -68,6 +70,11 @@ export interface TmuxClient {
    * Tests: return an in-memory Readable the mock can push into.
    */
   openPipe(target: string): Promise<TmuxPipe>;
+  /**
+   * Type literal keys into the pane (`tmux send-keys -t <target> -l <data>`).
+   * Used for approved collaborator input on attach shares. Empty data is a no-op.
+   */
+  sendKeys(target: string, data: string): Promise<void>;
 }
 
 export interface AttachOptions {
@@ -300,6 +307,21 @@ export function createProcessTmuxClient(opts: { tmpDir?: string } = {}): TmuxCli
         },
       };
     },
+    async sendKeys(target: string, data: string) {
+      if (data.length === 0) return;
+      // -l = literal: every char is typed, not interpreted as a key name.
+      // tmux caps a single argument; chunk large pastes.
+      const CHUNK = 256;
+      for (let i = 0; i < data.length; i += CHUNK) {
+        const slice = data.slice(i, i + CHUNK);
+        const r = await runTmux(['send-keys', '-t', target, '-l', '--', slice]);
+        if (r.code !== 0) {
+          throw new AttachError(
+            `tmux send-keys failed for ${target}: ${r.stderr.trim() || `exit ${r.code}`}`,
+          );
+        }
+      }
+    },
   };
 }
 
@@ -397,11 +419,13 @@ export function createTmuxCaptureSource(opts: AttachOptions): CaptureSource {
         }
       };
 
-      // TODO(attach-write): collaborator input → `tmux send-keys -t <target>`.
-      // v0 is spectate/read-only; do not wire ViewerRegistry writes here.
-
       return {
         label: `tmux:${target}`,
+        /** Apply approved collaborator input to the live pane. */
+        writeInput: async (data: string) => {
+          if (stopped || data.length === 0) return;
+          await tmux.sendKeys(target, data);
+        },
         stop,
       };
     },

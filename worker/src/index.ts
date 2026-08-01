@@ -18,10 +18,11 @@
  *     created; the first secret presented for a share is bound durably and
  *     later host connections must match (viewers never see it);
  *   - the relay is a whitelist: rtc-offer / rtc-answer / rtc-ice (point-to-point
- *     handshake) plus presence / hello / chat (multi-party hub frames).
- *     Chat TEXT is end-to-end ciphertext — the Worker never decrypts it.
- *     Sender identity on chat is STAMPED from the connection attachment.
- *     Keys, session bytes, and every other frame shape are dropped.
+ *     handshake) plus presence / hello / chat / join-request / role-update
+ *     (multi-party hub frames). Chat TEXT is end-to-end ciphertext — the
+ *     Worker never decrypts it. Sender identity on chat/join-request is
+ *     STAMPED from the connection attachment. Keys, session bytes, and every
+ *     other frame shape are dropped.
  *
  * Availability / isolation hardening (see ./limits.ts for tunable constants):
  *
@@ -374,8 +375,9 @@ export class ShareRoom implements DurableObject {
   }
 
   /**
-   * Multi-party hub frames (hello / chat / presence). Returns true when the
-   * message was handled (so rtc relay should not also try it).
+   * Multi-party hub frames (hello / chat / join-request / role-update).
+   * Returns true when the message was handled (so rtc relay should not also
+   * try it).
    */
   private handlePresenceChat(
     ws: WebSocket,
@@ -416,6 +418,62 @@ export class ShareRoom implements DurableObject {
       if (!stamped) return true; // bad ciphertext — drop
       // Discard any client-supplied identity: reconstruct server-side only.
       this.broadcastAll(stamped);
+      return true;
+    }
+
+    // Viewer → host: request to drive. Identity from CONNECTION only.
+    if (msg['kind'] === 'join-request') {
+      if (att.role !== 'viewer') return true; // host cannot self-request
+      const viewerId = connectionViewerId ?? att.viewerId ?? '';
+      if (viewerId.length === 0) return true;
+      const live = ws.deserializeAttachment() as Attachment | null;
+      const name =
+        sanitizePresenceName(live?.name ?? att.name) ||
+        defaultPresenceName('viewer', viewerId);
+      const host = this.hostSocket();
+      if (host) {
+        host.send(
+          JSON.stringify({
+            kind: 'join-request',
+            viewerId,
+            name,
+          }),
+        );
+      }
+      return true;
+    }
+
+    // Host → one viewer: role decision after approve/deny.
+    if (msg['kind'] === 'role-update') {
+      if (att.role !== 'host') return true; // viewers cannot mint role updates
+      const viewerId = typeof msg['viewerId'] === 'string' ? msg['viewerId'] : '';
+      if (viewerId.length === 0) return true;
+      const role =
+        msg['role'] === 'collaborator'
+          ? 'collaborator'
+          : msg['role'] === 'spectator'
+            ? 'spectator'
+            : null;
+      if (!role) return true;
+      const joinRequest =
+        msg['joinRequest'] === 'approved' ||
+        msg['joinRequest'] === 'denied' ||
+        msg['joinRequest'] === 'pending' ||
+        msg['joinRequest'] === 'none'
+          ? msg['joinRequest']
+          : null;
+      if (!joinRequest) return true;
+      const viewer = this.viewerSocket(viewerId);
+      if (viewer) {
+        viewer.send(
+          JSON.stringify({
+            kind: 'role-update',
+            viewerId,
+            role,
+            joinRequest,
+          }),
+        );
+      }
       return true;
     }
 

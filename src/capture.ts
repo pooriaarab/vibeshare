@@ -12,8 +12,10 @@
  *   3. Streaming live raw bytes via `feed.publishRaw`
  *   4. Cleaning up on stop (kill PTY, `tmux pipe-pane` off, remove fifo, …)
  *
- * v0 attach is read-only/spectate: sources do not accept collaborator input.
- * (Collaborator → `tmux send-keys` is a future flag — see attach.ts TODO.)
+ * Collaborator input (when the host approves a viewer on an `--invite`
+ * share) is applied by the host CLI via optional `CaptureHandle.writeInput`
+ * (PTY stdin write, or tmux send-keys for attach). The write gate is always
+ * `ViewerRegistry.canWrite()` in the transport — never the capture source.
  */
 import type { SessionFeed } from './feed.js';
 
@@ -29,6 +31,11 @@ export interface CaptureHandle {
   readonly label: string;
   /** End capture and release OS resources. Safe to call more than once. */
   stop(): Promise<void>;
+  /**
+   * Apply approved collaborator input to the live session (PTY stdin or
+   * tmux send-keys). Optional — sources that are capture-only omit it.
+   */
+  writeInput?(data: string): void | Promise<void>;
 }
 
 /**
