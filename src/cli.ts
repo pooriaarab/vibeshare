@@ -2,8 +2,8 @@
 /**
  * vibeshare CLI.
  *
- *   vibeshare [options] [-- <cmd…>]   start sharing (default command: your shell)
- *   vibeshare attach [target]         share an already-running tmux pane
+ *   vibeshare [options] [-- <cmd…>]   start sharing any harness/shell (default: your shell)
+ *   vibeshare attach [target]         share an already-running tmux pane (harness-agnostic)
  *   vibeshare viewers [--approve|--deny|--kick <viewerId>] [--json]
  *   vibeshare stop
  *
@@ -127,8 +127,8 @@ export class CliUsageError extends Error {
 const USAGE = `vibeshare — share your live agent coding session by URL
 
 usage:
-  vibeshare [options] [-- <cmd…>]   start sharing (default: your shell)
-  vibeshare attach [target] [opts]  share an already-running tmux pane (read-only)
+  vibeshare [options] [-- <cmd…>]   start sharing any harness/shell (default: your shell)
+  vibeshare attach [target] [opts]  share an already-running tmux pane (harness-agnostic)
   vibeshare viewers [shareId]       list viewers; act on join requests
   vibeshare stop [shareId]          end the active share
 
