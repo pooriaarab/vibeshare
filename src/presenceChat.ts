@@ -71,8 +71,32 @@ export interface ChatRelayFrame {
   readonly ts: number;
 }
 
-export type PresenceChatInbound = HelloFrame | ChatSendFrame;
-export type PresenceChatOutbound = PresenceFrame | ChatRelayFrame;
+/**
+ * Viewer → hub → host: request to drive an invite share.
+ * The hub stamps viewerId from the CONNECTION — payload identity is discarded.
+ */
+export interface JoinRequestFrame {
+  readonly kind: 'join-request';
+  readonly viewerId: string;
+  readonly name: string;
+}
+
+/**
+ * Host → hub → one viewer: role / join-request decision.
+ * Host is the only party allowed to emit this; hub stamps target from the
+ * host-supplied viewerId (must match a live connection) and fans it out.
+ */
+export interface RoleUpdateFrame {
+  readonly kind: 'role-update';
+  readonly viewerId: string;
+  /** 'collaborator' after approve; 'spectator' after deny. */
+  readonly role: 'spectator' | 'collaborator';
+  /** Mirrors Viewer.joinRequest after the decision. */
+  readonly joinRequest: 'approved' | 'denied' | 'pending' | 'none';
+}
+
+export type PresenceChatInbound = HelloFrame | ChatSendFrame | { kind: 'join-request' };
+export type PresenceChatOutbound = PresenceFrame | ChatRelayFrame | JoinRequestFrame | RoleUpdateFrame;
 
 /** Sanitize a peer-supplied display name for storage/display. */
 export function sanitizePresenceName(name: unknown): string {
@@ -153,5 +177,32 @@ export function parsePresenceChatInbound(msg: Record<string, unknown>): Presence
   if (msg['kind'] === 'chat' && typeof msg['text'] === 'string') {
     return { kind: 'chat', text: msg['text'] };
   }
+  if (msg['kind'] === 'join-request') {
+    return { kind: 'join-request' };
+  }
   return null;
+}
+
+/** Build a host→viewer role-update frame (pure). */
+export function buildRoleUpdate(opts: {
+  readonly viewerId: string;
+  readonly role: 'spectator' | 'collaborator';
+  readonly joinRequest: 'approved' | 'denied' | 'pending' | 'none';
+}): RoleUpdateFrame | null {
+  if (typeof opts.viewerId !== 'string' || opts.viewerId.length === 0) return null;
+  if (opts.role !== 'spectator' && opts.role !== 'collaborator') return null;
+  if (
+    opts.joinRequest !== 'approved' &&
+    opts.joinRequest !== 'denied' &&
+    opts.joinRequest !== 'pending' &&
+    opts.joinRequest !== 'none'
+  ) {
+    return null;
+  }
+  return {
+    kind: 'role-update',
+    viewerId: opts.viewerId,
+    role: opts.role,
+    joinRequest: opts.joinRequest,
+  };
 }
