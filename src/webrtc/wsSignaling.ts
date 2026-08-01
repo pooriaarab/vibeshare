@@ -20,6 +20,7 @@
  *                    {kind:'rtc-ice', shareId, viewerId, candidate, mid, from:'viewer'}
  *                    {kind:'presence', viewers:[{viewerId,name,role}]}
  *                    {kind:'chat', viewerId, name, role, text, ts}   (text = ciphertext)
+ *                    {kind:'annotation', id, seq, viewerId, name, role, text, replyTo?, ts}   (text = ciphertext)
  *   server → viewer: {kind:'assigned', viewerId}        (server-minted, unforgeable)
  *                    {kind:'rtc-offer', shareId, viewerId, sdp}
  *                    {kind:'rtc-ice', shareId, viewerId, candidate, mid, from:'host'}
@@ -50,6 +51,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
+import type { AnnotationRelayFrame } from '../annotations.js';
 import type {
   ChatRelayFrame,
   JoinRequestFrame,
@@ -60,6 +62,7 @@ import type {
 import { buildRoleUpdate } from '../presenceChat.js';
 import type { SignalingChannel, SignalingFrame, SignalingSide } from './signaling.js';
 
+export type { AnnotationRelayFrame };
 export type { ChatRelayFrame, JoinRequestFrame, PresenceEntry, PresenceFrame, RoleUpdateFrame };
 
 export interface WsSignalingOptions {
@@ -74,6 +77,8 @@ export interface WsSignalingOptions {
   readonly onPresence?: (frame: PresenceFrame) => void;
   /** Multi-party chat lines stamped by the rendezvous (host socket). */
   readonly onChat?: (frame: ChatRelayFrame) => void;
+  /** Multi-party annotations stamped by the rendezvous (host socket). */
+  readonly onAnnotation?: (frame: AnnotationRelayFrame) => void;
   /** Viewer requested to drive — identity hub-stamped (host socket). */
   readonly onJoinRequest?: (frame: JoinRequestFrame) => void;
 }
@@ -111,6 +116,7 @@ export class WsSignaling implements SignalingChannel {
   readonly #onError: (error: Error) => void;
   readonly #onPresence: ((frame: PresenceFrame) => void) | undefined;
   readonly #onChat: ((frame: ChatRelayFrame) => void) | undefined;
+  readonly #onAnnotation: ((frame: AnnotationRelayFrame) => void) | undefined;
   readonly #onJoinRequest: ((frame: JoinRequestFrame) => void) | undefined;
   readonly #hosts = new Map<string, HostConn>();
   readonly #viewers = new Map<string, ViewerConn>();
@@ -122,6 +128,7 @@ export class WsSignaling implements SignalingChannel {
     this.#onError = opts.onError ?? (() => {});
     this.#onPresence = opts.onPresence;
     this.#onChat = opts.onChat;
+    this.#onAnnotation = opts.onAnnotation;
     this.#onJoinRequest = opts.onJoinRequest;
   }
 
@@ -419,6 +426,11 @@ export class WsSignaling implements SignalingChannel {
           if (frame) this.#onChat?.(frame);
           return;
         }
+        case 'annotation': {
+          const frame = asAnnotation(msg);
+          if (frame) this.#onAnnotation?.(frame);
+          return;
+        }
         case 'join-request': {
           const frame = asJoinRequest(msg);
           if (frame) this.#onJoinRequest?.(frame);
@@ -456,8 +468,10 @@ export class WsSignaling implements SignalingChannel {
         }
         case 'presence':
         case 'chat':
-          // Viewer-side presence/chat is handled by the browser page over the
-          // same socket; the Node viewer path (tests) ignores them here.
+        case 'annotation':
+          // Viewer-side presence/chat/annotations are handled by the browser
+          // page over the same socket; the Node viewer path (tests) ignores
+          // them here.
           return;
         default:
           return; // unknown shape — ignore
@@ -553,5 +567,29 @@ function asJoinRequest(msg: Record<string, unknown>): JoinRequestFrame | null {
   if (typeof msg['viewerId'] !== 'string' || msg['viewerId'].length === 0) return null;
   if (typeof msg['name'] !== 'string') return null;
   return { kind: 'join-request', viewerId: msg['viewerId'], name: msg['name'] };
+}
+
+function asAnnotation(msg: Record<string, unknown>): AnnotationRelayFrame | null {
+  if (msg['kind'] !== 'annotation') return null;
+  if (typeof msg['id'] !== 'string' || msg['id'].length === 0) return null;
+  if (typeof msg['seq'] !== 'number' || !Number.isInteger(msg['seq']) || msg['seq'] < 0) return null;
+  if (typeof msg['viewerId'] !== 'string') return null;
+  if (typeof msg['name'] !== 'string') return null;
+  if (typeof msg['text'] !== 'string') return null;
+  const role = msg['role'] === 'host' ? 'host' : msg['role'] === 'viewer' ? 'viewer' : null;
+  if (!role) return null;
+  const replyTo = typeof msg['replyTo'] === 'string' && msg['replyTo'].length > 0 ? msg['replyTo'] : undefined;
+  const ts = typeof msg['ts'] === 'number' ? msg['ts'] : Date.now();
+  return {
+    kind: 'annotation',
+    id: msg['id'],
+    seq: msg['seq'],
+    viewerId: msg['viewerId'],
+    name: msg['name'],
+    role,
+    text: msg['text'],
+    ...(replyTo !== undefined ? { replyTo } : {}),
+    ts,
+  };
 }
 
