@@ -221,6 +221,35 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     feed.close();
   });
 
+  it('hub-stamped ensure(id) + approve lets that exact viewerId reach onInput', async () => {
+    // Mirrors the --public path: Worker mints viewerId, presence/ensure binds
+    // it into the host registry, approve flips canWrite, DataChannel input
+    // arrives stamped with the same id.
+    transport = new WebRtcTransport({
+      signaling,
+      onInput: (shareId, viewerId, data) => inputs.push({ shareId, viewerId, data }),
+    });
+
+    const share = makeShare('invite');
+    const feed = new SessionFeed();
+    const viewers = new ViewerRegistry(() => share.access);
+    const url = await transport.serve(share, feed, viewers);
+    const key = keyFromUrl(url);
+
+    const hubId = 'hub-minted-uuid-bbbb';
+    viewers.ensure(hubId, 'Ada');
+    viewers.requestJoin(hubId);
+    viewers.approve(hubId);
+    expect(viewers.canWrite(hubId)).toBe(true);
+
+    const dc = await connect(signaling, share.id, hubId).opened;
+    sendInput(dc, key, 'echo hi\r', 1);
+    await vi.waitFor(() => {
+      expect(inputs).toEqual([{ shareId: share.id, viewerId: hubId, data: 'echo hi\r' }]);
+    });
+    feed.close();
+  });
+
   it('AES-GCM: tampered ciphertext fails authentication and never yields plaintext', async () => {
     // Unit level: flip a bit, wrong key, truncation — all must throw.
     const unitKey = randomBytes(32);
