@@ -52,12 +52,15 @@ import { randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
 import type {
   ChatRelayFrame,
+  JoinRequestFrame,
   PresenceEntry,
   PresenceFrame,
+  RoleUpdateFrame,
 } from '../presenceChat.js';
+import { buildRoleUpdate } from '../presenceChat.js';
 import type { SignalingChannel, SignalingFrame, SignalingSide } from './signaling.js';
 
-export type { ChatRelayFrame, PresenceEntry, PresenceFrame };
+export type { ChatRelayFrame, JoinRequestFrame, PresenceEntry, PresenceFrame, RoleUpdateFrame };
 
 export interface WsSignalingOptions {
   /**
@@ -71,6 +74,8 @@ export interface WsSignalingOptions {
   readonly onPresence?: (frame: PresenceFrame) => void;
   /** Multi-party chat lines stamped by the rendezvous (host socket). */
   readonly onChat?: (frame: ChatRelayFrame) => void;
+  /** Viewer requested to drive — identity hub-stamped (host socket). */
+  readonly onJoinRequest?: (frame: JoinRequestFrame) => void;
 }
 
 interface HostConn {
@@ -106,6 +111,7 @@ export class WsSignaling implements SignalingChannel {
   readonly #onError: (error: Error) => void;
   readonly #onPresence: ((frame: PresenceFrame) => void) | undefined;
   readonly #onChat: ((frame: ChatRelayFrame) => void) | undefined;
+  readonly #onJoinRequest: ((frame: JoinRequestFrame) => void) | undefined;
   readonly #hosts = new Map<string, HostConn>();
   readonly #viewers = new Map<string, ViewerConn>();
   /** Viewer-side subscribers registered before their announceViewer call. */
@@ -116,6 +122,7 @@ export class WsSignaling implements SignalingChannel {
     this.#onError = opts.onError ?? (() => {});
     this.#onPresence = opts.onPresence;
     this.#onChat = opts.onChat;
+    this.#onJoinRequest = opts.onJoinRequest;
   }
 
   /**
@@ -135,6 +142,24 @@ export class WsSignaling implements SignalingChannel {
    */
   sendChat(shareId: string, ciphertextB64: string): void {
     this.#sendHost(shareId, { kind: 'chat', text: ciphertextB64 });
+  }
+
+  /**
+   * Host → one viewer: notify them of an approve/deny decision.
+   * Hub only relays if this socket is the host for the share.
+   */
+  sendRoleUpdate(
+    shareId: string,
+    opts: { viewerId: string; role: 'spectator' | 'collaborator'; joinRequest: 'approved' | 'denied' | 'pending' | 'none' },
+  ): void {
+    const frame = buildRoleUpdate(opts);
+    if (!frame) return;
+    this.#sendHost(shareId, {
+      kind: 'role-update',
+      viewerId: frame.viewerId,
+      role: frame.role,
+      joinRequest: frame.joinRequest,
+    });
   }
 
   // ------------------------------------------------------- SignalingChannel
@@ -394,6 +419,11 @@ export class WsSignaling implements SignalingChannel {
           if (frame) this.#onChat?.(frame);
           return;
         }
+        case 'join-request': {
+          const frame = asJoinRequest(msg);
+          if (frame) this.#onJoinRequest?.(frame);
+          return;
+        }
         default:
           return; // unknown shape — ignore
       }
@@ -517,3 +547,11 @@ function asChat(msg: Record<string, unknown>): ChatRelayFrame | null {
     ts,
   };
 }
+
+function asJoinRequest(msg: Record<string, unknown>): JoinRequestFrame | null {
+  if (msg['kind'] !== 'join-request') return null;
+  if (typeof msg['viewerId'] !== 'string' || msg['viewerId'].length === 0) return null;
+  if (typeof msg['name'] !== 'string') return null;
+  return { kind: 'join-request', viewerId: msg['viewerId'], name: msg['name'] };
+}
+

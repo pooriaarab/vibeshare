@@ -206,6 +206,49 @@ class MockRendezvous {
       });
       return true;
     }
+    // Viewer → host: request to drive. Identity from CONNECTION only.
+    if (msg['kind'] === 'join-request') {
+      if (att.role !== 'viewer' || !att.viewerId || !room.host) return true;
+      room.host.ws.send(
+        JSON.stringify({
+          kind: 'join-request',
+          viewerId: att.viewerId,
+          name: att.name,
+        }),
+      );
+      return true;
+    }
+    // Host → one viewer: role decision after approve/deny.
+    if (msg['kind'] === 'role-update') {
+      if (att.role !== 'host') return true;
+      const viewerId = typeof msg['viewerId'] === 'string' ? msg['viewerId'] : '';
+      const role =
+        msg['role'] === 'collaborator'
+          ? 'collaborator'
+          : msg['role'] === 'spectator'
+            ? 'spectator'
+            : null;
+      const joinRequest =
+        msg['joinRequest'] === 'approved' ||
+        msg['joinRequest'] === 'denied' ||
+        msg['joinRequest'] === 'pending' ||
+        msg['joinRequest'] === 'none'
+          ? msg['joinRequest']
+          : null;
+      if (!viewerId || !role || !joinRequest) return true;
+      const viewer = room.viewers.get(viewerId);
+      if (viewer) {
+        viewer.ws.send(
+          JSON.stringify({
+            kind: 'role-update',
+            viewerId,
+            role,
+            joinRequest,
+          }),
+        );
+      }
+      return true;
+    }
     return false;
   }
 
@@ -554,11 +597,73 @@ describe('WsSignaling over a mock rendezvous', () => {
     host.ws.send(JSON.stringify({ kind: 'key', viewerId, key: 'AES KEY MATERIAL' }));
 
     await sleep(300);
-    const allowed = new Set(['host-ready', 'viewer-joined', 'assigned', 'presence', 'chat']);
+    const allowed = new Set([
+      'host-ready',
+      'viewer-joined',
+      'assigned',
+      'presence',
+      'chat',
+      'join-request',
+      'role-update',
+    ]);
     const hostExtra = host.msgs.filter((m) => !allowed.has(String(m['kind'])));
     const viewerExtra = viewer.msgs.filter((m) => !allowed.has(String(m['kind'])));
     expect(hostExtra).toEqual([]);
     expect(viewerExtra).toEqual([]);
+  });
+
+  it('stamps join-request from the connection and relays host role-update to that viewer', async () => {
+    const shareId = newShareId();
+    const host = rawClient(`${base}/ws/host?share=${shareId}&secret=${'j'.repeat(32)}`);
+    raws.push(host.ws);
+    await waitForMsg(host, 'host-ready');
+
+    const viewer = rawClient(`${base}/ws/viewer?share=${shareId}`);
+    raws.push(viewer.ws);
+    const assigned = await waitForMsg(viewer, 'assigned');
+    const viewerId = assigned['viewerId'] as string;
+    await waitForMsg(host, 'viewer-joined');
+
+    // Viewer hellos so the hub has a display name, then requests to drive.
+    // Any client-supplied viewerId on the payload is discarded.
+    viewer.ws.send(JSON.stringify({ kind: 'hello', name: 'Ada' }));
+    await waitForMsg(host, 'presence');
+    viewer.ws.send(JSON.stringify({ kind: 'join-request', viewerId: 'forged-id', name: 'Eve' }));
+
+    const jr = await waitForMsg(host, 'join-request');
+    expect(jr['viewerId']).toBe(viewerId); // connection-stamped, not forged
+    expect(jr['name']).toBe('Ada');
+
+    // Host approves → role-update reaches ONLY that viewer.
+    host.ws.send(
+      JSON.stringify({
+        kind: 'role-update',
+        viewerId,
+        role: 'collaborator',
+        joinRequest: 'approved',
+      }),
+    );
+    const ru = await waitForMsg(viewer, 'role-update');
+    expect(ru).toMatchObject({
+      kind: 'role-update',
+      viewerId,
+      role: 'collaborator',
+      joinRequest: 'approved',
+    });
+
+    // A viewer cannot mint a role-update for themselves.
+    const before = viewer.msgs.length;
+    viewer.ws.send(
+      JSON.stringify({
+        kind: 'role-update',
+        viewerId,
+        role: 'collaborator',
+        joinRequest: 'approved',
+      }),
+    );
+    await sleep(200);
+    const sneaky = viewer.msgs.slice(before).filter((m) => m['kind'] === 'role-update');
+    expect(sneaky).toEqual([]);
   });
 
   it('broadcasts a presence roster on join/hello/leave and stamps chat from the connection', async () => {
