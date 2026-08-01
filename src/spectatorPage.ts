@@ -8,11 +8,14 @@
  *   - e2e (tunnel path): SSE data is base64(AES-GCM frame); the page decrypts
  *     with the key from `location.hash` via WebCrypto (mirrors viewerPage.ts)
  *
- * Presence + chat ride the host multi-party hub (SSE events + POST /chat):
+ * Presence + chat + annotations ride the host multi-party hub (SSE events +
+ * POST /chat|/annotate):
  *   - presence roster replaces the bare "N watching" count with named watchers
  *   - chat TEXT is e2e-encrypted with the share key when e2e is on (tunnel);
  *     on pure-local plaintext path the host still stamps identity from the
  *     viewer token. Display text is sanitized against terminal/bidi injection.
+ *   - annotations are pinned comments anchored to the feed seq the viewer is
+ *     watching, threaded via replyTo; same stamping + e2e rules as chat.
  *
  * Terminal rendering uses inlined xterm.js (CSP-safe, no CDN) so raw PTY
  * bytes reconstruct colors/cursor/full-screen TUI redraws faithfully.
@@ -103,6 +106,8 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
     <button type="button" id="exportTextBtn" title="Download the full terminal scrollback as plain text">Export text</button>
   </div>
 
+  <button class="pin-btn hidden" id="pinBtn" title="pin a comment at the feed position you are watching">📌 pin a comment here</button>
+
   <button class="join-btn hidden" id="reqBtn">Request to join</button>
 
   <div class="input-row hidden" id="inputRow">
@@ -116,6 +121,16 @@ export function spectatorPage(share: Share, opts: SpectatorPageOptions = {}): st
     <form class="chat-form" id="chatForm">
       <input id="chatInput" placeholder="message the room…" maxlength="500" autocomplete="off">
       <button id="chatSend" type="submit">Send</button>
+    </form>
+  </div>
+
+  <div class="chat ann hidden" id="annBox">
+    <div class="chat-head">Annotations · pinned to the feed${e2e ? ' · e2e encrypted' : ''}</div>
+    <div class="chat-log" id="annLog"><div class="chat-empty">No pins yet — pin a comment to the moment you are watching.</div></div>
+    <div class="ann-replying hidden" id="annReplying"><span id="annReplyingText"></span><button type="button" id="annReplyCancel">✕</button></div>
+    <form class="chat-form" id="annForm">
+      <input id="annInput" placeholder="pin a comment at the current moment…" maxlength="500" autocomplete="off">
+      <button id="annSend" type="submit">Pin</button>
     </form>
   </div>
 </div>
@@ -164,6 +179,20 @@ ${XTERM_BOOT_JS}
   var chatLog = document.getElementById("chatLog");
   var chatInput = document.getElementById("chatInput");
   var chatForm = document.getElementById("chatForm");
+  var annBox = document.getElementById("annBox");
+  var annLog = document.getElementById("annLog");
+  var annInput = document.getElementById("annInput");
+  var annForm = document.getElementById("annForm");
+  var annReplying = document.getElementById("annReplying");
+  var annReplyingText = document.getElementById("annReplyingText");
+  var pinBtn = document.getElementById("pinBtn");
+  var anns = [];
+  var annById = {};
+  var annReplyTo = null;
+  var annLocal = 0;
+  // Best-effort seq → xterm buffer line map so a pin can "jump" to its moment.
+  var seqLines = {};
+  var seqLineQueue = [];
 
   document.getElementById("sessionName").textContent = " · " + CFG.name;
   document.getElementById("chromePath").textContent = CFG.name + " — live";
@@ -195,8 +224,22 @@ ${XTERM_BOOT_JS}
     if(typeof e.seq === "number"){
       if(e.seq <= lastSeq) return;
       lastSeq = e.seq;
+      // termApi may not exist on the very first entry — noteSeqLine guards.
+      noteSeqLine(e.seq);
     }
     __vsHandleEntry(ensureTerm(), e);
+  }
+
+  function noteSeqLine(seq){
+    try {
+      if(!termApi || !termApi.term || !termApi.term.buffer) return;
+      seqLines[seq] = termApi.term.buffer.active.length;
+      seqLineQueue.push(seq);
+      if(seqLineQueue.length > 4000){
+        var old = seqLineQueue.shift();
+        delete seqLines[old];
+      }
+    } catch(err){}
   }
 
   var presenceExpanded = false;
@@ -243,6 +286,103 @@ ${XTERM_BOOT_JS}
     chatLog.appendChild(line);
     chatLog.scrollTop = chatLog.scrollHeight;
   }
+
+  // ---- annotations: pinned comments anchored to a feed seq (threaded).
+  function addAnn(d, text, mine){
+    var clean = sanitizePeerText(text, 500);
+    if(!clean || !clean.trim()) return;
+    var id = (typeof d.id === "string" && d.id) ? d.id : ("local-" + (++annLocal));
+    if(annById[id]) return;
+    var a = {
+      id: id,
+      seq: (typeof d.seq === "number" && isFinite(d.seq)) ? Math.max(0, Math.floor(d.seq)) : 0,
+      name: sanitizePeerText(d.name || "viewer", 32).trim() || "viewer",
+      text: clean,
+      replyTo: (typeof d.replyTo === "string" && d.replyTo) ? d.replyTo : null,
+      ts: (typeof d.ts === "number") ? d.ts : Date.now(),
+      mine: !!mine
+    };
+    annById[id] = a;
+    anns.push(a);
+    if(anns.length > 500){
+      var dropped = anns.shift();
+      if(dropped) delete annById[dropped.id];
+    }
+    renderAnns();
+  }
+
+  function renderAnns(){
+    annLog.innerHTML = "";
+    var roots = [], repliesByParent = {}, i, a;
+    for(i = 0; i < anns.length; i++){
+      a = anns[i];
+      if(a.replyTo && annById[a.replyTo]){
+        (repliesByParent[a.replyTo] = repliesByParent[a.replyTo] || []).push(a);
+      } else {
+        roots.push(a);
+      }
+    }
+    roots.sort(function(x, y){ return (x.seq - y.seq) || (x.ts - y.ts); });
+    for(i = 0; i < roots.length; i++){
+      appendAnnLine(roots[i], 0);
+      var reps = repliesByParent[roots[i].id] || [];
+      reps.sort(function(x, y){ return x.ts - y.ts; });
+      for(var j = 0; j < reps.length; j++) appendAnnLine(reps[j], 1);
+    }
+    annLog.scrollTop = annLog.scrollHeight;
+  }
+
+  function appendAnnLine(a, depth){
+    var line = document.createElement("div");
+    line.className = "chat-line ann-line" + (a.mine ? " mine" : "") + (depth ? " reply" : "");
+    var html = '<span class="seq">@' + a.seq + "</span> " +
+      '<span class="who">' + escapeHtml(a.name) + "</span>: " +
+      '<span class="msg">' + escapeHtml(a.text) + "</span>" +
+      '<span class="ops">';
+    if(typeof seqLines[a.seq] === "number"){
+      html += '<a data-jump="' + a.seq + '">jump</a>';
+    }
+    html += '<a data-reply="' + a.id + '">reply</a></span>';
+    line.innerHTML = html;
+    annLog.appendChild(line);
+  }
+
+  annLog.addEventListener("click", function(ev){
+    var t = ev.target;
+    if(!t || !t.getAttribute) return;
+    var jump = t.getAttribute("data-jump");
+    if(jump !== null && jump !== undefined){
+      ev.preventDefault();
+      var lineNo = seqLines[Number(jump)];
+      if(termApi && typeof lineNo === "number"){
+        try { termApi.term.scrollToLine(Math.max(0, lineNo - 1)); } catch(e){}
+      }
+      return;
+    }
+    var rep = t.getAttribute("data-reply");
+    if(rep){
+      ev.preventDefault();
+      setAnnReply(rep);
+    }
+  });
+
+  function setAnnReply(id){
+    annReplyTo = id || null;
+    if(annReplyTo && annById[annReplyTo]){
+      annReplyingText.textContent = "replying to " + annById[annReplyTo].name + " @" + annById[annReplyTo].seq;
+      annReplying.classList.remove("hidden");
+      annInput.focus();
+    } else {
+      annReplyTo = null;
+      annReplying.classList.add("hidden");
+    }
+  }
+  document.getElementById("annReplyCancel").addEventListener("click", function(){ setAnnReply(null); });
+
+  pinBtn.addEventListener("click", function(){
+    annInput.placeholder = "pin a comment at seq " + lastSeq + "…";
+    annInput.focus();
+  });
 
   // ---- optional e2e helpers (only when CFG.e2e). Key rides in #fragment.
   var cryptoKey = null;
@@ -340,6 +480,8 @@ ${XTERM_BOOT_JS}
       viewer = res;
       joinPanel.classList.add("hidden");
       chatBox.classList.remove("hidden");
+      annBox.classList.remove("hidden");
+      pinBtn.classList.remove("hidden");
       setBadge("", "SPECTATING · read-only");
       if(CFG.access === "invite") reqBtn.classList.remove("hidden");
       ensureTerm();
@@ -375,6 +517,20 @@ ${XTERM_BOOT_JS}
           });
         } else if(typeof d.text === "string"){
           appendChatLine(d.name, d.text, mine);
+        }
+      });
+    });
+    source.addEventListener("annotation", function(ev){
+      parseEventData(ev.data).then(function(d){
+        if(!d) return;
+        var mine = viewer && d.viewerId === viewer.viewerId;
+        if(CFG.e2e && typeof d.text === "string"){
+          // text is ciphertext; decrypt with share key
+          decryptChatCipher(d.text).then(function(plain){
+            if(plain) addAnn(d, plain, mine);
+          });
+        } else if(typeof d.text === "string"){
+          addAnn(d, d.text, mine);
         }
       });
     });
@@ -469,6 +625,35 @@ ${XTERM_BOOT_JS}
     }
   });
 
+  // Pin a comment at the feed head the viewer is watching (seq = anchor).
+  // Identity rides the viewer token; replyTo threads under a parent pin.
+  annForm.addEventListener("submit", function(ev){
+    ev.preventDefault();
+    if(!viewer) return;
+    var text = sanitizePeerText(annInput.value || "", 500).trim();
+    if(!text) return;
+    annInput.value = "";
+    var body = { token: viewer.token, seq: lastSeq, text: text };
+    if(annReplyTo) body.replyTo = annReplyTo;
+    setAnnReply(null);
+    function post(b){
+      return fetch(base + "/annotate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(b)
+      });
+    }
+    if(CFG.e2e){
+      encryptChatPlain(text).then(function(cipher){
+        if(!cipher) return;
+        body.text = cipher;
+        return post(body);
+      });
+    } else {
+      post(body).catch(function(){ /* host gone */ });
+    }
+  });
+
   function ended(state){
     setBadge("ended", state === "kicked" ? "REMOVED BY HOST" : "SHARE ENDED");
     reqBtn.classList.add("hidden");
@@ -477,6 +662,7 @@ ${XTERM_BOOT_JS}
     sendBtn.disabled = true;
     inputRow.classList.add("hidden");
     chatInput.disabled = true;
+    annInput.disabled = true;
     applyEntry({ type: "system", text: state === "kicked" ? "— the host removed you from this share —" : "— the host ended this share —" });
   }
 
