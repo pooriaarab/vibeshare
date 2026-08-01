@@ -12,6 +12,12 @@ describe('newShareId', () => {
     expect(ids.size).toBe(2000);
   });
 
+  it('never starts with - or _ (would parse as a CLI flag)', () => {
+    for (let i = 0; i < 3000; i++) {
+      expect(newShareId()).not.toMatch(/^[-_]/);
+    }
+  });
+
   it('is the single canonical definition (utils.js), not duplicated in url.js', async () => {
     // Audit finding: url.ts and utils.ts used to BOTH define newShareId with
     // different entropy. utils.ts is canonical; url.ts must not re-grow one.

@@ -120,5 +120,6 @@ export type ShareErrorCode =
   | 'invite-disabled'
   | 'already-pending'
   | 'not-pending'
+  | 'not-promoted'
   | 'consent-required'
   | 'bad-request';

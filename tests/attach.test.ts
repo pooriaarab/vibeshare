@@ -98,6 +98,8 @@ interface MockTmuxState {
   missing: Set<string>;
   /** Live writers keyed by target — tests push bytes after start. */
   live: Map<string, PassThrough>;
+  /** sendKeys calls: { target, data } */
+  sent: Array<{ target: string; data: string }>;
 }
 
 function createMockTmux(init: Partial<MockTmuxState> = {}): { client: TmuxClient; state: MockTmuxState } {
@@ -110,6 +112,7 @@ function createMockTmux(init: Partial<MockTmuxState> = {}): { client: TmuxClient
     stopped: [],
     missing: init.missing ?? new Set(),
     live: new Map(),
+    sent: [],
   };
 
   const client: TmuxClient = {
@@ -154,6 +157,13 @@ function createMockTmux(init: Partial<MockTmuxState> = {}): { client: TmuxClient
           stream.destroy();
         },
       };
+    },
+    async sendKeys(target, data) {
+      if (state.missing.has(target)) {
+        throw new AttachError(`tmux send-keys failed for ${target}: can't find pane`);
+      }
+      if (data.length === 0) return;
+      state.sent.push({ target, data });
     },
   };
 
@@ -301,6 +311,25 @@ describe('createTmuxCaptureSource (mocked tmux)', () => {
     const { feed } = collectFeed();
     const source = createTmuxCaptureSource({ target: 'nope:0.0', tmux: client });
     await expect(source.start(feed)).rejects.toThrow(/target not found/i);
+  });
+
+  it('writeInput routes approved collaborator keys through tmux send-keys -l', async () => {
+    const target = 'demo:1.0';
+    const { client, state } = createMockTmux({
+      sizes: new Map([[target, { cols: 80, rows: 24 }]]),
+      screens: new Map([[target, '']]),
+    });
+    const { feed } = collectFeed();
+    const source = createTmuxCaptureSource({ target, tmux: client, sizePollMs: 0 });
+    const handle = await source.start(feed);
+    expect(typeof handle.writeInput).toBe('function');
+    await handle.writeInput!('ls -la\r');
+    await handle.writeInput!(''); // no-op
+    expect(state.sent).toEqual([{ target, data: 'ls -la\r' }]);
+    await handle.stop();
+    // After stop, writeInput is a quiet no-op.
+    await handle.writeInput!('nope');
+    expect(state.sent).toHaveLength(1);
   });
 
   it('re-emits resize when pane size changes', async () => {

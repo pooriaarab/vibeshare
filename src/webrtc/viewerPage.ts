@@ -68,8 +68,10 @@ export function viewerPage(): string {
     <div class="term-body" id="termBody"></div>
   </div>
 
+  <button class="join-btn hidden" id="reqBtn">Request to drive</button>
+
   <div class="input-row">
-    <input id="cmdInput" placeholder="send input to the session (applied only if the host approved you)" disabled>
+    <input id="cmdInput" placeholder="type to drive the session (enabled after host approves)" disabled autocomplete="off">
     <button id="sendBtn" disabled>Send</button>
   </div>
 
@@ -118,7 +120,10 @@ ${XTERM_BOOT_JS}
   var chatInput = document.getElementById("chatInput");
   var chatSend = document.getElementById("chatSend");
   var chatForm = document.getElementById("chatForm");
-  var termApi = null;
+
+  var reqBtn = document.getElementById("reqBtn");
+  var canDrive = false;
+  var dcOpen = false;  var termApi = null;
   var lastEntrySeq = 0;
   var myViewerId = null;
   var myName = "";
@@ -260,6 +265,8 @@ ${XTERM_BOOT_JS}
       renderPresence(msg.viewers);
     } else if(msg.kind === "chat"){
       appendChat(msg);
+    } else if(msg.kind === "role-update"){
+      onRoleUpdate(msg);
     }
   };
   ws.onopen = function(){
@@ -282,7 +289,46 @@ ${XTERM_BOOT_JS}
     else pendingHello = hello;
     if(myViewerId) startPeer();
     enableChat();
+    reqBtn.classList.remove("hidden");
     setBadge("", "CONNECTING · waiting for host");
+  });
+
+  function setDriveEnabled(on){
+    canDrive = !!on;
+    var ready = canDrive && dcOpen;
+    cmdInput.disabled = !ready;
+    sendBtn.disabled = !ready;
+    if(canDrive){
+      setBadge("collab", "COLLABORATING · you can drive");
+      reqBtn.className = "join-btn joined";
+      reqBtn.disabled = true;
+      reqBtn.textContent = "You're in — driving";
+    }
+  }
+
+  function onRoleUpdate(msg){
+    if(!msg) return;
+    if(msg.role === "collaborator" && msg.joinRequest === "approved"){
+      setDriveEnabled(true);
+      applyEntry({ type: "system", text: "→ the host approved you — your keystrokes drive the session." });
+    } else if(msg.joinRequest === "denied"){
+      canDrive = false;
+      cmdInput.disabled = true;
+      sendBtn.disabled = true;
+      reqBtn.className = "join-btn";
+      reqBtn.disabled = false;
+      reqBtn.textContent = "Request denied — try again";
+      setBadge("", "LIVE · p2p · read-only");
+    }
+  }
+
+  reqBtn.addEventListener("click", function(){
+    if(ws.readyState !== 1) return;
+    reqBtn.disabled = true;
+    reqBtn.className = "join-btn pending";
+    reqBtn.textContent = "Waiting for host approval…";
+    // Identity is stamped by the Worker from the connection — never claim viewerId.
+    send({ kind: "join-request" });
   });
 
   function startPeer(){
@@ -295,9 +341,11 @@ ${XTERM_BOOT_JS}
       dc = ev.channel;
       dc.binaryType = "arraybuffer";
       dc.onopen = function(){
-        setBadge("", "LIVE · p2p");
-        cmdInput.disabled = false;
-        sendBtn.disabled = false;
+        dcOpen = true;
+        setBadge("", canDrive ? "COLLABORATING · you can drive" : "LIVE · p2p · read-only");
+        // Input stays disabled until the host approves (role-update).
+        cmdInput.disabled = !canDrive;
+        sendBtn.disabled = !canDrive;
         ensureTerm();
       };
       dc.onclose = function(){ ended("SHARE ENDED", "— the host ended this share —"); };
@@ -345,23 +393,50 @@ ${XTERM_BOOT_JS}
     });
   }
 
-  // ---- collaborator input: {kind:'input', data, seq} encrypted host-bound
-  function sendInput(){
-    var text = cmdInput.value;
-    if(!text || !dc || dc.readyState !== "open" || !key) return;
-    cmdInput.value = "";
+  // ---- collaborator input: {kind:'input', data, seq} encrypted host-bound.
+  // Identity is the DataChannel peer (hub-stamped viewerId on the host side);
+  // payload never carries viewerId. Enabled only after host role-update.
+  function sendInputBytes(data){
+    if(!canDrive || !data || !dc || dc.readyState !== "open" || !key) return;
     inputSeq++;
-    var payload = new TextEncoder().encode(JSON.stringify({ kind: "input", data: text, seq: inputSeq }));
+    var payload = new TextEncoder().encode(JSON.stringify({ kind: "input", data: data, seq: inputSeq }));
     var nonce = crypto.getRandomValues(new Uint8Array(12));
     crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, payload).then(function(ct){
       var out = new Uint8Array(12 + ct.byteLength);
       out.set(nonce, 0);
       out.set(new Uint8Array(ct), 12);
-      dc.send(out.buffer);
+      try { dc.send(out.buffer); } catch(e){ /* channel closing */ }
     });
   }
-  sendBtn.addEventListener("click", sendInput);
-  cmdInput.addEventListener("keydown", function(ev){ if(ev.key === "Enter") sendInput(); });
+  function sendInputLine(){
+    var text = cmdInput.value;
+    if(!text) return;
+    cmdInput.value = "";
+    // Append CR so Enter submits in shells/TUIs the way a real terminal does.
+    sendInputBytes(text + "\\r");
+  }
+  sendBtn.addEventListener("click", sendInputLine);
+  cmdInput.addEventListener("keydown", function(ev){
+    if(!canDrive) return;
+    if(ev.key === "Enter"){
+      ev.preventDefault();
+      sendInputLine();
+      return;
+    }
+    // Control characters: Ctrl+C / Ctrl+D / Esc / Tab / arrows — send raw.
+    if(ev.ctrlKey && ev.key.length === 1){
+      ev.preventDefault();
+      sendInputBytes(String.fromCharCode(ev.key.toUpperCase().charCodeAt(0) - 64));
+      return;
+    }
+    if(ev.key === "Escape"){ ev.preventDefault(); sendInputBytes("\u001b"); return; }
+    if(ev.key === "Tab"){ ev.preventDefault(); sendInputBytes("\t"); return; }
+    if(ev.key === "Backspace"){ ev.preventDefault(); sendInputBytes("\u007f"); return; }
+    if(ev.key === "ArrowUp"){ ev.preventDefault(); sendInputBytes("\u001b[A"); return; }
+    if(ev.key === "ArrowDown"){ ev.preventDefault(); sendInputBytes("\u001b[B"); return; }
+    if(ev.key === "ArrowRight"){ ev.preventDefault(); sendInputBytes("\u001b[C"); return; }
+    if(ev.key === "ArrowLeft"){ ev.preventDefault(); sendInputBytes("\u001b[D"); return; }
+  });
 
   // ---- chat: encrypt plaintext with share key; Worker stamps identity
   chatForm.addEventListener("submit", function(ev){
@@ -382,10 +457,13 @@ ${XTERM_BOOT_JS}
 
   function ended(state, msg){
     setBadge("ended", state);
+    canDrive = false;
+    dcOpen = false;
     cmdInput.disabled = true;
     sendBtn.disabled = true;
     chatInput.disabled = true;
     chatSend.disabled = true;
+    reqBtn.disabled = true;
     applyEntry({ type: "system", text: msg });
   }
 
