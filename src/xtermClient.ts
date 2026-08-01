@@ -150,6 +150,9 @@ button:disabled{ opacity:.6; cursor:default; }
   .term-body{ height:38vh; height:38dvh; min-height:180px; }
   .p2p{ font-size:10.5px; }
 }
+.export-bar{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+.export-bar button{ font-size:12px; padding:8px 12px; color:var(--dim); }
+.export-bar button:hover{ color:var(--text); }
 ${extraCss}`;
 }
 
@@ -314,6 +317,166 @@ function __vsHandleEntry(termApi, entry){
     else if(entry.stream === "stderr") prefix = "\\x1b[38;2;154;160;178m";
     var suffix = prefix ? "\\x1b[0m" : "";
     term.writeln(prefix + entry.text + suffix);
+  }
+}
+
+/** CSP-safe Blob download via a temporary <a download>. */
+function __vsDownloadBlob(blob, filename){
+  if(!blob) return;
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "vibeshare-export";
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function(){
+    try { document.body.removeChild(a); } catch(e){}
+    try { URL.revokeObjectURL(url); } catch(e){}
+  }, 0);
+}
+
+/** Dump term.buffer.active scrollback to a .txt download. */
+function __vsExportText(termApi, filename){
+  if(!termApi || !termApi.term) return;
+  var term = termApi.term;
+  var buf = term.buffer.active;
+  var lines = [];
+  for(var i = 0; i < buf.length; i++){
+    var line = buf.getLine(i);
+    lines.push(line ? line.translateToString(true) : "");
+  }
+  while(lines.length && lines[lines.length - 1] === "") lines.pop();
+  // Join with a real newline char; double-escaped so the outer template stays valid.
+  var text = lines.join("\\n");
+  if(text.length) text += "\\n";
+  __vsDownloadBlob(new Blob([text], { type: "text/plain;charset=utf-8" }), filename || ("vibeshare-" + Date.now() + ".txt"));
+}
+
+/** ANSI-16/256 palette matching the vibeshare xterm theme. */
+function __vsAnsiPalette(n){
+  var base = [
+    "#0d0f14","#ff8b85","#7ee787","#e3b341",
+    "#79c0ff","#c4b5fd","#67e8f9","#edeef3",
+    "#666c7c","#ffb1ac","#a8f0b0","#f0d78c",
+    "#a5d6ff","#d8ccff","#a5f3fc","#ffffff"
+  ];
+  n = n | 0;
+  if(n < 0) n = 0;
+  if(n < 16) return base[n];
+  if(n < 232){
+    n -= 16;
+    var r = Math.floor(n / 36), g = Math.floor((n % 36) / 6), b = n % 6;
+    var c = [0, 95, 135, 175, 215, 255];
+    return "rgb(" + c[r] + "," + c[g] + "," + c[b] + ")";
+  }
+  if(n > 255) n = 255;
+  var v = 8 + (n - 232) * 10;
+  return "rgb(" + v + "," + v + "," + v + ")";
+}
+function __vsRgbCss(n){
+  n = n | 0;
+  return "rgb(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + ")";
+}
+function __vsCellFg(cell){
+  if(cell.isFgDefault()) return "#edeef3";
+  if(cell.isFgRGB && cell.isFgRGB()) return __vsRgbCss(cell.getFgColor());
+  return __vsAnsiPalette(cell.getFgColor());
+}
+function __vsCellBg(cell){
+  if(cell.isBgDefault()) return "#0d0f14";
+  if(cell.isBgRGB && cell.isBgRGB()) return __vsRgbCss(cell.getBgColor());
+  return __vsAnsiPalette(cell.getBgColor());
+}
+
+/**
+ * Render the visible xterm viewport to a canvas and download as PNG.
+ * Uses the buffer cell API (DOM renderer has no single canvas snapshot).
+ */
+function __vsExportPng(termApi, filename){
+  if(!termApi || !termApi.term) return;
+  var term = termApi.term;
+  var cols = term.cols | 0;
+  var rows = term.rows | 0;
+  if(cols < 1 || rows < 1) return;
+  var cw = 9, ch = 17;
+  try {
+    var core = term._core;
+    var dims = core && core._renderService && core._renderService.dimensions;
+    if(dims && dims.css && dims.css.cell){
+      if(dims.css.cell.width > 0) cw = dims.css.cell.width;
+      if(dims.css.cell.height > 0) ch = dims.css.cell.height;
+    } else if(term.element){
+      var rowEl = term.element.querySelector(".xterm-rows > div");
+      if(rowEl){
+        var rh = rowEl.getBoundingClientRect().height;
+        if(rh > 0) ch = rh;
+      }
+    }
+  } catch(e){}
+  cw = Math.max(4, Math.round(cw));
+  ch = Math.max(8, Math.round(ch));
+  var canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(cols * cw));
+  canvas.height = Math.max(1, Math.round(rows * ch));
+  var ctx = canvas.getContext("2d");
+  if(!ctx) return;
+  ctx.fillStyle = "#0d0f14";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.font = "13px ui-monospace, SF Mono, Cascadia Code, Menlo, Consolas, monospace";
+  ctx.textBaseline = "top";
+  var buf = term.buffer.active;
+  var start = typeof buf.viewportY === "number" ? buf.viewportY : 0;
+  var cell = null;
+  for(var r = 0; r < rows; r++){
+    var line = buf.getLine(start + r);
+    if(!line) continue;
+    for(var c = 0; c < cols; ){
+      cell = line.getCell(c, cell || undefined);
+      if(!cell){ c++; continue; }
+      var w = cell.getWidth();
+      if(w === 0){ c++; continue; }
+      var widthCells = w > 0 ? w : 1;
+      var fg = __vsCellFg(cell);
+      var bg = __vsCellBg(cell);
+      if(cell.isInverse && cell.isInverse()){
+        var tmp = fg; fg = bg; bg = tmp;
+      }
+      var x = Math.round(c * cw);
+      var y = Math.round(r * ch);
+      var cellW = Math.round(widthCells * cw);
+      if(!cell.isInvisible || !cell.isInvisible()){
+        ctx.fillStyle = bg;
+        ctx.fillRect(x, y, cellW, ch);
+        var chs = cell.getChars();
+        if(chs){
+          var bold = cell.isBold && cell.isBold();
+          ctx.font = (bold ? "bold " : "") + "13px ui-monospace, SF Mono, Cascadia Code, Menlo, Consolas, monospace";
+          ctx.fillStyle = fg;
+          ctx.fillText(chs, x, y + Math.max(0, (ch - 13) / 2));
+          if(cell.isUnderline && cell.isUnderline()){
+            ctx.fillRect(x, y + ch - 2, cellW, 1);
+          }
+        }
+      }
+      c += widthCells;
+    }
+  }
+  var name = filename || ("vibeshare-" + Date.now() + ".png");
+  if(canvas.toBlob){
+    canvas.toBlob(function(blob){
+      if(blob) __vsDownloadBlob(blob, name);
+    }, "image/png");
+  } else {
+    try {
+      var dataUrl = canvas.toDataURL("image/png");
+      var a = document.createElement("a");
+      a.href = dataUrl;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){ try { document.body.removeChild(a); } catch(e){} }, 0);
+    } catch(e){}
   }
 }
 `;
