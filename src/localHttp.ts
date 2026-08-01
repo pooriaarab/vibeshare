@@ -6,14 +6,16 @@
  *   POST /s/:id/join         become a viewer (passphrase checked here)
  *   GET  /s/:id/stream       SSE: replay + live feed, per-viewer events
  *   POST /s/:id/request-join spectator → pending collaborator (invite shares)
+ *   POST /s/:id/input        collaborator keystrokes (gated on canWrite)
  *   POST /s/:id/leave        viewer leaves
  *
  * Host-only control (loopback + bearer host token — never exposed to viewers):
  *   GET  /control/shares · /control/viewers?share=<id>
  *   POST /control/approve · /control/deny · /control/kick · /control/stop
  *
- * There is deliberately NO route that writes to a feed. Read-only is enforced
- * by construction, not by the UI: the only publisher is the host process.
+ * Session OUTPUT is host-only (the feed publisher). Session INPUT from a
+ * viewer is accepted only when ViewerRegistry.canWrite(viewerId) is true —
+ * identity is taken from the viewer token, never the payload.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { networkInterfaces } from 'node:os';
@@ -69,6 +71,16 @@ export interface LocalHttpTransportOptions {
    * terminal. Identity is stamped from the viewer token — never the payload.
    */
   readonly onChat?: (shareId: string, frame: { viewerId: string; name: string; text: string }) => void;
+  /**
+   * Gated collaborator input. Called only after the viewer token resolves and
+   * `viewers.canWrite(viewerId)` is true. Identity is never taken from the body.
+   */
+  readonly onInput?: (shareId: string, viewerId: string, data: string) => void;
+  /**
+   * Fired when a viewer requests to join (invite shares). Host CLI prints a
+   * one-line approve hint. Identity from the registry row.
+   */
+  readonly onJoinRequest?: (shareId: string, viewer: Viewer) => void;
 }
 
 interface ShareContext {
@@ -93,6 +105,8 @@ export class LocalHttpTransport implements ShareTransport {
   readonly #onChat:
     | ((shareId: string, frame: { viewerId: string; name: string; text: string }) => void)
     | undefined;
+  readonly #onInput: ((shareId: string, viewerId: string, data: string) => void) | undefined;
+  readonly #onJoinRequest: ((shareId: string, viewer: Viewer) => void) | undefined;
   readonly #shares = new Map<string, ShareContext>();
   readonly #gone = new Set<string>();
   readonly #sockets = new Set<import('node:net').Socket>();
@@ -107,6 +121,8 @@ export class LocalHttpTransport implements ShareTransport {
     this.#onStop = opts.onStopRequested;
     this.#e2eKey = opts.e2e?.key;
     this.#onChat = opts.onChat;
+    this.#onInput = opts.onInput;
+    this.#onJoinRequest = opts.onJoinRequest;
   }
 
   /** True when this transport encrypts SSE payloads end-to-end. */
@@ -195,8 +211,12 @@ export class LocalHttpTransport implements ShareTransport {
       this.#closeViewerStreams(ctx, v, 'kicked');
       broadcastPresence();
     });
+    ctx.viewers.on('request', (v) => {
+      this.#onJoinRequest?.(ctx.share.id, v);
+      broadcastPresence();
+    });
     ctx.viewers.on('approve', (v) => {
-      this.#sendToViewer(ctx, v, 'join-approved', {});
+      this.#sendToViewer(ctx, v, 'join-approved', { role: v.role });
       broadcastPresence();
     });
     ctx.viewers.on('deny', (v) => this.#sendToViewer(ctx, v, 'join-denied', {}));
@@ -214,7 +234,7 @@ export class LocalHttpTransport implements ShareTransport {
       return;
     }
 
-    const m = /^\/s\/([A-Za-z0-9_-]+)(?:\/(meta|stream|join|request-join|leave|chat))?\/?$/.exec(path);
+    const m = /^\/s\/([A-Za-z0-9_-]+)(?:\/(meta|stream|join|request-join|input|leave|chat))?\/?$/.exec(path);
     if (!m) {
       sendJson(res, 404, { error: 'not found' });
       return;
@@ -282,6 +302,25 @@ export class LocalHttpTransport implements ShareTransport {
         if (!viewer) return void sendJson(res, 401, { error: 'unknown viewer token' });
         ctx.viewers.requestJoin(viewer.id);
         sendJson(res, 202, { status: 'pending' });
+        return;
+      }
+      case 'input': {
+        // Identity from the viewer TOKEN — never from the body. canWrite is
+        // the single gate; spectate shares and unapproved invitees get 403.
+        if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
+        if (ctx.share.state !== 'live') throw new ShareError('not-live', 'share has ended');
+        const body = await readJsonBody(req);
+        const viewer = ctx.viewers.getByToken(typeof body['token'] === 'string' ? body['token'] : '');
+        if (!viewer) return void sendJson(res, 401, { error: 'unknown viewer token' });
+        if (!ctx.viewers.canWrite(viewer.id)) {
+          throw new ShareError('not-promoted', 'not approved to drive this session');
+        }
+        const data = typeof body['data'] === 'string' ? body['data'] : '';
+        if (data.length === 0) return void sendJson(res, 400, { error: 'empty input' });
+        // Cap a single frame so a runaway client can't flood the PTY.
+        const capped = data.length > 4096 ? data.slice(0, 4096) : data;
+        this.#onInput?.(ctx.share.id, viewer.id, capped);
+        sendJson(res, 202, { ok: true });
         return;
       }
       case 'leave': {
@@ -420,7 +459,7 @@ export class LocalHttpTransport implements ShareTransport {
       const status =
         err.code === 'not-found' ? 404
         : err.code === 'not-live' ? 410
-        : err.code === 'passphrase-required' || err.code === 'passphrase-invalid' || err.code === 'invite-disabled' ? 403
+        : err.code === 'passphrase-required' || err.code === 'passphrase-invalid' || err.code === 'invite-disabled' || err.code === 'not-promoted' ? 403
         : err.code === 'already-pending' || err.code === 'not-pending' ? 409
         : 400;
       sendJson(res, status, { error: err.message, code: err.code });
