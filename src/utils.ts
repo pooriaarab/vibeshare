@@ -7,7 +7,14 @@ import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 /** A 12-char base64url id (72 bits of entropy) — unguessable, URL-safe. */
 export function newShareId(): string {
-  return randomBytes(9).toString('base64url');
+  // base64url can begin with '-' or '_'; a leading '-' makes the id parse as a
+  // CLI flag (`vibeshare attach -abc…`) and trips some URL/arg handling. Reroll
+  // until the first char is alphanumeric — still 72 bits, still URL-safe.
+  let id: string;
+  do {
+    id = randomBytes(9).toString('base64url');
+  } while (/^[-_]/.test(id));
+  return id;
 }
 
 /** A random hex token (viewer bearer tokens, host control token). */

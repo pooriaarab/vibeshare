@@ -393,7 +393,7 @@ ${XTERM_BOOT_JS}
     var text = cmdInput.value;
     if(!text) return;
     cmdInput.value = "";
-    postInput(text + "\r");
+    postInput(text + "\\r");
   }
   sendBtn.addEventListener("click", sendInputLine);
   cmdInput.addEventListener("keydown", function(ev){
