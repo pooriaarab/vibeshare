@@ -14,12 +14,13 @@
  *     wire format `nonce(12) ‖ ciphertext ‖ tag(16)`,
  *   - collaborator input carries a per-peer monotonic `seq` INSIDE the
  *     encrypted payload (the host drops replays; see `transport.ts`),
- *   - presence + chat ride the Worker multi-party hub (NOT the DataChannel):
- *     chat TEXT is e2e-encrypted with the share key so the Worker relays
- *     ciphertext only; sender identity is stamped by the Worker from the
- *     connection (never trusted from the payload). Display text is sanitized
- *     client-side against terminal/bidi injection (mirrors vibe-core
- *     sanitizePeerText).
+ *   - presence + chat + annotations ride the Worker multi-party hub (NOT the
+ *     DataChannel): chat/annotation TEXT is e2e-encrypted with the share key
+ *     so the Worker relays ciphertext only; sender identity is stamped by the
+ *     Worker from the connection (never trusted from the payload). Display
+ *     text is sanitized client-side against terminal/bidi injection (mirrors
+ *     vibe-core sanitizePeerText). Annotations are pinned comments anchored
+ *     to the feed seq the viewer is watching, threaded via replyTo.
  *
  * Terminal rendering uses the same inlined xterm.js bootstrap as the local
  * spectator page so raw PTY bytes reconstruct the real TUI on both transports.
@@ -80,6 +81,8 @@ export function viewerPage(): string {
     <button type="button" id="exportTextBtn" title="Download the full terminal scrollback as plain text">Export text</button>
   </div>
 
+  <button class="pin-btn hidden" id="pinBtn" title="pin a comment at the feed position you are watching">📌 pin a comment here</button>
+
   <button class="join-btn hidden" id="reqBtn">Request to drive</button>
 
   <div class="input-row">
@@ -93,6 +96,16 @@ export function viewerPage(): string {
     <form class="chat-form" id="chatForm">
       <input id="chatInput" placeholder="message the room…" maxlength="500" disabled autocomplete="off">
       <button id="chatSend" type="submit" disabled>Send</button>
+    </form>
+  </div>
+
+  <div class="chat ann" id="annBox">
+    <div class="chat-head">Annotations · pinned to the feed · e2e encrypted</div>
+    <div class="chat-log" id="annLog"><div class="chat-empty">No pins yet — pin a comment to the moment you are watching.</div></div>
+    <div class="ann-replying hidden" id="annReplying"><span id="annReplyingText"></span><button type="button" id="annReplyCancel">✕</button></div>
+    <form class="chat-form" id="annForm">
+      <input id="annInput" placeholder="pin a comment at the current moment…" maxlength="500" disabled autocomplete="off">
+      <button id="annSend" type="submit" disabled>Pin</button>
     </form>
   </div>
 </div>
@@ -141,6 +154,20 @@ ${XTERM_BOOT_JS}
   var myName = "";
   var joined = false;
   var chatEmpty = true;
+  var annLog = document.getElementById("annLog");
+  var annInput = document.getElementById("annInput");
+  var annSend = document.getElementById("annSend");
+  var annForm = document.getElementById("annForm");
+  var annReplying = document.getElementById("annReplying");
+  var annReplyingText = document.getElementById("annReplyingText");
+  var pinBtn = document.getElementById("pinBtn");
+  var anns = [];
+  var annById = {};
+  var annReplyTo = null;
+  var annLocal = 0;
+  // Best-effort seq → xterm buffer line map so a pin can "jump" to its moment.
+  var seqLines = {};
+  var seqLineQueue = [];
 
   function setBadge(cls, text){ badge.className = "badge" + (cls ? " " + cls : ""); badge.innerHTML = '<span class="d"></span> ' + text; }
   function fatal(msg){
@@ -171,8 +198,22 @@ ${XTERM_BOOT_JS}
     if(typeof entry.seq === "number"){
       if(entry.seq <= lastEntrySeq) return;
       lastEntrySeq = entry.seq;
+      // termApi may not exist on the very first entry — noteSeqLine guards.
+      noteSeqLine(entry.seq);
     }
     __vsHandleEntry(ensureTerm(), entry);
+  }
+
+  function noteSeqLine(seq){
+    try {
+      if(!termApi || !termApi.term || !termApi.term.buffer) return;
+      seqLines[seq] = termApi.term.buffer.active.length;
+      seqLineQueue.push(seq);
+      if(seqLineQueue.length > 4000){
+        var old = seqLineQueue.shift();
+        delete seqLines[old];
+      }
+    } catch(err){}
   }
 
   // ---- share id from the path, key from the fragment (never sent anywhere)
@@ -283,7 +324,120 @@ ${XTERM_BOOT_JS}
   function enableChat(){
     chatInput.disabled = false;
     chatSend.disabled = false;
+    annInput.disabled = false;
+    annSend.disabled = false;
   }
+
+  // ---- annotations: pinned comments anchored to a feed seq (threaded).
+  // Same hub + e2e rules as chat; the Worker stamps identity, mints the id.
+  function onAnnotation(frame){
+    if(!frame || !key || typeof frame.text !== "string") return;
+    var bytes;
+    try { bytes = b64ToBytes(frame.text); } catch(e){ return; }
+    if(bytes.length < 12 + 16) return;
+    var nonce = bytes.slice(0, 12);
+    var ct = bytes.slice(12);
+    crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ct).then(function(plain){
+      var text = sanitizePeerText(new TextDecoder().decode(plain), 500);
+      if(text.length > 0) addAnn(frame, text, !!(myViewerId && frame.viewerId === myViewerId));
+    }).catch(function(){ /* GCM auth failure — drop */ });
+  }
+
+  function addAnn(d, text, mine){
+    var clean = sanitizePeerText(text, 500);
+    if(!clean || !clean.trim()) return;
+    var id = (typeof d.id === "string" && d.id) ? d.id : ("local-" + (++annLocal));
+    if(annById[id]) return;
+    var a = {
+      id: id,
+      seq: (typeof d.seq === "number" && isFinite(d.seq)) ? Math.max(0, Math.floor(d.seq)) : 0,
+      name: sanitizePeerText(d.name || "viewer", 32).trim() || "viewer",
+      text: clean,
+      replyTo: (typeof d.replyTo === "string" && d.replyTo) ? d.replyTo : null,
+      ts: (typeof d.ts === "number") ? d.ts : Date.now(),
+      mine: !!mine
+    };
+    annById[id] = a;
+    anns.push(a);
+    if(anns.length > 500){
+      var dropped = anns.shift();
+      if(dropped) delete annById[dropped.id];
+    }
+    renderAnns();
+  }
+
+  function renderAnns(){
+    annLog.innerHTML = "";
+    var roots = [], repliesByParent = {}, i, a;
+    for(i = 0; i < anns.length; i++){
+      a = anns[i];
+      if(a.replyTo && annById[a.replyTo]){
+        (repliesByParent[a.replyTo] = repliesByParent[a.replyTo] || []).push(a);
+      } else {
+        roots.push(a);
+      }
+    }
+    roots.sort(function(x, y){ return (x.seq - y.seq) || (x.ts - y.ts); });
+    for(i = 0; i < roots.length; i++){
+      appendAnnLine(roots[i], 0);
+      var reps = repliesByParent[roots[i].id] || [];
+      reps.sort(function(x, y){ return x.ts - y.ts; });
+      for(var j = 0; j < reps.length; j++) appendAnnLine(reps[j], 1);
+    }
+    annLog.scrollTop = annLog.scrollHeight;
+  }
+
+  function appendAnnLine(a, depth){
+    var line = document.createElement("div");
+    line.className = "chat-line ann-line" + (a.mine ? " mine" : "") + (depth ? " reply" : "");
+    var html = '<span class="seq">@' + a.seq + "</span> " +
+      '<span class="who">' + escapeHtml(a.name) + "</span>: " +
+      '<span class="msg">' + escapeHtml(a.text) + "</span>" +
+      '<span class="ops">';
+    if(typeof seqLines[a.seq] === "number"){
+      html += '<a data-jump="' + a.seq + '">jump</a>';
+    }
+    html += '<a data-reply="' + a.id + '">reply</a></span>';
+    line.innerHTML = html;
+    annLog.appendChild(line);
+  }
+
+  annLog.addEventListener("click", function(ev){
+    var t = ev.target;
+    if(!t || !t.getAttribute) return;
+    var jump = t.getAttribute("data-jump");
+    if(jump !== null && jump !== undefined){
+      ev.preventDefault();
+      var lineNo = seqLines[Number(jump)];
+      if(termApi && typeof lineNo === "number"){
+        try { termApi.term.scrollToLine(Math.max(0, lineNo - 1)); } catch(e){}
+      }
+      return;
+    }
+    var rep = t.getAttribute("data-reply");
+    if(rep){
+      ev.preventDefault();
+      setAnnReply(rep);
+    }
+  });
+
+  function setAnnReply(id){
+    annReplyTo = id || null;
+    if(annReplyTo && annById[annReplyTo]){
+      annReplyingText.textContent = "replying to " + annById[annReplyTo].name + " @" + annById[annReplyTo].seq;
+      annReplying.classList.remove("hidden");
+      annInput.focus();
+    } else {
+      annReplyTo = null;
+      annReplying.classList.add("hidden");
+    }
+  }
+  document.getElementById("annReplyCancel").addEventListener("click", function(){ setAnnReply(null); });
+
+  pinBtn.addEventListener("click", function(){
+    annInput.placeholder = "pin a comment at seq " + lastEntrySeq + "…";
+    annInput.focus();
+  });
 
   ws.onmessage = function(ev){
     var msg;
@@ -300,6 +454,8 @@ ${XTERM_BOOT_JS}
       renderPresence(msg.viewers);
     } else if(msg.kind === "chat"){
       appendChat(msg);
+    } else if(msg.kind === "annotation"){
+      onAnnotation(msg);
     } else if(msg.kind === "role-update"){
       onRoleUpdate(msg);
     }
@@ -325,6 +481,7 @@ ${XTERM_BOOT_JS}
     if(myViewerId) startPeer();
     enableChat();
     reqBtn.classList.remove("hidden");
+    pinBtn.classList.remove("hidden");
     setBadge("", "CONNECTING · waiting for host");
   });
 
@@ -490,6 +647,28 @@ ${XTERM_BOOT_JS}
     });
   });
 
+  // ---- annotations: pin a comment at the feed head (seq anchor), encrypted
+  // like chat; the Worker stamps identity and mints the annotation id.
+  annForm.addEventListener("submit", function(ev){
+    ev.preventDefault();
+    var text = sanitizePeerText(annInput.value || "", 500).trim();
+    if(!text || !key || ws.readyState !== 1) return;
+    annInput.value = "";
+    var frame = { kind: "annotation", seq: lastEntrySeq, text: "" };
+    if(annReplyTo) frame.replyTo = annReplyTo;
+    setAnnReply(null);
+    var payload = new TextEncoder().encode(text);
+    var nonce = crypto.getRandomValues(new Uint8Array(12));
+    crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, payload).then(function(ct){
+      var out = new Uint8Array(12 + ct.byteLength);
+      out.set(nonce, 0);
+      out.set(new Uint8Array(ct), 12);
+      // Send ONLY ciphertext + seq + replyTo — never claim identity.
+      frame.text = bytesToB64(out);
+      send(frame);
+    });
+  });
+
   function ended(state, msg){
     setBadge("ended", state);
     canDrive = false;
@@ -498,6 +677,8 @@ ${XTERM_BOOT_JS}
     sendBtn.disabled = true;
     chatInput.disabled = true;
     chatSend.disabled = true;
+    annInput.disabled = true;
+    annSend.disabled = true;
     reqBtn.disabled = true;
     applyEntry({ type: "system", text: msg });
   }

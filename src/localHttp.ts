@@ -19,8 +19,16 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { networkInterfaces } from 'node:os';
-import { timingSafeEqual } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { encryptFrame, sanitizePeerText } from '@pooriaarab/vibe-core';
+import {
+  MAX_ANNOTATION_PLAINTEXT_LEN,
+  normalizeReplyTo,
+  parseAnchorSeq,
+  stampAnnotation,
+  type AnnotationRelayFrame,
+} from './annotations.js';
+import { decryptAnnotationText } from './annotationsCrypto.js';
 import type { SessionFeed } from './feed.js';
 import {
   MAX_CHAT_PLAINTEXT_LEN,
@@ -72,6 +80,15 @@ export interface LocalHttpTransportOptions {
    */
   readonly onChat?: (shareId: string, frame: { viewerId: string; name: string; text: string }) => void;
   /**
+   * Incoming annotations (already decrypted when e2e is on) for the host
+   * terminal. Identity is stamped from the viewer token — never the payload;
+   * `seq` is the feed anchor the viewer pinned.
+   */
+  readonly onAnnotation?: (
+    shareId: string,
+    frame: { viewerId: string; name: string; seq: number; text: string; replyTo?: string },
+  ) => void;
+  /**
    * Gated collaborator input. Called only after the viewer token resolves and
    * `viewers.canWrite(viewerId)` is true. Identity is never taken from the body.
    */
@@ -105,6 +122,9 @@ export class LocalHttpTransport implements ShareTransport {
   readonly #onChat:
     | ((shareId: string, frame: { viewerId: string; name: string; text: string }) => void)
     | undefined;
+  readonly #onAnnotation:
+    | ((shareId: string, frame: { viewerId: string; name: string; seq: number; text: string; replyTo?: string }) => void)
+    | undefined;
   readonly #onInput: ((shareId: string, viewerId: string, data: string) => void) | undefined;
   readonly #onJoinRequest: ((shareId: string, viewer: Viewer) => void) | undefined;
   readonly #shares = new Map<string, ShareContext>();
@@ -121,6 +141,7 @@ export class LocalHttpTransport implements ShareTransport {
     this.#onStop = opts.onStopRequested;
     this.#e2eKey = opts.e2e?.key;
     this.#onChat = opts.onChat;
+    this.#onAnnotation = opts.onAnnotation;
     this.#onInput = opts.onInput;
     this.#onJoinRequest = opts.onJoinRequest;
   }
@@ -234,7 +255,7 @@ export class LocalHttpTransport implements ShareTransport {
       return;
     }
 
-    const m = /^\/s\/([A-Za-z0-9_-]+)(?:\/(meta|stream|join|request-join|input|leave|chat))?\/?$/.exec(path);
+    const m = /^\/s\/([A-Za-z0-9_-]+)(?:\/(meta|stream|join|request-join|input|leave|chat|annotate))?\/?$/.exec(path);
     if (!m) {
       sendJson(res, 404, { error: 'not found' });
       return;
@@ -378,6 +399,65 @@ export class LocalHttpTransport implements ShareTransport {
             viewerId: viewer.id,
             name: sanitizePresenceName(viewer.name) || viewer.name,
             text: displayText,
+          });
+        }
+        sendJson(res, 202, { ok: true });
+        return;
+      }
+      case 'annotate': {
+        // A pinned comment anchored to a feed seq. Identity from the viewer
+        // TOKEN — never from the payload; id minted here; only seq (anchor)
+        // and replyTo (threading) pass through from the body.
+        if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
+        if (ctx.share.state !== 'live') throw new ShareError('not-live', 'share has ended');
+        const body = await readJsonBody(req);
+        const viewer = ctx.viewers.getByToken(typeof body['token'] === 'string' ? body['token'] : '');
+        if (!viewer) return void sendJson(res, 401, { error: 'unknown viewer token' });
+        const seq = parseAnchorSeq(body['seq']);
+        if (seq === null) throw new ShareError('bad-request', 'invalid annotation anchor');
+        const replyTo = normalizeReplyTo(body['replyTo']);
+        const wireText = typeof body['text'] === 'string' ? body['text'] : '';
+        let frame: AnnotationRelayFrame;
+        let displayText: string;
+        if (this.#e2eKey) {
+          // Tunnel path: client sent ciphertext; relay it opaque, decrypt only
+          // for the host terminal callback.
+          const stamped = stampAnnotation({
+            id: randomUUID(),
+            viewerId: viewer.id,
+            name: viewer.name,
+            role: 'viewer',
+            seq,
+            text: wireText,
+            ...(replyTo !== undefined ? { replyTo } : {}),
+          });
+          if (!stamped) throw new ShareError('bad-request', 'invalid annotation payload');
+          frame = stamped;
+          displayText = decryptAnnotationText(this.#e2eKey, stamped.text) ?? '';
+        } else {
+          // Local plaintext path: sanitize and stamp; no share key on the URL.
+          displayText = sanitizePeerText(wireText, MAX_ANNOTATION_PLAINTEXT_LEN).trim();
+          if (displayText.length === 0) throw new ShareError('bad-request', 'empty annotation');
+          frame = {
+            kind: 'annotation',
+            id: randomUUID(),
+            seq,
+            viewerId: viewer.id,
+            name: sanitizePresenceName(viewer.name) || viewer.name,
+            role: 'viewer',
+            text: displayText,
+            ...(replyTo !== undefined ? { replyTo } : {}),
+            ts: Date.now(),
+          };
+        }
+        this.#broadcastAnnotation(ctx, frame);
+        if (displayText.length > 0) {
+          this.#onAnnotation?.(ctx.share.id, {
+            viewerId: viewer.id,
+            name: sanitizePresenceName(viewer.name) || viewer.name,
+            seq,
+            text: displayText,
+            ...(replyTo !== undefined ? { replyTo } : {}),
           });
         }
         sendJson(res, 202, { ok: true });
@@ -542,6 +622,12 @@ export class LocalHttpTransport implements ShareTransport {
   #broadcastChat(ctx: ShareContext, frame: ChatRelayFrame): void {
     for (const set of ctx.streams.values()) {
       for (const res of set) this.#sse(res, 'chat', frame);
+    }
+  }
+
+  #broadcastAnnotation(ctx: ShareContext, frame: AnnotationRelayFrame): void {
+    for (const set of ctx.streams.values()) {
+      for (const res of set) this.#sse(res, 'annotation', frame);
     }
   }
 
