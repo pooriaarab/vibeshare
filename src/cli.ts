@@ -36,6 +36,7 @@ import {
   type TmuxClient,
 } from './attach.js';
 import { decryptChatText } from './presenceChatCrypto.js';
+import { decryptAnnotationText } from './annotationsCrypto.js';
 import {
   clearActiveShare,
   listActiveShares,
@@ -434,6 +435,14 @@ async function mintShareRuntime(
     io.err(`\r\x1b[2m[chat] ${who}: ${msg}\x1b[0m`);
   };
 
+  /** Print incoming annotations (pinned feedback) with their feed-seq anchor. */
+  const printAnnotation = (name: string, seq: number, text: string): void => {
+    const who = sanitizePeerText(name, 32).trim() || 'viewer';
+    const msg = sanitizePeerText(text, 500);
+    if (!msg) return;
+    io.err(`\r\x1b[2m[annotation @${seq}] ${who}: ${msg}\x1b[0m`);
+  };
+
   let publicSignaling: WsSignaling | null = null;
   // Filled after createShare for --public (key lives in the URL #fragment).
   let publicShareKey: Buffer | null = null;
@@ -480,6 +489,13 @@ async function mintShareRuntime(
         const plain = decryptChatText(key, frame.text);
         if (plain) printChat(frame.name, plain);
       },
+      onAnnotation: (frame) => {
+        // Same e2e rule as chat: ciphertext until the share key is known.
+        const key = publicShareKey;
+        if (!key) return;
+        const plain = decryptAnnotationText(key, frame.text);
+        if (plain) printAnnotation(frame.name, frame.seq, plain);
+      },
       onJoinRequest: (frame) => {
         if (!created) return;
         // Spectate shares reject at the registry; invite shares go pending.
@@ -515,6 +531,7 @@ async function mintShareRuntime(
       port: options.port,
       e2e: { key: e2eKey },
       onChat: (_shareId, frame) => printChat(frame.name, frame.text),
+      onAnnotation: (_shareId, frame) => printAnnotation(frame.name, frame.seq, frame.text),
       onInput: (_shareId, _viewerId, data) => applyInput(data),
       onJoinRequest: printJoinRequest,
       onStopRequested: () => {
@@ -527,6 +544,7 @@ async function mintShareRuntime(
       host: options.host,
       port: options.port,
       onChat: (_shareId, frame) => printChat(frame.name, frame.text),
+      onAnnotation: (_shareId, frame) => printAnnotation(frame.name, frame.seq, frame.text),
       onInput: (_shareId, _viewerId, data) => applyInput(data),
       onJoinRequest: printJoinRequest,
       onStopRequested: () => {
