@@ -106,6 +106,15 @@ button:disabled{ opacity:.6; cursor:default; }
   padding-bottom:max(10px, env(safe-area-inset-bottom, 0px)); }
 .chat-form input{ flex:1; min-width:0; font-size:16px; }
 .chat-form button{ flex-shrink:0; min-height:var(--touch); }
+.pin-btn{ margin-top:10px; align-self:flex-start; font-family:var(--mono); font-size:12px; padding:7px 12px; }
+.ann{ max-height:260px; }
+.ann-line .seq{ color:var(--violet); font-weight:600; font-size:11px; }
+.ann-line.reply{ margin-left:14px; border-left:2px solid var(--border-2); padding-left:8px; }
+.ann-line .ops a{ color:var(--faint); font-size:11px; text-decoration:none; margin-left:8px; cursor:pointer; }
+.ann-line .ops a:hover{ color:var(--cyan); }
+.ann-replying{ display:flex; justify-content:space-between; align-items:center; gap:8px;
+  padding:6px 12px; font-size:11.5px; color:var(--dim); border-top:1px solid var(--border); }
+.ann-replying button{ padding:2px 8px; font-size:11px; }
 
 /* Tablet */
 @media (max-width: 900px){
