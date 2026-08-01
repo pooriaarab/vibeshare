@@ -413,7 +413,7 @@ ${XTERM_BOOT_JS}
     if(!text) return;
     cmdInput.value = "";
     // Append CR so Enter submits in shells/TUIs the way a real terminal does.
-    sendInputBytes(text + "\r");
+    sendInputBytes(text + "\\r");
   }
   sendBtn.addEventListener("click", sendInputLine);
   cmdInput.addEventListener("keydown", function(ev){
