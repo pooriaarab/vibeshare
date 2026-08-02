@@ -42,7 +42,10 @@ export function viewerPage(): string {
 <div class="app">
   <header class="topbar">
     <div class="brand">vibeshare<span id="shareLabel"></span></div>
-    <div class="p2p"><b>●</b> p2p · end-to-end encrypted</div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <a id="gridLink" class="hidden" href="/vibeshare/grid" title="Open this share in the multi-view grid" style="font-family:var(--mono);font-size:12px;color:var(--cyan);text-decoration:none;border:1px solid var(--border-2);border-radius:999px;padding:6px 12px;background:var(--panel)">⊞ grid</a>
+      <div class="p2p"><b>●</b> p2p · end-to-end encrypted</div>
+    </div>
   </header>
 
   <div class="panel" id="namePanel">
@@ -225,6 +228,14 @@ ${XTERM_BOOT_JS}
 
   var keyB64 = location.hash.slice(1);
   if(!keyB64){ fatal("This link is incomplete — the decryption key lives in the #fragment of the URL. Ask the host for the full link."); return; }
+
+  // Build-a-grid entry: open the multi-view page with this share prefilled.
+  // shareId + key are already URL-safe base64url — keep the fragment form raw.
+  var gridLink = document.getElementById("gridLink");
+  if(gridLink){
+    gridLink.href = "/vibeshare/grid#" + shareId + "~" + keyB64;
+    gridLink.classList.remove("hidden");
+  }
 
   function b64urlToBytes(s){
     var b64 = s.replace(/-/g, "+").replace(/_/g, "/");

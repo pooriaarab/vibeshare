@@ -35,6 +35,7 @@
  * Protocol (mirrored by src/webrtc/wsSignaling.ts + src/webrtc/viewerPage.ts):
  *
  *   GET /vibeshare/s/<id>                          → the viewer page (HTML)
+ *   GET /vibeshare/grid                            → multi-view grid page (HTML)
  *   GET /vibeshare/ws/host?share=<id>&secret=<s>   → host socket
  *   GET /vibeshare/ws/viewer?share=<id>            → viewer socket
  *   GET /vibeshare/health                          → liveness
@@ -47,6 +48,7 @@ import {
   sanitizePresenceName,
   stampChatRelay,
 } from '../../src/presenceChat.js';
+import { gridPage } from '../../src/webrtc/gridPage.js';
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
 import {
   MAX_VIEWERS,
@@ -83,6 +85,10 @@ export default {
 
     if (url.pathname === '/vibeshare/health') {
       return new Response('ok', { headers: { 'content-type': 'text/plain' } });
+    }
+
+    if (request.method === 'GET' && (url.pathname === '/vibeshare/grid' || url.pathname === '/vibeshare/grid/')) {
+      return new Response(gridPage(), { headers: PAGE_HEADERS });
     }
 
     if (request.method === 'GET' && SHARE_ID_RE.test(pageShareId(url.pathname) ?? '')) {
