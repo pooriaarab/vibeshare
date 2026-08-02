@@ -7,7 +7,7 @@
  * disconnects viewers and the URL goes 410) — not just a filter on reads.
  */
 import type { ConsentLedger } from '@pooriaarab/vibe-core';
-import { SessionFeed } from './feed.js';
+import { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import { ViewerRegistry } from './registry.js';
 import type { ShareTransport } from './transport.js';
 import {

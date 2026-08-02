@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PeerConnection, cleanup as rtcCleanup, type DataChannel } from 'node-datachannel';
-import { SessionFeed } from '../src/feed.js';
+import { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import { ViewerRegistry } from '../src/registry.js';
 import type { Share } from '../src/types.js';
 import { newShareId } from '../src/utils.js';
