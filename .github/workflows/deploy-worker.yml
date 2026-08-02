@@ -27,6 +27,13 @@ jobs:
         if: steps.gate.outputs.have == 'true'
         with:
           node-version: '22'
+      # The Worker's entry (worker/src/index.ts) bundles repo-root src/*.ts
+      # (viewerPage, annotations, presenceChat, xtermClient), which import
+      # @pooriaarab/vibe-core — esbuild resolves that from ROOT node_modules,
+      # so root deps must be installed, not just the worker's.
+      - name: Install root deps
+        if: steps.gate.outputs.have == 'true'
+        run: npm install --legacy-peer-deps
       - name: Install worker deps
         if: steps.gate.outputs.have == 'true'
         # --legacy-peer-deps: wrangler's peerOptional @cloudflare/workers-types@^4
