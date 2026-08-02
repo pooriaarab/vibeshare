@@ -18,7 +18,7 @@
  * from the payload — neither is identity. `text` is e2e ciphertext with the
  * share key on encrypted paths; the hub relays it opaque.
  */
-import { sanitizePeerText } from '@pooriaarab/vibe-core';
+import { sanitizePeerText } from '@pooriaarab/vibe-core/untrusted';
 import {
   defaultPresenceName,
   sanitizePresenceName,
