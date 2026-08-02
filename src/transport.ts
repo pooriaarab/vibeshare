@@ -22,7 +22,7 @@
  * transport that accepts remote input MUST route it through
  * `ViewerRegistry.canWrite()` before applying anything to the session.
  */
-import type { SessionFeed } from './feed.js';
+import type { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import type { ViewerRegistry } from './registry.js';
 import type { Share } from './types.js';
 

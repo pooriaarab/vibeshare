@@ -47,38 +47,8 @@ export interface Viewer {
   joinRequest: JoinRequestStatus;
 }
 
-/**
- * One entry in the shared session's ordered log.
- *
- * Session output is raw PTY bytes (base64) so a terminal emulator can
- * reconstruct the real TUI (colors, cursor, full-screen redraws). Ordered
- * `seq` + backlog replay let late joiners rebuild state by replaying bytes.
- * Structured `milestone` / `system` lines stay text for chrome/status.
- */
-export type FeedEntry =
-  | {
-      /** Monotonic sequence number — also the SSE event id. */
-      readonly seq: number;
-      readonly ts: number;
-      readonly type: 'raw';
-      /** Base64-encoded raw PTY bytes (ANSI/cursor sequences included). */
-      readonly data: string;
-    }
-  | {
-      readonly seq: number;
-      readonly ts: number;
-      readonly type: 'resize';
-      readonly cols: number;
-      readonly rows: number;
-    }
-  | {
-      readonly seq: number;
-      readonly ts: number;
-      readonly type: 'output' | 'milestone' | 'system';
-      /** Which host stream produced an `output` entry (legacy line path). */
-      readonly stream?: 'stdout' | 'stderr';
-      readonly text: string;
-    };
+/** Ordered-log entry — re-exported from vibe-core (single source of truth). */
+export type { FeedEntry } from '@pooriaarab/vibe-core/feed';
 
 /** Options for creating a share (CLI, library, and MCP all funnel here). */
 export interface CreateShareOptions {
