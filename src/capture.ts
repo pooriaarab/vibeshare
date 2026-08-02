@@ -17,7 +17,7 @@
  * (PTY stdin write, or tmux send-keys for attach). The write gate is always
  * `ViewerRegistry.canWrite()` in the transport — never the capture source.
  */
-import type { SessionFeed } from './feed.js';
+import type { SessionFeed } from '@pooriaarab/vibe-core/feed';
 
 /** Minimal feed surface a capture source needs — keeps tests light. */
 export interface CaptureFeed {

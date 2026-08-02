@@ -21,7 +21,7 @@
 import { randomBytes } from 'node:crypto';
 import { PeerConnection, type DataChannel } from 'node-datachannel';
 import { decryptFrame, encryptFrame, E2E_KEY_LEN } from '@pooriaarab/vibe-core';
-import type { SessionFeed } from '../feed.js';
+import type { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import type { ViewerRegistry } from '../registry.js';
 import type { ShareTransport } from '../transport.js';
 import type { FeedEntry, Share, Viewer } from '../types.js';

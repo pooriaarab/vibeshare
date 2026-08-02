@@ -29,7 +29,7 @@ import {
   type AnnotationRelayFrame,
 } from './annotations.js';
 import { decryptAnnotationText } from './annotationsCrypto.js';
-import type { SessionFeed } from './feed.js';
+import type { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import {
   MAX_CHAT_PLAINTEXT_LEN,
   sanitizePresenceName,

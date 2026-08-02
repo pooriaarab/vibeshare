@@ -3,7 +3,7 @@ import type { IncomingMessage } from 'node:http';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PeerConnection, cleanup as rtcCleanup, type DataChannel } from 'node-datachannel';
 import { WebSocketServer, WebSocket as WsClient, type WebSocket as WsSocket } from 'ws';
-import { SessionFeed } from '../src/feed.js';
+import { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import { ViewerRegistry } from '../src/registry.js';
 import type { Share } from '../src/types.js';
 import { newShareId } from '../src/utils.js';

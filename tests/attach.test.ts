@@ -20,7 +20,7 @@ import {
   type TmuxPipe,
 } from '../src/attach.js';
 import type { CaptureFeed } from '../src/capture.js';
-import { SessionFeed } from '../src/feed.js';
+import { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import { parseArgv, runCommand } from '../src/cli.js';
 import { tempHome } from './helpers.js';
 
