@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.gate.outputs.have == 'true'
         with:
-          node-version: '20'
+          node-version: '22'
       - name: Install worker deps
         if: steps.gate.outputs.have == 'true'
         # --legacy-peer-deps: wrangler's peerOptional @cloudflare/workers-types@^4
