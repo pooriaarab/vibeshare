@@ -14,7 +14,7 @@
  * can import the pure helpers (roster / stamp / sanitize). Host-side
  * encrypt/decrypt live in `./presenceChatCrypto.ts`.
  */
-import { sanitizePeerText } from '@pooriaarab/vibe-core';
+import { sanitizePeerText } from '@pooriaarab/vibe-core/untrusted';
 
 /** Cap on a display name stored in an attachment / registry. */
 export const MAX_PRESENCE_NAME_LEN = 32;
