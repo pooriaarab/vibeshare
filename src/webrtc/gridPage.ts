@@ -168,6 +168,7 @@ export function gridPage(): string {
   <div class="grid-tools">
     <input id="addInput" placeholder="paste a share URL (…/s/<id>#<key>) or id~key" autocomplete="off" spellcheck="false">
     <button type="button" id="addBtn" title="Add a session to the grid">＋ add a session</button>
+    <a class="grid-link" href="/vibeshare/canvas" title="Switch to the free-form canvas board" style="margin-left:auto">⬚ canvas</a>
   </div>
   <div class="grid-err" id="addErr" aria-live="polite"></div>
 
