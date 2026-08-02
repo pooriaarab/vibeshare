@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { makeEvent } from '@pooriaarab/vibe-core';
-import { SessionFeed } from '../src/feed.js';
+import { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import { ViewerRegistry } from '../src/registry.js';
 import { ShareError, type ShareAccess } from '../src/types.js';
 

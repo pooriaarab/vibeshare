@@ -44,7 +44,7 @@ export {
   type TunnelSources,
   type VibeShareConfig,
 } from './config.js';
-export { SessionFeed, type PublishOptions } from './feed.js';
+export { SessionFeed, type PublishOptions } from '@pooriaarab/vibe-core/feed';
 export { LocalHttpTransport, type LocalHttpTransportOptions } from './localHttp.js';
 export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, type ShareManagerDeps } from './manager.js';
 export { ViewerRegistry } from './registry.js';
