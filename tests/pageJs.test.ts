@@ -5,6 +5,7 @@ import {
   parseGridFragment,
   parseSharePaste,
 } from '../src/webrtc/gridPage.js';
+import { canvasPage } from '../src/webrtc/canvasPage.js';
 import { viewerPage } from '../src/webrtc/viewerPage.js';
 import { spectatorPage } from '../src/spectatorPage.js';
 import type { Share } from '../src/types.js';
@@ -54,6 +55,7 @@ const ID_C = 'shareIdCcc3';
 describe('inlined viewer-page JS is syntactically valid', () => {
   it('viewerPage (WebRTC) parses', () => expectAllParse(viewerPage()));
   it('gridPage (multi-view) parses', () => expectAllParse(gridPage()));
+  it('canvasPage (canvas) parses', () => expectAllParse(canvasPage()));
   it('spectatorPage (SSE, invite) parses', () => expectAllParse(spectatorPage(share)));
   it('spectatorPage (spectate) parses', () => expectAllParse(spectatorPage({ ...share, access: 'spectate' })));
 });
