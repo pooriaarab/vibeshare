@@ -48,6 +48,7 @@ import {
   sanitizePresenceName,
   stampChatRelay,
 } from '../../src/presenceChat.js';
+import { canvasPage } from '../../src/webrtc/canvasPage.js';
 import { gridPage } from '../../src/webrtc/gridPage.js';
 import { viewerPage } from '../../src/webrtc/viewerPage.js';
 import {
@@ -89,6 +90,10 @@ export default {
 
     if (request.method === 'GET' && (url.pathname === '/vibeshare/grid' || url.pathname === '/vibeshare/grid/')) {
       return new Response(gridPage(), { headers: PAGE_HEADERS });
+    }
+
+    if (request.method === 'GET' && (url.pathname === '/vibeshare/canvas' || url.pathname === '/vibeshare/canvas/')) {
+      return new Response(canvasPage(), { headers: PAGE_HEADERS });
     }
 
     if (request.method === 'GET' && SHARE_ID_RE.test(pageShareId(url.pathname) ?? '')) {

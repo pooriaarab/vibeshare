@@ -1,26 +1,33 @@
 /**
- * Multi-view grid page — spectate several public shares side-by-side.
+ * Multi-view canvas page — spatial alternative to the fixed grid.
  *
- * Served by the signaling Worker at `GET /vibeshare/grid` (see
- * `worker/src/index.ts`). Share ids + AES keys live ONLY in the URL fragment:
+ * Served by the signaling Worker at `GET /vibeshare/canvas` (see
+ * `worker/src/index.ts`). Same live-session cells as the grid, but each cell
+ * is absolutely positioned on a pannable/zoomable board:
  *
- *   /vibeshare/grid#<id1>~<key1>,<id2>~<key2>,…
+ *   /vibeshare/canvas#<id1>~<key1>~<x1>~<y1>,<id2>~<key2>~<x2>~<y2>,…
  *
- * Fragments never reach the Worker. Each cell runs the same WebRTC ANSWER +
- * AES-256-GCM DataChannel path as `viewerPage.ts` (read-only spectate — no
- * drive/chat/annotations in v0). Terminal rendering reuses vibe-core/xterm
- * via the shared `__vs*` bootstrap.
+ * `x`,`y` are integer board coords; pairs without them auto-place. Fragments
+ * never reach the Worker. Each cell reuses the EXACT WebRTC ANSWER +
+ * AES-256-GCM DataChannel path as `gridPage.ts` (read-only spectate — no
+ * drive/chat/annotations in v0). The per-cell `connectShare` below is copied
+ * verbatim from gridPage; only the board container + pan/zoom/drag chrome is
+ * canvas-specific.
  *
  * Self-contained and CSP-safe: inline script/style only, sockets + WebRTC
  * to the page origin, one viewer ws per cell against the existing share room.
  */
 import { XTERM_BOOT_JS, xtermPageStyles, xtermScriptTags } from '../xtermClient.js';
 
-/** One share slot decoded from the grid URL fragment. */
-export interface GridShareRef {
+/** One share slot decoded from the canvas URL fragment (with board position). */
+export interface CanvasShareRef {
   readonly id: string;
   /** base64url AES-256-GCM key (URL fragment form). */
   readonly key: string;
+  /** Integer board x (CSS px on the unscaled board). */
+  readonly x: number;
+  /** Integer board y (CSS px on the unscaled board). */
+  readonly y: number;
 }
 
 const SHARE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
@@ -28,89 +35,76 @@ const SHARE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const KEY_RE = /^[A-Za-z0-9_-]{22,64}$/;
 
 /**
- * Parse a grid URL fragment (`#` optional) into share refs.
- * Invalid pairs are dropped; first occurrence of an id wins.
+ * Parse a canvas URL fragment (`#` optional) into positioned share refs.
+ * Format: `id~key~x~y` pairs joined by `,`. Pairs without x/y auto-place at
+ * (0,0). Invalid pairs (bad id/key, or x/y present but non-numeric) are
+ * dropped; first occurrence of an id wins. Coordinates are parsed as ints
+ * (truncated) — a present-but-NaN coordinate rejects the whole pair.
  */
-export function parseGridFragment(fragment: string): GridShareRef[] {
+export function parseCanvasFragment(fragment: string): CanvasShareRef[] {
   const raw = fragment.startsWith('#') ? fragment.slice(1) : fragment;
   if (!raw) return [];
-  const out: GridShareRef[] = [];
+  const out: CanvasShareRef[] = [];
   const seen = new Set<string>();
   for (const part of raw.split(',')) {
-    const tilde = part.indexOf('~');
-    if (tilde <= 0) continue;
-    const id = part.slice(0, tilde).trim();
-    const key = part.slice(tilde + 1).trim();
+    const segs = part.split('~');
+    const id = (segs[0] ?? '').trim();
+    const key = (segs[1] ?? '').trim();
     if (!SHARE_ID_RE.test(id) || !KEY_RE.test(key)) continue;
     if (seen.has(id)) continue;
+    let x = 0;
+    let y = 0;
+    if (segs.length >= 4) {
+      const px = parseInt((segs[2] ?? '').trim(), 10);
+      const py = parseInt((segs[3] ?? '').trim(), 10);
+      // Reject NaN — a present-but-non-numeric coordinate is malformed.
+      if (Number.isNaN(px) || Number.isNaN(py)) continue;
+      x = px;
+      y = py;
+    }
     seen.add(id);
-    out.push({ id, key });
+    out.push({ id, key, x, y });
   }
   return out;
 }
 
-/** Serialize share refs back to a fragment body (no leading `#`). */
-export function formatGridFragment(shares: readonly GridShareRef[]): string {
-  return shares.map((s) => `${s.id}~${s.key}`).join(',');
+/** Serialize positioned share refs back to a fragment body (no leading `#`). */
+export function formatCanvasFragment(shares: readonly CanvasShareRef[]): string {
+  return shares.map((s) => `${s.id}~${s.key}~${s.x}~${s.y}`).join(',');
 }
 
-/**
- * Pull `{id, key}` from a pasted single-share viewer URL or a bare `id~key`.
- * Accepts `/vibeshare/s/<id>#<key>`, `/s/<id>#<key>`, full origins, or `id~key`.
- */
-export function parseSharePaste(input: string): GridShareRef | null {
-  const text = input.trim();
-  if (!text) return null;
-  // Bare id~key (same as one fragment pair).
-  const bare = parseGridFragment(text);
-  if (bare.length === 1 && !text.includes('/') && !text.includes('#')) {
-    return bare[0] ?? null;
-  }
-  let id: string | null = null;
-  let key = '';
-  try {
-    // Absolute or path-absolute URL.
-    const url = text.includes('://')
-      ? new URL(text)
-      : new URL(text, 'https://getvibe.dev');
-    const m =
-      /\/(?:vibeshare\/)?s\/([A-Za-z0-9_-]+)/.exec(url.pathname) ??
-      /\/s\/([A-Za-z0-9_-]+)/.exec(url.pathname);
-    if (m) id = m[1] ?? null;
-    key = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
-  } catch {
-    // Fall through — try fragment-only paste of id~key with junk.
-    const pair = parseGridFragment(text);
-    return pair[0] ?? null;
-  }
-  if (!id || !key) return null;
-  if (!SHARE_ID_RE.test(id) || !KEY_RE.test(key)) return null;
-  return { id, key };
-}
-
-const GRID_EXTRA_CSS = `
-.app.grid-app{ max-width:100%; padding:16px 16px 24px; gap:0; }
-.grid-app .topbar{ margin-bottom:14px; padding-bottom:14px; }
-.grid-tools{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:14px; }
-.grid-tools input{ flex:1 1 220px; min-width:0; }
-.grid-tools button{ flex-shrink:0; }
-.grid-hint{ font-size:12.5px; color:var(--dim); margin:0 0 14px; line-height:1.4; }
-.grid-hint code{ font-family:var(--mono); font-size:11.5px; color:var(--cyan); }
-.grid-empty{ background:var(--panel); border:1px dashed var(--border-2); border-radius:12px;
+const CANVAS_EXTRA_CSS = `
+.app.canvas-app{ max-width:100%; padding:16px 16px 24px; gap:0; }
+.canvas-app .topbar{ margin-bottom:14px; padding-bottom:14px; }
+.canvas-tools{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:14px; }
+.canvas-tools input{ flex:1 1 220px; min-width:0; }
+.canvas-tools button{ flex-shrink:0; }
+.canvas-zoom{ display:inline-flex; align-items:center; gap:6px; flex-shrink:0;
+  font-family:var(--mono); font-size:11.5px; color:var(--faint);
+  background:var(--panel); border:1px solid var(--border); border-radius:999px; padding:4px 6px; }
+.canvas-zoom button{ min-width:30px; min-height:0; padding:3px 8px; font-size:13px; line-height:1; }
+.canvas-zoom #zoomLabel{ min-width:38px; text-align:center; }
+.canvas-hint{ font-size:12.5px; color:var(--dim); margin:0 0 14px; line-height:1.4; }
+.canvas-hint code{ font-family:var(--mono); font-size:11.5px; color:var(--cyan); }
+.canvas-empty{ background:var(--panel); border:1px dashed var(--border-2); border-radius:12px;
   padding:28px 18px; text-align:center; color:var(--dim); font-size:13.5px; line-height:1.5; }
-.grid-empty strong{ color:var(--text); font-weight:600; }
-.grid{ display:grid; gap:12px; grid-template-columns:1fr;
-  align-items:stretch; width:100%; min-width:0; }
-@media (min-width:640px){ .grid{ grid-template-columns:repeat(2, minmax(0, 1fr)); } }
-@media (min-width:1100px){ .grid{ grid-template-columns:repeat(3, minmax(0, 1fr)); } }
-@media (min-width:1600px){ .grid{ grid-template-columns:repeat(4, minmax(0, 1fr)); } }
-.cell{ background:#0d0f14; border:1px solid var(--border); border-radius:12px;
-  overflow:hidden; display:flex; flex-direction:column; min-width:0; min-height:220px;
-  position:relative; cursor:pointer; transition:border-color .15s ease, box-shadow .15s ease; }
+.canvas-empty strong{ color:var(--text); font-weight:600; }
+.viewport{ position:relative; width:100%; height:calc(100vh - 240px); min-height:320px;
+  overflow:hidden; background:var(--panel-2); border:1px solid var(--border); border-radius:12px;
+  cursor:grab; touch-action:none; }
+.viewport.panning{ cursor:grabbing; }
+.viewport[hidden]{ display:none; }
+.board{ position:absolute; left:0; top:0; width:0; height:0;
+  transform-origin:0 0; will-change:transform; }
+.cell{ position:absolute; width:340px; background:#0d0f14; border:1px solid var(--border);
+  border-radius:12px; overflow:hidden; display:flex; flex-direction:column; min-width:0;
+  min-height:220px; box-shadow:0 10px 28px rgba(0,0,0,.4);
+  transition:border-color .15s ease, box-shadow .15s ease; }
 .cell:hover{ border-color:var(--border-2); }
-.cell:focus-visible{ outline:2px solid var(--cyan); outline-offset:2px; }
 .cell-head{ display:flex; align-items:center; gap:8px; padding:8px 10px;
-  background:var(--panel-2); border-bottom:1px solid var(--border); flex-shrink:0; min-width:0; }
+  background:var(--panel-2); border-bottom:1px solid var(--border); flex-shrink:0; min-width:0;
+  cursor:grab; user-select:none; -webkit-user-select:none; }
+.cell-head:active{ cursor:grabbing; }
 .cell-dot{ width:8px; height:8px; border-radius:50%; background:var(--faint); flex-shrink:0; }
 .cell-dot.live{ background:var(--green); box-shadow:0 0 0 3px rgba(126,231,135,.15); }
 .cell-dot.connecting{ background:var(--cyan); }
@@ -122,63 +116,66 @@ const GRID_EXTRA_CSS = `
 .cell-remove{ flex-shrink:0; font-size:14px; line-height:1; padding:4px 8px; min-height:0;
   color:var(--faint); background:transparent; border:1px solid transparent; border-radius:6px; }
 .cell-remove:hover{ color:var(--red); border-color:var(--border); background:var(--panel-3); }
-.cell-body{ flex:1 1 auto; min-height:160px; height:28vh; height:28dvh; padding:2px;
+.cell-body{ flex:1 1 auto; min-height:160px; height:240px; padding:2px;
   min-width:0; overflow:hidden; position:relative; }
 .cell-body .xterm{ height:100%; width:100%; }
 .cell-body .xterm-viewport{ overflow-y:auto !important; }
-/* Expanded cell — full viewport overlay */
-.cell.expanded{ position:fixed; inset:12px; z-index:40; min-height:0; height:auto;
-  box-shadow:0 24px 80px rgba(0,0,0,.55); border-color:var(--border-2); cursor:default; }
-.cell.expanded .cell-body{ height:auto; flex:1 1 auto; min-height:0; }
-body.grid-expanded{ overflow:hidden; }
-.expand-backdrop{ position:fixed; inset:0; background:rgba(5,6,10,.72); z-index:30;
-  border:0; padding:0; cursor:pointer; }
-.grid-err{ color:var(--red); font-size:12.5px; margin:0 0 10px; min-height:1.2em; }
-.grid-link{ font-size:12.5px; color:var(--cyan); text-decoration:none; }
-.grid-link:hover{ text-decoration:underline; }
+.canvas-err{ color:var(--red); font-size:12.5px; margin:0 0 10px; min-height:1.2em; }
+.mode-link{ font-size:12.5px; color:var(--cyan); text-decoration:none; margin-left:auto;
+  font-family:var(--mono); }
+.mode-link:hover{ text-decoration:underline; }
 @media (max-width:639px){
-  .cell-body{ height:36vh; height:36dvh; min-height:180px; }
-  .cell.expanded{ inset:0; border-radius:0; }
+  .cell{ width:calc(100vw - 48px); max-width:340px; }
+  .viewport{ height:calc(100vh - 280px); }
+  .mode-link{ margin-left:0; }
 }
 `;
 
-export function gridPage(): string {
+export function canvasPage(): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>vibeshare · grid</title>
+<title>vibeshare · canvas</title>
 <style>
-  ${xtermPageStyles(GRID_EXTRA_CSS)}
+  ${xtermPageStyles(CANVAS_EXTRA_CSS)}
 </style>
 </head>
 <body>
-<div class="app grid-app">
+<div class="app canvas-app">
   <header class="topbar">
-    <div class="brand">vibeshare<span> · multi-view</span></div>
+    <div class="brand">vibeshare<span> · canvas</span></div>
     <div class="p2p"><b>●</b> p2p · end-to-end encrypted</div>
   </header>
 
-  <p class="grid-hint">
-    Watch several live shares at once. Keys stay in the URL fragment
-    (<code>#id~key,id~key,…</code>) and never hit the server. Click a cell to expand.
+  <p class="canvas-hint">
+    Drop live shares on a free-form board. Drag a cell header to move it,
+    drag the background to pan, scroll to zoom. Keys stay in the URL fragment
+    (<code>#id~key~x~y,…</code>) and never hit the server.
   </p>
 
-  <div class="grid-tools">
+  <div class="canvas-tools">
     <input id="addInput" placeholder="paste a share URL (…/s/<id>#<key>) or id~key" autocomplete="off" spellcheck="false">
-    <button type="button" id="addBtn" title="Add a session to the grid">＋ add a session</button>
-    <a class="grid-link" href="/vibeshare/canvas" title="Switch to the free-form canvas board" style="margin-left:auto">⬚ canvas</a>
+    <button type="button" id="addBtn" title="Add a session to the board">＋ add a session</button>
+    <span class="canvas-zoom">
+      <button type="button" id="zoomOut" title="Zoom out" aria-label="Zoom out">−</button>
+      <span id="zoomLabel">100%</span>
+      <button type="button" id="zoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+    </span>
+    <a class="mode-link" href="/vibeshare/grid" title="Switch to the fixed multi-view grid">⊞ grid</a>
   </div>
-  <div class="grid-err" id="addErr" aria-live="polite"></div>
+  <div class="canvas-err" id="addErr" aria-live="polite"></div>
 
-  <div class="grid-empty" id="emptyState">
+  <div class="canvas-empty" id="emptyState">
     <strong>No sessions yet.</strong><br>
     Paste a vibeshare link above, or open this page as
-    <code>/vibeshare/grid#id~key,id2~key2</code>.
+    <code>/vibeshare/canvas#id~key~x~y</code>.
   </div>
 
-  <div class="grid" id="grid" hidden></div>
+  <div class="viewport" id="viewport" hidden>
+    <div class="board" id="board"></div>
+  </div>
 </div>
 
 ${xtermScriptTags()}
@@ -189,21 +186,27 @@ ${XTERM_BOOT_JS}
 
   var SHARE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
   var KEY_RE = /^[A-Za-z0-9_-]{22,64}$/;
+  var MIN_ZOOM = 0.3, MAX_ZOOM = 2;
 
-  var gridEl = document.getElementById("grid");
+  var viewportEl = document.getElementById("viewport");
+  var boardEl = document.getElementById("board");
   var emptyEl = document.getElementById("emptyState");
   var addInput = document.getElementById("addInput");
   var addBtn = document.getElementById("addBtn");
   var addErr = document.getElementById("addErr");
+  var zoomInBtn = document.getElementById("zoomIn");
+  var zoomOutBtn = document.getElementById("zoomOut");
+  var zoomLabel = document.getElementById("zoomLabel");
 
-  /** @type {Array<{id:string,key:string}>} */
+  /** @type {Array<{id:string,key:string,x:number,y:number}>} */
   var shares = [];
   /** @type {Object.<string, any>} */
   var cells = {};
-  var expandedId = null;
-  var backdrop = null;
 
-  function parseGridFragment(fragment){
+  // Board view state (pan in viewport px, zoom is unitless scale).
+  var panX = 48, panY = 48, zoom = 1;
+
+  function parseCanvasFragment(fragment){
     var raw = fragment.charAt(0) === "#" ? fragment.slice(1) : fragment;
     if(!raw) return [];
     var out = [];
@@ -211,43 +214,49 @@ ${XTERM_BOOT_JS}
     var parts = raw.split(",");
     for(var i = 0; i < parts.length; i++){
       var part = parts[i];
-      var tilde = part.indexOf("~");
-      if(tilde <= 0) continue;
-      var id = part.slice(0, tilde).trim();
-      var key = part.slice(tilde + 1).trim();
+      var segs = part.split("~");
+      var id = (segs[0] || "").trim();
+      var key = (segs[1] || "").trim();
       if(!SHARE_ID_RE.test(id) || !KEY_RE.test(key)) continue;
       if(seen[id]) continue;
+      var x = 0, y = 0;
+      if(segs.length >= 4){
+        var px = parseInt((segs[2] || "").trim(), 10);
+        var py = parseInt((segs[3] || "").trim(), 10);
+        if(isNaN(px) || isNaN(py)) continue;
+        x = px; y = py;
+      }
       seen[id] = true;
-      out.push({ id: id, key: key });
+      out.push({ id: id, key: key, x: x, y: y });
     }
     return out;
   }
 
-  function formatGridFragment(list){
-    return list.map(function(s){ return s.id + "~" + s.key; }).join(",");
+  function formatCanvasFragment(list){
+    return list.map(function(s){ return s.id + "~" + s.key + "~" + s.x + "~" + s.y; }).join(",");
   }
 
   function parseSharePaste(input){
     var text = (input || "").trim();
     if(!text) return null;
     if(text.indexOf("/") === -1 && text.indexOf("#") === -1){
-      var bare = parseGridFragment(text);
+      // Bare id~key (or id~key~x~y) — take the first canvas pair.
+      var bare = parseCanvasFragment(text);
       return bare.length === 1 ? bare[0] : null;
     }
-    var id = null;
-    var key = "";
+    var id = null, key = "";
     try {
       var url = text.indexOf("://") !== -1 ? new URL(text) : new URL(text, location.origin);
       var m = /\\/(?:vibeshare\\/)?s\\/([A-Za-z0-9_-]+)/.exec(url.pathname);
       if(m) id = m[1];
       key = url.hash.charAt(0) === "#" ? url.hash.slice(1) : url.hash;
     } catch(e){
-      var pair = parseGridFragment(text);
+      var pair = parseCanvasFragment(text);
       return pair[0] || null;
     }
     if(!id || !key) return null;
     if(!SHARE_ID_RE.test(id) || !KEY_RE.test(key)) return null;
-    return { id: id, key: key };
+    return { id: id, key: key, x: 0, y: 0 };
   }
 
   function b64urlToBytes(s){
@@ -262,10 +271,9 @@ ${XTERM_BOOT_JS}
   function setAddErr(msg){ addErr.textContent = msg || ""; }
 
   function writeHash(){
-    var body = formatGridFragment(shares);
+    var body = formatCanvasFragment(shares);
     var next = body ? "#" + body : "";
     if(location.hash !== next){
-      // replaceState keeps back-stack clean while still updating the fragment.
       if(history.replaceState){
         history.replaceState(null, "", location.pathname + location.search + next);
       } else {
@@ -278,23 +286,39 @@ ${XTERM_BOOT_JS}
     var n = shares.length;
     if(n === 0){
       emptyEl.hidden = false;
-      gridEl.hidden = true;
+      viewportEl.hidden = true;
     } else {
       emptyEl.hidden = true;
-      gridEl.hidden = false;
+      viewportEl.hidden = false;
     }
   }
 
-  function setCellStatus(cell, state, label){
-    cell.state = state;
-    cell.dot.className = "cell-dot" + (state ? " " + state : "");
-    cell.statusEl.textContent = label || state || "";
+  function applyTransform(){
+    boardEl.style.transform = "translate(" + panX + "px," + panY + "px) scale(" + zoom + ")";
+    if(zoomLabel) zoomLabel.textContent = Math.round(zoom * 100) + "%";
+  }
+
+  // Zoom around a viewport-space point (cursor / control center) so the board
+  // point under it stays fixed on screen.
+  function setZoom(newZoom, originClientX, originClientY){
+    var z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+    if(typeof originClientX === "number" && typeof originClientY === "number"){
+      var rect = viewportEl.getBoundingClientRect();
+      var cx = originClientX - rect.left;
+      var cy = originClientY - rect.top;
+      var bx = (cx - panX) / zoom;
+      var by = (cy - panY) / zoom;
+      panX = cx - bx * z;
+      panY = cy - by * z;
+    }
+    zoom = z;
+    applyTransform();
   }
 
   /**
    * Reuse the single-viewer WebRTC connect + e2e path per cell.
-   * Same handshake as viewerPage: viewer ws → hello → ANSWER → AES-GCM DC.
-   * Read-only: no input/chat/annotations.
+   * Same handshake as viewerPage / gridPage: viewer ws → hello → ANSWER →
+   * AES-GCM DC. Read-only: no input/chat/annotations.
    */
   function connectShare(shareId, keyB64, hooks){
     var closed = false;
@@ -314,7 +338,6 @@ ${XTERM_BOOT_JS}
       if(termApi) return termApi;
       if(hooks.getTermEl){
         termApi = __vsCreateTerm(hooks.getTermEl());
-        // Multi-cell: font hotkeys are global; re-fit this cell on create.
         try { if(termApi.fitNow) termApi.fitNow(); } catch(e){}
       }
       return termApi;
@@ -423,10 +446,10 @@ ${XTERM_BOOT_JS}
         } else if(msg.kind === "rtc-ice"){
           onRemoteIce(msg.candidate, msg.mid);
         }
-        // presence/chat/role-update ignored — grid is read-only spectate.
+        // presence/chat/role-update ignored — canvas is read-only spectate.
       };
       ws.onopen = function(){
-        send({ kind: "hello", name: "grid" });
+        send({ kind: "hello", name: "canvas" });
         if(myViewerId) startPeer();
         if(hooks.onStatus) hooks.onStatus("connecting", "CONNECTING");
       };
@@ -448,42 +471,25 @@ ${XTERM_BOOT_JS}
     };
   }
 
-  function collapseExpanded(){
-    if(!expandedId || !cells[expandedId]) {
-      expandedId = null;
-      if(backdrop){ try { backdrop.remove(); } catch(e){} backdrop = null; }
-      document.body.classList.remove("grid-expanded");
-      return;
-    }
-    var cell = cells[expandedId];
-    cell.root.classList.remove("expanded");
-    expandedId = null;
-    if(backdrop){ try { backdrop.remove(); } catch(e){} backdrop = null; }
-    document.body.classList.remove("grid-expanded");
-    // Re-fit after layout settles.
-    setTimeout(function(){ cell.conn.fit(); }, 50);
+  function setCellStatus(cell, state, label){
+    cell.state = state;
+    cell.dot.className = "cell-dot" + (state ? " " + state : "");
+    cell.statusEl.textContent = label || state || "";
   }
 
-  function expandCell(id){
-    if(expandedId === id){ collapseExpanded(); return; }
-    collapseExpanded();
-    var cell = cells[id];
-    if(!cell) return;
-    expandedId = id;
-    cell.root.classList.add("expanded");
-    document.body.classList.add("grid-expanded");
-    backdrop = document.createElement("button");
-    backdrop.type = "button";
-    backdrop.className = "expand-backdrop";
-    backdrop.setAttribute("aria-label", "Close expanded session");
-    backdrop.addEventListener("click", function(){ collapseExpanded(); });
-    document.body.appendChild(backdrop);
-    setTimeout(function(){ cell.conn.fit(); }, 50);
+  function placeCell(cell){
+    cell.root.style.left = cell.x + "px";
+    cell.root.style.top = cell.y + "px";
+  }
+
+  // Cascade new shares so they don't all stack at (0,0).
+  function autoPosition(){
+    var n = Object.keys(cells).length;
+    return { x: 40 + (n % 3) * 60, y: 40 + Math.floor(n / 3) * 60 };
   }
 
   function removeShare(id, opts){
     opts = opts || {};
-    if(expandedId === id) collapseExpanded();
     var cell = cells[id];
     if(cell){
       try { cell.conn.close(); } catch(e){}
@@ -499,19 +505,18 @@ ${XTERM_BOOT_JS}
     opts = opts || {};
     if(!ref || !ref.id || !ref.key) return false;
     if(cells[ref.id]){
-      if(!opts.silent) setAddErr("Already in the grid: " + ref.id);
+      if(!opts.silent) setAddErr("Already on the board: " + ref.id);
       return false;
     }
-    shares.push({ id: ref.id, key: ref.key });
+    var pos = (typeof ref.x === "number" && typeof ref.y === "number" && !opts.autoPlace)
+      ? { x: ref.x, y: ref.y } : autoPosition();
+    shares.push({ id: ref.id, key: ref.key, x: pos.x, y: pos.y });
     if(!opts.skipHash) writeHash();
     syncEmpty();
 
     var root = document.createElement("div");
     root.className = "cell";
     root.dataset.shareId = ref.id;
-    root.tabIndex = 0;
-    root.setAttribute("role", "button");
-    root.setAttribute("aria-label", "Session " + ref.id + " — click to expand");
 
     var head = document.createElement("div");
     head.className = "cell-head";
@@ -532,7 +537,7 @@ ${XTERM_BOOT_JS}
     var removeBtn = document.createElement("button");
     removeBtn.type = "button";
     removeBtn.className = "cell-remove";
-    removeBtn.title = "Remove from grid";
+    removeBtn.title = "Remove from board";
     removeBtn.setAttribute("aria-label", "Remove " + ref.id);
     removeBtn.textContent = "×";
     removeBtn.addEventListener("click", function(ev){
@@ -551,7 +556,7 @@ ${XTERM_BOOT_JS}
 
     root.appendChild(head);
     root.appendChild(body);
-    gridEl.appendChild(root);
+    boardEl.appendChild(root);
 
     var cell = {
       root: root,
@@ -559,37 +564,103 @@ ${XTERM_BOOT_JS}
       dot: dot,
       statusEl: statusEl,
       state: "connecting",
+      x: pos.x,
+      y: pos.y,
       conn: null
     };
+    placeCell(cell);
+
+    // Drag the HEADER to reposition the cell in board space; persist on drop.
+    startCellDrag(cell, head);
 
     function onStatus(state, label){ setCellStatus(cell, state, label); }
-
     cell.conn = connectShare(ref.id, ref.key, {
       getTermEl: function(){ return body; },
       onStatus: onStatus
     });
     cells[ref.id] = cell;
 
-    root.addEventListener("click", function(ev){
-      // Ignore clicks on the remove control (already stopPropagated).
-      if(ev.target && ev.target.closest && ev.target.closest(".cell-remove")) return;
-      expandCell(ref.id);
-    });
-    root.addEventListener("keydown", function(ev){
-      if(ev.key === "Enter" || ev.key === " "){
-        ev.preventDefault();
-        expandCell(ref.id);
-      } else if(ev.key === "Escape" && expandedId === ref.id){
-        ev.preventDefault();
-        collapseExpanded();
-      }
-    });
-
     return true;
   }
 
+  function startCellDrag(cell, handle){
+    handle.addEventListener("mousedown", function(ev){
+      if(ev.button !== 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      var startMX = ev.clientX, startMY = ev.clientY;
+      var startX = cell.x, startY = cell.y;
+      cell.root.style.zIndex = 20;
+      function move(e){
+        // Convert screen-space delta to board space via the current zoom.
+        cell.x = startX + (e.clientX - startMX) / zoom;
+        cell.y = startY + (e.clientY - startMY) / zoom;
+        placeCell(cell);
+      }
+      function up(){
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        cell.root.style.zIndex = "";
+        cell.x = Math.round(cell.x);
+        cell.y = Math.round(cell.y);
+        placeCell(cell);
+        for(var i = 0; i < shares.length; i++){
+          if(shares[i].id === cell.root.dataset.shareId){
+            shares[i].x = cell.x;
+            shares[i].y = cell.y;
+          }
+        }
+        writeHash();
+      }
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    });
+  }
+
+  // Pan: drag the empty board background.
+  viewportEl.addEventListener("mousedown", function(ev){
+    if(ev.button !== 0) return;
+    // Only pan when the press lands on the empty board/viewport (not a cell).
+    if(ev.target && ev.target.closest && ev.target.closest(".cell")) return;
+    ev.preventDefault();
+    viewportEl.classList.add("panning");
+    var startMX = ev.clientX, startMY = ev.clientY;
+    var startPX = panX, startPY = panY;
+    function move(e){
+      panX = startPX + (e.clientX - startMX);
+      panY = startPY + (e.clientY - startMY);
+      applyTransform();
+    }
+    function up(){
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+      viewportEl.classList.remove("panning");
+    }
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
+
+  // Zoom: wheel over the viewport, anchored to the cursor.
+  viewportEl.addEventListener("wheel", function(ev){
+    ev.preventDefault();
+    var delta = -ev.deltaY;
+    if(ev.deltaMode === 1) delta *= 16; // DOM_DELTA_LINE → px-ish
+    else if(ev.deltaMode === 2) delta *= 100; // DOM_DELTA_PAGE
+    var factor = Math.exp(delta * 0.0015);
+    setZoom(zoom * factor, ev.clientX, ev.clientY);
+  }, { passive: false });
+
+  if(zoomInBtn) zoomInBtn.addEventListener("click", function(){
+    var rect = viewportEl.getBoundingClientRect();
+    setZoom(zoom * 1.2, rect.left + rect.width / 2, rect.top + rect.height / 2);
+  });
+  if(zoomOutBtn) zoomOutBtn.addEventListener("click", function(){
+    var rect = viewportEl.getBoundingClientRect();
+    setZoom(zoom / 1.2, rect.left + rect.width / 2, rect.top + rect.height / 2);
+  });
+
   function loadFromHash(){
-    var next = parseGridFragment(location.hash || "");
+    var next = parseCanvasFragment(location.hash || "");
     var nextIds = {};
     for(var i = 0; i < next.length; i++) nextIds[next[i].id] = true;
     Object.keys(cells).forEach(function(id){
@@ -599,7 +670,11 @@ ${XTERM_BOOT_JS}
     for(var j = 0; j < next.length; j++){
       var ref = next[j];
       if(cells[ref.id]){
-        shares.push({ id: ref.id, key: ref.key });
+        // Already on the board — just sync its position.
+        var c = cells[ref.id];
+        c.x = ref.x; c.y = ref.y;
+        placeCell(c);
+        shares.push({ id: ref.id, key: ref.key, x: ref.x, y: ref.y });
       } else {
         addShare(ref, { skipHash: true, silent: true });
       }
@@ -614,7 +689,7 @@ ${XTERM_BOOT_JS}
       setAddErr("Paste a full share link (…/s/<id>#<key>) or id~key.");
       return;
     }
-    if(addShare(ref)){
+    if(addShare(ref, { autoPlace: true })){
       addInput.value = "";
       setAddErr("");
     }
@@ -626,16 +701,10 @@ ${XTERM_BOOT_JS}
     }
   });
 
-  document.addEventListener("keydown", function(ev){
-    if(ev.key === "Escape" && expandedId){
-      ev.preventDefault();
-      collapseExpanded();
-    }
-  });
-
   window.addEventListener("hashchange", function(){ loadFromHash(); });
 
   // Initial paint from fragment.
+  applyTransform();
   loadFromHash();
 })();
 </script>
