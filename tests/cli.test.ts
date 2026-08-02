@@ -92,6 +92,24 @@ describe('parseArgv', () => {
     expect(parseArgv(['viewers', 'share-id', '--json'])).toMatchObject({ cmd: 'viewers', share: 'share-id', json: true });
     expect(parseArgv(['--help'])).toEqual({ cmd: 'help' });
     expect(parseArgv(['--version'])).toEqual({ cmd: 'version' });
+    expect(parseArgv(['trace'])).toEqual({
+      cmd: 'trace',
+      options: {
+        agent: 'claude',
+        cwd: process.cwd(),
+        access: 'spectate',
+        expiry: 'stop',
+        port: 0,
+        host: '127.0.0.1',
+        yes: false,
+        public: false,
+        tunnel: false,
+      },
+    });
+    expect(parseArgv(['trace', 'claude', '--public', '--cwd', '/tmp/demo', '--yes'])).toEqual({
+      cmd: 'trace',
+      options: expect.objectContaining({ agent: 'claude', cwd: '/tmp/demo', public: true, yes: true }),
+    });
   });
 
   it('rejects bad usage with CliUsageError', () => {
@@ -146,6 +164,15 @@ describe('run (with an isolated VIBESHARE_HOME)', () => {
     const u = io();
     expect(await run(['--bogus'], u.io)).toBe(2);
     expect(u.err.join()).toContain('unknown option');
+  });
+
+  it('refuses non-interactive trace without --yes before creating a share', async () => {
+    home = tempHome();
+    process.env['VIBESHARE_HOME'] = home.dir;
+    const c = io();
+    expect(await run(['trace', '--cwd', '/tmp/example'], c.io)).toBe(1);
+    expect(c.err.join('\n')).toContain('Sharing your FULL claude transcript for /tmp/example');
+    expect(c.err.join('\n')).toContain('re-run with --yes');
   });
 
   it('viewers without an active share exits 1', async () => {
