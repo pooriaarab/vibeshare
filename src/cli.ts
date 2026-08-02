@@ -60,6 +60,8 @@ import type { Viewer } from './types.js';
 import { VERSION } from './version.js';
 import { WebRtcTransport } from './webrtc/transport.js';
 import { WsSignaling } from './webrtc/wsSignaling.js';
+import { createTranscriptCaptureSource } from './transcript/source.js';
+import type { TranscriptAgent } from './transcript/types.js';
 
 /**
  * ICE server used for `--public` shares (and baked into the viewer page).
@@ -116,9 +118,15 @@ export interface AttachCliOptions extends ShareFlags {
   sizePollMs?: number;
 }
 
+export interface TraceCliOptions extends ShareFlags {
+  agent: TranscriptAgent;
+  cwd: string;
+}
+
 export type CliCommand =
   | { cmd: 'start'; options: StartOptions }
   | { cmd: 'attach'; options: AttachCliOptions }
+  | { cmd: 'trace'; options: TraceCliOptions }
   | { cmd: 'stop'; share?: string }
   | { cmd: 'viewers'; share?: string; approve?: string; deny?: string; kick?: string; json: boolean }
   | { cmd: 'mcp' }
@@ -137,6 +145,7 @@ const USAGE = `vibeshare — share your live agent coding session by URL
 usage:
   vibeshare [options] [-- <cmd…>]   start sharing any harness/shell (default: your shell)
   vibeshare attach [target] [opts]  share an already-running tmux pane (harness-agnostic)
+  vibeshare trace [agent] [opts]    share an already-running harness transcript (read-only)
   vibeshare viewers [shareId]       list viewers; act on join requests
   vibeshare stop [shareId]          end the active share
 
@@ -170,6 +179,10 @@ attach:
   $TMUX_PANE when inside tmux, or to list panes. --invite enables drive via send-keys.
   Needs tmux — GNU screen is not supported yet. To share a fresh command instead:
     vibeshare -- <cmd>
+
+trace:
+  agent defaults to claude; --cwd selects the project directory (default: current directory).
+  Transcript sharing is read-only and auto-redacts likely secrets on a best-effort basis.
 
 local-first: the stream is served from this machine; nothing is stored on a
 server. Consent scope "share:session" is recorded in ~/.vibeshare/consent.json.`;
@@ -236,6 +249,30 @@ function parseShareFlags(
   return { positionals, commandAfterDashDash };
 }
 
+function parseTraceArgs(
+  args: string[],
+  flags: ShareFlags,
+): { agent: TranscriptAgent; cwd: string } {
+  const shareArgs: string[] = [];
+  let cwd = process.cwd();
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === '--cwd') {
+      const value = args[++i];
+      if (value === undefined || value.startsWith('-')) throw new CliUsageError('--cwd needs a value');
+      cwd = value;
+    } else {
+      shareArgs.push(arg);
+    }
+  }
+  const { positionals, commandAfterDashDash } = parseShareFlags(shareArgs, flags);
+  if (commandAfterDashDash !== null) throw new CliUsageError('trace does not take a command after `--`');
+  if (positionals.length > 1) throw new CliUsageError('trace takes at most one agent (claude or codex)');
+  const agent = positionals[0] ?? 'claude';
+  if (agent !== 'claude' && agent !== 'codex') throw new CliUsageError(`unsupported trace agent: ${agent}`);
+  return { agent, cwd };
+}
+
 class HelpRequested extends Error {
   constructor() {
     super('help');
@@ -295,6 +332,17 @@ export function parseArgv(argv: string[]): CliCommand {
         ...(positionals[0] !== undefined ? { target: positionals[0] } : {}),
       };
       return { cmd: 'attach', options };
+    } catch (err) {
+      if (err instanceof HelpRequested) return { cmd: 'help' };
+      throw err;
+    }
+  }
+
+  if (sub === 'trace') {
+    const flags = defaultShareFlags();
+    try {
+      const { agent, cwd } = parseTraceArgs(rest.slice(1), flags);
+      return { cmd: 'trace', options: { ...flags, agent, cwd } };
     } catch (err) {
       if (err instanceof HelpRequested) return { cmd: 'help' };
       throw err;
@@ -371,6 +419,31 @@ async function ensureConsent(io: IO, yes: boolean): Promise<boolean> {
       return false;
     }
     ledger.grant(SHARE_SCOPE, 'granted via vibeshare CLI prompt');
+    return true;
+  } finally {
+    rl.close();
+  }
+}
+
+async function ensureTraceConsent(io: IO, options: TraceCliOptions): Promise<boolean> {
+  if (options.yes) return true;
+  const warning =
+    `⚠ Sharing your FULL ${options.agent} transcript for ${options.cwd} — every prompt, model reply,\n` +
+    `  and tool output in this session becomes visible to anyone with the URL.\n` +
+    `  Secrets are auto-redacted (best-effort, not guaranteed). Continue? [y/N]`;
+  io.err(warning);
+  if (!process.stdin.isTTY) {
+    io.err('refusing to share transcript non-interactively — re-run with --yes');
+    return false;
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await rl.question(' ');
+    if (!parseConfirm(answer)) {
+      io.err('aborted — transcript was not shared');
+      return false;
+    }
+    loadLedger().grant(SHARE_SCOPE, 'granted via vibeshare trace prompt');
     return true;
   } finally {
     rl.close();
@@ -886,6 +959,45 @@ async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
   return exitCode;
 }
 
+/** `vibeshare trace` — share a native harness transcript as a read-only source. */
+async function traceShare(options: TraceCliOptions, io: IO): Promise<number> {
+  if (!(await ensureTraceConsent(io, options))) return 1;
+  const sessionLabel = options.name ?? `${options.agent} transcript`;
+  const minted = await mintShareRuntime(options, io, sessionLabel);
+  if (!minted.ok) return minted.code;
+  const { runtime } = minted;
+  const { created } = runtime;
+  const source = createTranscriptCaptureSource({ agent: options.agent, cwd: options.cwd });
+
+  io.out(`  source:   ${options.agent} transcript · read-only`);
+  let handle: Awaited<ReturnType<typeof source.start>> | null = null;
+  try {
+    handle = await source.start(created.feed);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    io.err(msg.startsWith('vibeshare') ? msg : `vibeshare trace: ${msg}`);
+    await runtime.cleanup();
+    return 2;
+  }
+
+  let shuttingDown = false;
+  const exitCode = await new Promise<number>((resolve) => {
+    process.on('SIGINT', () => shutdown(130));
+    process.on('SIGTERM', () => shutdown(143));
+
+    function shutdown(code: number): void {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      resolve(code);
+    }
+    shutdownRef = shutdown;
+  });
+
+  await handle.stop().catch(() => undefined);
+  await runtime.cleanup();
+  return exitCode;
+}
+
 // Control-stop callback set once startShare is running.
 let shutdownRef: ((code: number) => void) | null = null;
 function shutdown(code: number): void {
@@ -1058,6 +1170,8 @@ export async function runCommand(command: CliCommand, io: IO = stdio): Promise<n
       return startShare(command.options, io);
     case 'attach':
       return attachShare(command.options, io);
+    case 'trace':
+      return traceShare(command.options, io);
     case 'viewers':
       return viewersCommand(command, io);
     case 'stop':
