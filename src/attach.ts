@@ -1,31 +1,28 @@
 /**
- * Tmux capture source for `vibeshare attach [target]`.
+ * Tmux attach POLICY for `vibeshare attach [target]`.
  *
- * Shares an ALREADY-RUNNING terminal session by tapping a tmux pane:
- *   1. `tmux display -p`         → pane size → feed.publishResize
- *   2. `tmux capture-pane -pe`   → current screen → feed.publishRaw (backlog)
- *   3. `tmux pipe-pane -o`       → live raw bytes → feed.publishRaw
+ * Target parsing, pane listing/picker, multiplexer detection, and the
+ * feed-facing capture adapter live here. The capture MECHANISM (pipe-pane
+ * fifo, capture-pane backlog, size poll, send-keys) comes from
+ * `@pooriaarab/vibe-core/capture` (`tmuxCapture` / `createProcessTmuxRunner`).
  *
- * Capture is always on; collaborator input (when the host approves a viewer
- * on an `--invite` share) is applied via `tmux send-keys -l` through
- * {@link TmuxClient.sendKeys}. Spectate shares never reach that path — the
- * write gate lives in ViewerRegistry.canWrite(), not here.
- *
- * All tmux IO goes through {@link TmuxClient} so tests can mock without a
- * real tmux binary. Production uses fifo + `pipe-pane`; mocks return an
- * in-memory Readable.
+ * Collaborator input (when the host approves a viewer on an `--invite`
+ * share) is applied via `tmux send-keys -l`. Spectate shares never reach
+ * that path — the write gate lives in ViewerRegistry.canWrite(), not here.
  */
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync, unlinkSync } from 'node:fs';
-import { mkdtemp, open, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
-import type { Readable } from 'node:stream';
+import {
+  CaptureError,
+  createProcessTmuxRunner,
+  tmuxCapture,
+  type TmuxRunner,
+} from '@pooriaarab/vibe-core/capture';
 import type { CaptureFeed, CaptureHandle, CaptureSource } from './capture.js';
 
 // ---------------------------------------------------------------- errors
 
+/** Policy/setup failure for attach (bad target, no tmux, screen, …). */
 export class AttachError extends Error {
   constructor(message: string) {
     super(message);
@@ -47,34 +44,15 @@ export interface TmuxPane {
 }
 
 /** Live byte stream from a pane; call stop() to end pipe-pane + release resources. */
-export interface TmuxPipe {
-  readonly stream: Readable;
-  stop(): Promise<void>;
-}
+export type { TmuxPipe } from '@pooriaarab/vibe-core/capture';
 
-export interface TmuxClient {
-  /** True if a `tmux` binary is on PATH. */
-  available(): Promise<boolean>;
+/**
+ * Tmux seam used by attach POLICY (listing/picker) and by the capture
+ * adapter. Extends vibe-core's {@link TmuxRunner} with `listPanes`.
+ */
+export interface TmuxClient extends TmuxRunner {
   /** List all panes (tmux list-panes -a). */
   listPanes(): Promise<TmuxPane[]>;
-  /** Pane geometry; throws AttachError if target missing/invalid. */
-  paneSize(target: string): Promise<{ cols: number; rows: number }>;
-  /**
-   * Current screen + scrollback with ANSI (`capture-pane -pe`).
-   * Throws AttachError if target invalid.
-   */
-  capturePane(target: string): Promise<string>;
-  /**
-   * Start live capture of pane output.
-   * Production: `tmux pipe-pane -o -t <target> 'cat >> fifo'` + Readable on fifo.
-   * Tests: return an in-memory Readable the mock can push into.
-   */
-  openPipe(target: string): Promise<TmuxPipe>;
-  /**
-   * Type literal keys into the pane (`tmux send-keys -t <target> -l <data>`).
-   * Used for approved collaborator input on attach shares. Empty data is a no-op.
-   */
-  sendKeys(target: string, data: string): Promise<void>;
 }
 
 export interface AttachOptions {
@@ -160,7 +138,7 @@ export function detectUnsupportedMultiplexer(env: NodeJS.ProcessEnv = process.en
   return null;
 }
 
-// ---------------------------------------------------------------- real tmux client
+// ---------------------------------------------------------------- real tmux client (policy list + vibe-core runner)
 
 async function runTmux(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -186,39 +164,18 @@ async function runTmux(args: string[]): Promise<{ code: number; stdout: string; 
   });
 }
 
-function shellSingleQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-async function makeFifo(path: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('mkfifo', [path], { stdio: ['ignore', 'ignore', 'ignore'] });
-    child.on('error', (e: NodeJS.ErrnoException) => {
-      if (e.code === 'ENOENT') {
-        void open(path, 'w')
-          .then((f) => f.close())
-          .then(() => resolve(), reject);
-        return;
-      }
-      reject(e);
-    });
-    child.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new AttachError(`mkfifo failed for ${path} (exit ${code})`));
-    });
-  });
-}
-
 /**
- * Production TmuxClient that shells out to the `tmux` binary.
- * Live bytes: mkfifo + `tmux pipe-pane -o -t <target> "cat >> fifo"`.
+ * Production TmuxClient: capture MECHANISM from vibe-core's process runner,
+ * plus local `listPanes` for the attach picker.
  */
 export function createProcessTmuxClient(opts: { tmpDir?: string } = {}): TmuxClient {
+  const runner = createProcessTmuxRunner(opts.tmpDir !== undefined ? { tmpDir: opts.tmpDir } : {});
   return {
-    async available() {
-      const r = await runTmux(['-V']);
-      return r.code === 0;
-    },
+    available: () => runner.available(),
+    paneSize: (target) => runner.paneSize(target),
+    capturePane: (target) => runner.capturePane(target),
+    openPipe: (target) => runner.openPipe(target),
+    sendKeys: (target, data) => runner.sendKeys(target, data),
     async listPanes() {
       const r = await runTmux(['list-panes', '-a', '-F', PANE_FORMAT]);
       if (r.code !== 0) {
@@ -234,199 +191,87 @@ export function createProcessTmuxClient(opts: { tmpDir?: string } = {}): TmuxCli
         .map(parsePaneLine)
         .filter((p): p is TmuxPane => p !== null);
     },
-    async paneSize(target: string) {
-      const r = await runTmux(['display', '-p', '-t', target, '#{pane_width} #{pane_height}']);
-      if (r.code !== 0) {
-        throw new AttachError(
-          `tmux target not found: ${target}\n` +
-            `  ${r.stderr.trim() || 'display-message failed'}\n` +
-            `  List panes with: tmux list-panes -a`,
-        );
-      }
-      const m = r.stdout.trim().match(/^(\d+)\s+(\d+)$/);
-      if (!m) throw new AttachError(`could not parse pane size for ${target}: ${r.stdout.trim()}`);
-      return { cols: Number(m[1]), rows: Number(m[2]) };
-    },
-    async capturePane(target: string) {
-      // -p print to stdout, -e preserve escape sequences (ANSI/colors/cursor).
-      const r = await runTmux(['capture-pane', '-pe', '-t', target]);
-      if (r.code !== 0) {
-        throw new AttachError(
-          `tmux capture-pane failed for ${target}: ${r.stderr.trim() || `exit ${r.code}`}`,
-        );
-      }
-      return r.stdout;
-    },
-    async openPipe(target: string) {
-      const base = opts.tmpDir ?? tmpdir();
-      const dir = await mkdtemp(join(base, 'vibeshare-attach-'));
-      const fifoPath = join(dir, 'pane.fifo');
-      await makeFifo(fifoPath);
-
-      // Open read end before pipe-pane so the writer never blocks forever.
-      // O_RDWR on a fifo lets open() return without a peer writer (POSIX).
-      const fh = await open(fifoPath, 'r+');
-      const stream = createReadStream('', { fd: fh.fd, autoClose: false });
-
-      const dest = `cat >> ${shellSingleQuote(fifoPath)}`;
-      // -o = stdout only.
-      const r = await runTmux(['pipe-pane', '-o', '-t', target, dest]);
-      if (r.code !== 0) {
-        stream.destroy();
-        await fh.close().catch(() => undefined);
-        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-        throw new AttachError(
-          `tmux pipe-pane failed for ${target}: ${r.stderr.trim() || `exit ${r.code}`}`,
-        );
-      }
-
-      let stopped = false;
-      return {
-        stream,
-        async stop() {
-          if (stopped) return;
-          stopped = true;
-          // No command arg = stop piping.
-          await runTmux(['pipe-pane', '-t', target]);
-          stream.destroy();
-          try {
-            await fh.close();
-          } catch {
-            /* already closed */
-          }
-          try {
-            if (existsSync(fifoPath)) unlinkSync(fifoPath);
-          } catch {
-            /* ignore */
-          }
-          try {
-            await rm(dir, { recursive: true, force: true });
-          } catch {
-            /* ignore */
-          }
-        },
-      };
-    },
-    async sendKeys(target: string, data: string) {
-      if (data.length === 0) return;
-      // -l = literal: every char is typed, not interpreted as a key name.
-      // tmux caps a single argument; chunk large pastes.
-      const CHUNK = 256;
-      for (let i = 0; i < data.length; i += CHUNK) {
-        const slice = data.slice(i, i + CHUNK);
-        const r = await runTmux(['send-keys', '-t', target, '-l', '--', slice]);
-        if (r.code !== 0) {
-          throw new AttachError(
-            `tmux send-keys failed for ${target}: ${r.stderr.trim() || `exit ${r.code}`}`,
-          );
-        }
-      }
-    },
   };
 }
 
-// ---------------------------------------------------------------- capture source
+// ---------------------------------------------------------------- capture source (adapter over vibe-core tmuxCapture)
+
+/** Map a vibeshare TmuxClient onto vibe-core's TmuxRunner (drop listPanes). */
+function asRunner(tmux: TmuxClient): TmuxRunner {
+  return {
+    available: () => tmux.available(),
+    paneSize: (target) => tmux.paneSize(target),
+    capturePane: (target) => tmux.capturePane(target),
+    openPipe: (target) => tmux.openPipe(target),
+    sendKeys: (target, data) => tmux.sendKeys(target, data),
+  };
+}
 
 /**
- * Build a CaptureSource that taps a tmux pane into the raw-byte feed.
- *
- * Lifecycle:
- *   start → size → backlog(capture-pane) → openPipe live → handle
- *   stop  → pipe.stop()
+ * Build a feed-facing CaptureSource that taps a tmux pane via vibe-core
+ * `tmuxCapture`. Presents the vibeshare CaptureHandle shape (label +
+ * writeInput + stop) expected by the CLI and tests.
  */
 export function createTmuxCaptureSource(opts: AttachOptions): CaptureSource {
   const tmux =
     opts.tmux ??
     createProcessTmuxClient(opts.tmpDir !== undefined ? { tmpDir: opts.tmpDir } : {});
-  const sizePollMs = opts.sizePollMs ?? 1000;
   const target = opts.target;
 
   return {
     async start(feed: CaptureFeed): Promise<CaptureHandle> {
-      if (!(await tmux.available())) {
-        throw new AttachError(
-          'tmux is not installed (or not on PATH).\n' +
-            '  `vibeshare attach` shares an already-running tmux pane.\n' +
-            '  Install tmux, or launch a new session wrapped instead:\n' +
-            '    vibeshare -- <cmd>',
-        );
-      }
+      const source = tmuxCapture(target, {
+        runner: asRunner(tmux),
+        ...(opts.sizePollMs !== undefined ? { sizePollMs: opts.sizePollMs } : {}),
+        ...(opts.tmpDir !== undefined ? { tmpDir: opts.tmpDir } : {}),
+      });
 
-      // Validate target + initial size up front (fail closed).
-      const size = await tmux.paneSize(target);
-      feed.publishResize(size.cols, size.rows);
-
-      // Backlog first so late-joining viewers reconstruct the current screen
-      // before live bytes land.
-      const screen = await tmux.capturePane(target);
-      if (screen.length > 0) {
-        feed.publishRaw(screen);
-      }
-
-      let pipe: TmuxPipe;
       try {
-        pipe = await tmux.openPipe(target);
+        await source.start(
+          (data) => {
+            try {
+              feed.publishRaw(data);
+            } catch {
+              // feed closed mid-stream
+            }
+          },
+          (cols, rows) => {
+            try {
+              feed.publishResize(cols, rows);
+            } catch {
+              // feed closed mid-stream
+            }
+          },
+        );
       } catch (err) {
+        // Surface vibe-core CaptureError as AttachError so CLI messaging stays stable.
+        if (err instanceof CaptureError || (err instanceof Error && err.name === 'CaptureError')) {
+          const msg = err.message;
+          if (/tmux is not installed/i.test(msg)) {
+            throw new AttachError(
+              'tmux is not installed (or not on PATH).\n' +
+                '  `vibeshare attach` shares an already-running tmux pane.\n' +
+                '  Install tmux, or launch a new session wrapped instead:\n' +
+                '    vibeshare -- <cmd>',
+            );
+          }
+          throw new AttachError(msg);
+        }
         throw err;
       }
 
       let stopped = false;
-      let lastCols = size.cols;
-      let lastRows = size.rows;
-      let pollTimer: NodeJS.Timeout | null = null;
-
-      const onData = (chunk: string | Buffer): void => {
-        if (stopped) return;
-        try {
-          feed.publishRaw(chunk);
-        } catch {
-          // feed closed mid-stream
-        }
-      };
-      pipe.stream.on('data', onData);
-
-      if (sizePollMs > 0) {
-        pollTimer = setInterval(() => {
-          void (async () => {
-            if (stopped) return;
-            try {
-              const s = await tmux.paneSize(target);
-              if (s.cols !== lastCols || s.rows !== lastRows) {
-                lastCols = s.cols;
-                lastRows = s.rows;
-                feed.publishResize(s.cols, s.rows);
-              }
-            } catch {
-              // pane gone — stop() will be driven by the share lifecycle
-            }
-          })();
-        }, sizePollMs);
-        pollTimer.unref?.();
-      }
-
-      const stop = async (): Promise<void> => {
-        if (stopped) return;
-        stopped = true;
-        if (pollTimer) {
-          clearInterval(pollTimer);
-          pollTimer = null;
-        }
-        pipe.stream.off('data', onData);
-        try {
-          await pipe.stop();
-        } catch {
-          /* best effort */
-        }
-      };
-
       return {
         label: `tmux:${target}`,
-        /** Apply approved collaborator input to the live pane. */
         writeInput: async (data: string) => {
           if (stopped || data.length === 0) return;
-          await tmux.sendKeys(target, data);
+          await source.write(data);
         },
-        stop,
+        stop: async () => {
+          if (stopped) return;
+          stopped = true;
+          await source.stop();
+        },
       };
     },
   };

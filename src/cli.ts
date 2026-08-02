@@ -10,8 +10,8 @@
  * The share runs on your machine only: the consent ledger (@pooriaarab/vibe-core)
  * gates every share, and the spectator stream is served straight from here.
  *
- * Capture sources (PTY spawn vs tmux attach) are swappable; share/transport/e2e
- * logic is shared — see src/capture.ts + src/attach.ts.
+ * Capture MECHANISM (PTY spawn / tmux attach) comes from
+ * `@pooriaarab/vibe-core/capture`; attach POLICY stays in src/attach.ts.
  */
 import { randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
@@ -28,6 +28,11 @@ import {
   watchCwd,
   type TriggerKind,
 } from '@pooriaarab/vibe-core';
+import {
+  CaptureError,
+  ptyCapture,
+  type PtyProcess,
+} from '@pooriaarab/vibe-core/capture';
 import {
   AttachError,
   createProcessTmuxClient,
@@ -708,42 +713,55 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   const minted = await mintShareRuntime(options, io, sessionLabel);
   if (!minted.ok) return minted.code;
   const { runtime } = minted;
-  const { created, record } = runtime;
+  const { created } = runtime;
 
-  // Spawn the session in a real PTY so interactive TUIs (Claude Code / Codex)
-  // render their full terminal UI. Raw bytes (ANSI included) go into the feed;
-  // viewers reconstruct via xterm.js.
+  // Spawn via vibe-core ptyCapture. Host POLICY stays here: tee to the local
+  // terminal, host stdin → PTY, SIGWINCH resize, exit-code plumbing. The
+  // injectable spawner keeps a handle for resize/onExit (not on CaptureSource).
   const cmd = options.command.length > 0 ? options.command : [process.env['SHELL'] ?? '/bin/sh'];
   const cols = process.stdout.columns || 80;
   const rows = process.stdout.rows || 24;
-  let ptyProcess: pty.IPty;
+  let ptyProcess: PtyProcess | null = null;
+  let exitResolver: ((code: number) => void) | null = null;
+  const source = ptyCapture(cmd[0]!, cmd.slice(1), {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd: process.cwd(),
+    env: process.env as Record<string, string>,
+    spawner: {
+      spawn(file, args, spawnOpts) {
+        const p = pty.spawn(file, args as string[], spawnOpts);
+        ptyProcess = p;
+        p.onExit(({ exitCode: code, signal }) => {
+          exitResolver?.(typeof code === 'number' ? code : (signal ? 128 : 0));
+        });
+        return p;
+      },
+    },
+  });
+
   try {
-    ptyProcess = pty.spawn(cmd[0]!, cmd.slice(1), {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd: process.cwd(),
-      env: process.env as Record<string, string>,
-    });
+    await source.start(
+      (data) => {
+        process.stdout.write(data);
+        try { created.feed.publishRaw(data); } catch { /* feed closed */ }
+      },
+      (c, r) => {
+        try { created.feed.publishResize(c, r); } catch { /* feed closed */ }
+      },
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     io.err(`vibeshare: could not start ${cmd[0]!}: ${msg}`);
+    await source.stop().catch(() => undefined);
     await runtime.cleanup();
     return 2;
   }
 
-  // Initial size so late viewers can term.resize before replaying bytes.
-  created.feed.publishResize(cols, rows);
-
-  // Tee PTY output to the host terminal and the ordered raw-byte feed.
-  ptyProcess.onData((data) => {
-    process.stdout.write(data);
-    created.feed.publishRaw(data);
-  });
-
   // Approved collaborator input → PTY stdin (transport already gated canWrite).
   runtime.setInputSink((data) => {
-    try { ptyProcess.write(data); } catch { /* closed */ }
+    void source.write(data);
   });
 
   // Host stdin → PTY so the host user still drives the session normally.
@@ -754,31 +772,28 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   }
   stdin.resume();
   const onStdin = (chunk: Buffer | string): void => {
-    try { ptyProcess.write(typeof chunk === 'string' ? chunk : chunk.toString('utf8')); } catch { /* closed */ }
+    void source.write(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
   };
   stdin.on('data', onStdin);
 
   const onWinch = (): void => {
     const c = process.stdout.columns || 80;
     const r = process.stdout.rows || 24;
-    try { ptyProcess.resize(c, r); } catch { /* closed */ }
-    created.feed.publishResize(c, r);
+    try { ptyProcess?.resize(c, r); } catch { /* closed */ }
+    try { created.feed.publishResize(c, r); } catch { /* feed closed */ }
   };
   process.on('SIGWINCH', onWinch);
 
   let shuttingDown = false;
   const exitCode = await new Promise<number>((resolve) => {
-    ptyProcess.onExit(({ exitCode: code, signal }) => {
-      resolve(typeof code === 'number' ? code : (signal ? 128 : 0));
-    });
+    exitResolver = resolve;
     process.on('SIGINT', () => shutdown(130));
     process.on('SIGTERM', () => shutdown(143));
 
     function shutdown(code: number): void {
       if (shuttingDown) return;
       shuttingDown = true;
-      try { ptyProcess.kill(); } catch { /* already gone */ }
-      resolve(code);
+      void source.stop().finally(() => resolve(code));
     }
     // Expose to onStopRequested above.
     shutdownRef = shutdown;
@@ -789,6 +804,7 @@ async function startShare(options: StartOptions, io: IO): Promise<number> {
   if (stdin.isTTY) {
     try { stdin.setRawMode(wasRaw); } catch { /* ignore */ }
   }
+  await source.stop().catch(() => undefined);
   await runtime.cleanup();
   return exitCode;
 }
@@ -807,7 +823,10 @@ async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
     // Fail closed on bad target BEFORE minting a share URL.
     await tmux.paneSize(target);
   } catch (err) {
-    const msg = err instanceof AttachError || err instanceof Error ? err.message : String(err);
+    const msg =
+      err instanceof AttachError || err instanceof CaptureError || err instanceof Error
+        ? err.message
+        : String(err);
     io.err(msg.startsWith('vibeshare') ? msg : `vibeshare attach: ${msg}`);
     return 2;
   }
