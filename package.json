@@ -1,6 +1,6 @@
 {
   "name": "vibeshare-live",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Share your live agent coding session by URL — spectate read-only or invite into the session. Local-first: runs on your machine, nothing readable leaves without consent. Part of the Vibe Suite.",
   "license": "MIT",
   "type": "module",
