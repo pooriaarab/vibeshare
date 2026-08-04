@@ -82,7 +82,7 @@ export class ShareManager {
           : null,
     };
 
-    const feed = new SessionFeed();
+    const feed = opts.feedCapacity !== undefined ? new SessionFeed(opts.feedCapacity) : new SessionFeed();
     const viewers = new ViewerRegistry(() => share.access);
     const url = await this.#transport.serve(share, feed, viewers);
 

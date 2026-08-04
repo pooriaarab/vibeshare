@@ -70,6 +70,12 @@ export interface CreateShareOptions {
    * Mainly for tests and embedders that already hold a duration.
    */
   readonly expiryMs?: number;
+  /**
+   * Feed backlog capacity (entries retained for replay to late joiners).
+   * Default 1000 — a rolling window, right for a live terminal. Transcript
+   * shares raise this so the whole conversation is retained and delivered.
+   */
+  readonly feedCapacity?: number;
 }
 
 /** vibeshare error with a machine-readable code (mapped to HTTP by transports). */
