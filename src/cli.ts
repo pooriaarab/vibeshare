@@ -93,6 +93,8 @@ export interface ShareFlags {
   tunnel: boolean | string;
   /** `--signaling <url>` override for the rendezvous (see src/config.ts). */
   signaling?: string;
+  /** Feed backlog capacity override (trace shares raise it to keep full history). */
+  feedCapacity?: number;
   /**
    * Injectable tunnel registry (tests). Production uses createTunnelRegistry().
    * Accepts anything with the resolve() shape so mocks stay light.
@@ -640,6 +642,7 @@ async function mintShareRuntime(
       expiry: options.expiry,
       ...(options.passphrase !== undefined ? { passphrase: options.passphrase } : {}),
       ...(options.name !== undefined ? { name: options.name } : {}),
+      ...(options.feedCapacity !== undefined ? { feedCapacity: options.feedCapacity } : {}),
       session: sessionLabel,
     });
     // --public: pull the share key from the URL fragment for chat decrypt, and
@@ -963,7 +966,10 @@ async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
 async function traceShare(options: TraceCliOptions, io: IO): Promise<number> {
   if (!(await ensureTraceConsent(io, options))) return 1;
   const sessionLabel = options.name ?? `${options.agent} transcript`;
-  const minted = await mintShareRuntime(options, io, sessionLabel);
+  // Retain the whole transcript (not the 1000-entry live-terminal window) so a
+  // late joiner receives the entire conversation. Bounded by the actual event
+  // count (a session is realistically well under this).
+  const minted = await mintShareRuntime({ ...options, feedCapacity: 200_000 }, io, sessionLabel);
   if (!minted.ok) return minted.code;
   const { runtime } = minted;
   const { created } = runtime;

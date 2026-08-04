@@ -189,6 +189,36 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     feed.close();
   });
 
+  it('paces a large backlog: delivers every entry in order without flooding the channel', async () => {
+    // A transcript backlog is far bigger than a live-terminal window. Before
+    // flow control, blasting it at open overflowed the DataChannel and stalled
+    // the handshake ("waiting for host"). Publish ~1.6 MB (1500 × ~1 KB) — well
+    // over the 512 KB high-water mark — and require every entry to arrive, in
+    // order, exactly once.
+    transport = new WebRtcTransport({ signaling });
+    const share = makeShare();
+    const feed = new SessionFeed(5000); // hold the whole backlog, like a trace share
+    const viewers = new ViewerRegistry(() => share.access);
+    const url = await transport.serve(share, feed, viewers);
+    const key = keyFromUrl(url);
+
+    const COUNT = 1500;
+    const chunk = 'x'.repeat(1024);
+    for (let i = 0; i < COUNT; i++) feed.publishRaw(Buffer.from(`${i}:${chunk}`, 'utf8'));
+
+    let received!: Promise<Array<Record<string, unknown>>>;
+    const viewer = connect(signaling, share.id, 'viewer-big', (dc) => {
+      received = collectEntries(dc, key, COUNT);
+    });
+    await viewer.opened;
+
+    const entries = await received;
+    expect(entries.length).toBe(COUNT);
+    // Monotonic, contiguous, no drops or duplicates.
+    expect(entries.map((e) => e['seq'])).toEqual(Array.from({ length: COUNT }, (_, i) => i + 1));
+    feed.close();
+  }, 20000);
+
   it('drops spectator input silently and applies approved-collaborator input', async () => {
     transport = new WebRtcTransport({
       signaling,

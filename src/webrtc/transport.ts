@@ -20,6 +20,15 @@
  */
 import { randomBytes } from 'node:crypto';
 import { PeerConnection, type DataChannel } from 'node-datachannel';
+
+/**
+ * Backlog flow control. A transcript (or long session) backlog can be many MB;
+ * blasting it all into the DataChannel at open overflows SCTP send buffers and
+ * stalls the handshake. Pace it: stop feeding new frames once `bufferedAmount`
+ * crosses HIGH, resume when it drains below LOW.
+ */
+const FLUSH_HIGH_WATER = 512 * 1024;
+const FLUSH_LOW_WATER = 64 * 1024;
 import { decryptFrame, encryptFrame, E2E_KEY_LEN } from '@pooriaarab/vibe-core';
 import type { SessionFeed } from '@pooriaarab/vibe-core/feed';
 import type { ViewerRegistry } from '../registry.js';
@@ -68,9 +77,15 @@ interface PeerContext {
   readonly dc: DataChannel;
   unsubscribeSignaling: () => void;
   unsubscribeFeed: (() => void) | null;
-  /** Live entries buffered between feed subscribe and channel open. */
+  /**
+   * Live entries buffered between feed subscribe and channel open, and again
+   * while the backlog is being paced out (see `flushing`) so a live entry can
+   * never jump ahead of unfinished backlog.
+   */
   pending: FeedEntry[];
   open: boolean;
+  /** True while the initial backlog is still being paced onto the channel. */
+  flushing: boolean;
   /** Last accepted collaborator-input seq (anti-replay watermark). */
   lastInputSeq: number;
 }
@@ -220,9 +235,13 @@ export class WebRtcTransport implements ShareTransport {
       unsubscribeFeed: null,
       pending: [],
       open: false,
+      flushing: false,
       lastInputSeq: -1,
     };
     ctx.peers.set(viewerId, peer);
+    // Fire onBufferedAmountLow once the send buffer drains below this, so the
+    // paced flush can resume without busy-waiting.
+    dc.setBufferedAmountLowThreshold(FLUSH_LOW_WATER);
 
     // Subscribe now and buffer until the channel opens: replaying the
     // backlog only at open time would silently drop entries published
@@ -231,22 +250,16 @@ export class WebRtcTransport implements ShareTransport {
     // the handshake then lands in `pending` instead of the gap between the
     // two calls. The two can overlap (an entry in both) — dedup by seq.
     peer.unsubscribeFeed = ctx.feed.subscribe((entry) => {
-      if (peer.open) this.#sendEntry(ctx, peer, entry);
+      // Send directly only once the channel is open AND the backlog flush has
+      // finished; otherwise queue so ordering is preserved.
+      if (peer.open && !peer.flushing) this.#sendEntry(ctx, peer, entry);
       else peer.pending.push(entry);
     });
     const backlog = [...ctx.feed.backlog()];
 
     dc.onOpen(() => {
       peer.open = true;
-      const sent = new Set<number>();
-      for (const entry of backlog) {
-        this.#sendEntry(ctx, peer, entry);
-        sent.add(entry.seq);
-      }
-      for (const entry of peer.pending) {
-        if (!sent.has(entry.seq)) this.#sendEntry(ctx, peer, entry);
-      }
-      peer.pending = [];
+      void this.#flushBacklog(ctx, peer, backlog);
     });
     dc.onMessage((msg) => this.#handleInbound(ctx, viewerId, msg));
     dc.onClosed(() => this.#dropPeer(ctx, viewerId));
@@ -285,6 +298,63 @@ export class WebRtcTransport implements ShareTransport {
   }
 
   // ------------------------------------------------------------- frames
+
+  /**
+   * Pace the initial backlog onto a freshly-opened channel, then drain anything
+   * that queued during the flush, then hand off to direct live sends. Live
+   * entries stay in `peer.pending` (guarded by `peer.flushing`) until this
+   * completes, so nothing jumps ahead of the backlog. Deduped by seq because an
+   * entry published during the handshake can appear in both backlog and pending.
+   */
+  async #flushBacklog(ctx: ShareContext, peer: PeerContext, backlog: FeedEntry[]): Promise<void> {
+    peer.flushing = true;
+    const sent = new Set<number>();
+    const sendPaced = async (entry: FeedEntry): Promise<void> => {
+      await this.#drain(peer);
+      if (!peer.open || sent.has(entry.seq)) return;
+      this.#sendEntry(ctx, peer, entry);
+      sent.add(entry.seq);
+    };
+    for (const entry of backlog) {
+      if (!peer.open) return;
+      await sendPaced(entry);
+    }
+    // Entries that arrived during the (awaited) backlog send accumulated in
+    // pending; drain them the same paced way. New arrivals keep landing in
+    // pending while flushing is true, so loop until it's empty.
+    while (peer.open && peer.pending.length > 0) {
+      const batch = peer.pending;
+      peer.pending = [];
+      for (const entry of batch) {
+        if (!peer.open) return;
+        await sendPaced(entry);
+      }
+    }
+    // No awaits between the emptiness check above and this flag flip, so no live
+    // entry can slip into the gap — the subscription now sends directly, in order.
+    peer.flushing = false;
+  }
+
+  /** Resolve once the send buffer is below HIGH (immediately if already low). */
+  #drain(peer: PeerContext): Promise<void> {
+    if (!peer.open || peer.dc.bufferedAmount() < FLUSH_HIGH_WATER) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        clearInterval(timer);
+        resolve();
+      };
+      peer.dc.onBufferedAmountLow(finish);
+      // Poll fallback: onBufferedAmountLow can miss if the buffer never dips to
+      // exactly the threshold, or the peer dies mid-flush.
+      const timer = setInterval(() => {
+        if (!peer.open || peer.dc.bufferedAmount() < FLUSH_HIGH_WATER) finish();
+      }, 50);
+      timer.unref?.();
+    });
+  }
 
   #sendEntry(ctx: ShareContext, peer: PeerContext, entry: FeedEntry): void {
     try {
