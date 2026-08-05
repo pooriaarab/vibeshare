@@ -14,6 +14,16 @@
  * Tunnel-provider settings live in the same file under `tunnel` (see
  * {@link TunnelConfig}). Secrets (e.g. an ngrok authtoken) live in this
  * file only and are never logged.
+ *
+ * ICE servers for `--public` (STUN/TURN) follow the same cascade:
+ *
+ *   --ice-servers '<json>'  (CLI flag)
+ *   VIBESHARE_ICE_SERVERS   (environment)
+ *   ~/.vibeshare/config.json  →  { "iceServers": [ … ] }
+ *   built-in default  (Google STUN only)
+ *
+ * TURN entries carry the host's own credentials (see {@link RTCIceServer});
+ * they are relayed to viewers over signaling so BYO TURN just works.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -34,6 +44,31 @@ export const NGROK_AUTHTOKEN_ENV = 'NGROK_AUTHTOKEN';
 
 /** Env var for a self-hosted frp server address. */
 export const FRP_SERVER_ADDR_ENV = 'FRP_SERVER_ADDR';
+
+/** Env var carrying the ICE server list as a JSON array (below the CLI flag). */
+export const ICE_SERVERS_ENV = 'VIBESHARE_ICE_SERVERS';
+
+/**
+ * One STUN/TURN server entry — the browser `RTCIceServer` shape. The same
+ * list drives the host's peer connections (mapped to node-datachannel's
+ * string form, see src/webrtc/transport.ts) and is relayed verbatim to
+ * browser viewers, so a TURN config here applies to BOTH ends.
+ */
+export interface RTCIceServer {
+  /** e.g. `'stun:stun.l.google.com:19302'` or `'turn:turn.example.com:3478'`. */
+  readonly urls: string | string[];
+  /** TURN username (meaningless on STUN entries). */
+  readonly username?: string;
+  /** TURN credential / password — the host's own; treat as a secret. */
+  readonly credential?: string;
+}
+
+/**
+ * Default ICE config for `--public` when nothing is configured: free Google
+ * STUN only — no TURN, no infra. Direct P2P works across most NATs with STUN
+ * alone; symmetric NAT / isolated networks need a configured TURN server.
+ */
+export const DEFAULT_ICE_SERVERS: readonly RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
 /**
  * Per-provider account material under `tunnel.account` in config.json.
@@ -80,6 +115,12 @@ export interface VibeShareConfig {
   readonly signalingUrl?: string;
   /** Tunnel provider settings for `vibeshare --tunnel`. */
   readonly tunnel?: TunnelConfig;
+  /**
+   * STUN/TURN servers for `--public` shares (see {@link resolveIceServers}).
+   * TURN entries carry the host's own credentials — this file may hold
+   * secrets and is never logged.
+   */
+  readonly iceServers?: readonly RTCIceServer[];
 }
 
 /**
@@ -95,12 +136,18 @@ export function readConfigFile(file = join(vibeHome(), 'config.json')): VibeShar
     const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
     const raw = parsed as Record<string, unknown>;
-    const config: { signalingUrl?: string; tunnel?: TunnelConfig } = {};
+    const config: {
+      signalingUrl?: string;
+      tunnel?: TunnelConfig;
+      iceServers?: readonly RTCIceServer[];
+    } = {};
     if (typeof raw['signalingUrl'] === 'string' && raw['signalingUrl'].trim().length > 0) {
       config.signalingUrl = raw['signalingUrl'];
     }
     const tunnel = parseTunnelConfig(raw['tunnel']);
     if (tunnel) config.tunnel = tunnel;
+    const iceServers = sanitizeIceServers(raw['iceServers']);
+    if (iceServers) config.iceServers = iceServers;
     return config;
   } catch {
     return {};
@@ -157,6 +204,100 @@ export function resolveSignalingUrl(sources: SignalingSources): string {
 /** Convenience for the CLI: resolve from real flag/env/config-file inputs. */
 export function resolveSignaling(flag?: string): string {
   return resolveSignalingUrl({ flag, env: process.env[SIGNALING_ENV], file: readConfigFile() });
+}
+
+/**
+ * Coerce an unknown value into a clean RTCIceServer list. Entries without a
+ * usable `urls` are dropped; `username`/`credential` pass through only as
+ * non-empty strings. Returns undefined when nothing valid survives, so a
+ * present-but-garbage value is treated as unset.
+ */
+export function sanitizeIceServers(raw: unknown): RTCIceServer[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: Array<{ urls: string | string[]; username?: string; credential?: string }> = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const e = entry as Record<string, unknown>;
+    const urls = e['urls'];
+    let cleanUrls: string | string[] | undefined;
+    if (typeof urls === 'string' && urls.trim().length > 0) {
+      cleanUrls = urls.trim();
+    } else if (Array.isArray(urls)) {
+      const list = urls
+        .filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
+        .map((u) => u.trim());
+      if (list.length > 0) cleanUrls = list;
+    }
+    if (cleanUrls === undefined) continue;
+    const server: { urls: string | string[]; username?: string; credential?: string } = { urls: cleanUrls };
+    if (typeof e['username'] === 'string' && e['username'].length > 0) server.username = e['username'];
+    if (typeof e['credential'] === 'string' && e['credential'].length > 0) server.credential = e['credential'];
+    out.push(server);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Parse the `--ice-servers` flag / `VIBESHARE_ICE_SERVERS` env value: a JSON
+ * array of RTCIceServer objects. Returns null on malformed JSON or when no
+ * valid entry survives — the caller decides the fallback.
+ */
+export function parseIceServersJson(raw: string): RTCIceServer[] | null {
+  try {
+    return sanitizeIceServers(JSON.parse(raw)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** The sources {@link resolveIceServers} consults, in precedence order. */
+export interface IceServersSources {
+  /** `--ice-servers '<json>'` CLI flag (a JSON array of RTCIceServer objects). */
+  readonly flag?: string | undefined;
+  /** `VIBESHARE_ICE_SERVERS` env var (same JSON as the flag). */
+  readonly env?: string | undefined;
+  /** Parsed config file (see {@link readConfigFile}). */
+  readonly file?: VibeShareConfig | undefined;
+  /**
+   * Called with a clear message when a flag/env value is present but
+   * malformed; resolution then falls through to the next source.
+   */
+  readonly onError?: (message: string) => void;
+}
+
+/**
+ * Resolve the ICE server list for `vibeshare --public`:
+ * `--ice-servers` flag > VIBESHARE_ICE_SERVERS env > config file
+ * `"iceServers"` key > default Google STUN. Blank values are treated as
+ * unset; malformed flag/env JSON is reported via onError and skipped, so a
+ * typo can never wedge the share — it falls back to the next source (and
+ * ultimately to STUN-only, today's behaviour). Pure w.r.t. the sources.
+ */
+export function resolveIceServers(sources: IceServersSources): readonly RTCIceServer[] {
+  const jsonSources: ReadonlyArray<readonly [string, string | undefined]> = [
+    ['--ice-servers', sources.flag],
+    [ICE_SERVERS_ENV, sources.env],
+  ];
+  for (const [label, raw] of jsonSources) {
+    if (typeof raw !== 'string' || raw.trim().length === 0) continue;
+    const parsed = parseIceServersJson(raw);
+    if (parsed) return parsed;
+    sources.onError?.(
+      `${label}: malformed ICE servers JSON — expected an array like ` +
+        `[{"urls":"turn:host:3478","username":"user","credential":"pass"}]; ignoring it`,
+    );
+  }
+  const fromFile = sources.file?.iceServers;
+  if (fromFile !== undefined && fromFile.length > 0) return fromFile;
+  return DEFAULT_ICE_SERVERS;
+}
+
+/** Convenience for the CLI: resolve from real flag/env/config-file inputs. */
+export function resolveIceServersConfig(
+  flag?: string,
+  onError?: (message: string) => void,
+): readonly RTCIceServer[] {
+  return resolveIceServers({ flag, env: process.env[ICE_SERVERS_ENV], file: readConfigFile(), onError });
 }
 
 /** Sources {@link resolveTunnelConfig} consults, in precedence order. */

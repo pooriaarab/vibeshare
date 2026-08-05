@@ -18,7 +18,9 @@
  *     created; the first secret presented for a share is bound durably and
  *     later host connections must match (viewers never see it);
  *   - the relay is a whitelist: rtc-offer / rtc-answer / rtc-ice (point-to-point
- *     handshake) plus presence / hello / chat / annotation / join-request /
+ *     handshake) plus rtc-ice-servers (host→viewer ONLY: the host's STUN/TURN
+ *     bootstrap, relayed verbatim — the Worker never inspects creds) plus
+ *     presence / hello / chat / annotation / join-request /
  *     role-update (multi-party hub frames). Chat + annotation TEXT is
  *     end-to-end ciphertext — the Worker never decrypts it. Sender identity on
  *     chat/annotation/join-request is STAMPED from the connection attachment;
@@ -71,6 +73,9 @@ const SHARE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 /** Relay frames larger than this are dropped (SDPs are a few KB). */
 const MAX_FRAME_BYTES = 32 * 1024;
+
+/** Cap on relayed ICE server entries (a STUN/TURN bootstrap list is tiny). */
+const MAX_ICE_SERVERS = 8;
 
 const PAGE_HEADERS: Record<string, string> = {
   'content-type': 'text/html; charset=utf-8',
@@ -343,6 +348,18 @@ export class ShareRoom implements DurableObject {
       viewer.send(JSON.stringify({ kind: 'rtc-offer', shareId: att.shareId, viewerId, sdp: msg['sdp'] }));
       return;
     }
+    if (
+      msg['kind'] === 'rtc-ice-servers' &&
+      Array.isArray(msg['iceServers']) &&
+      msg['iceServers'].length <= MAX_ICE_SERVERS
+    ) {
+      // Host → viewer ONLY: the host's STUN/TURN bootstrap (BYO TURN). Relayed
+      // verbatim apart from identity stamping — the Worker never inspects creds.
+      viewer.send(
+        JSON.stringify({ kind: 'rtc-ice-servers', shareId: att.shareId, viewerId, iceServers: msg['iceServers'] }),
+      );
+      return;
+    }
     if (msg['kind'] === 'rtc-ice' && typeof msg['candidate'] === 'string' && typeof msg['mid'] === 'string') {
       viewer.send(
         JSON.stringify({
@@ -366,6 +383,10 @@ export class ShareRoom implements DurableObject {
     msg: Record<string, unknown>,
   ): void {
     if (this.handlePresenceChat(ws, att, msg, viewerId)) return;
+
+    // rtc-ice-servers is host→viewer ONLY (TURN creds are the host's own) —
+    // a viewer-sent copy is rejected outright, never relayed.
+    if (msg['kind'] === 'rtc-ice-servers') return;
 
     const host = this.hostSocket();
     if (!host) return;

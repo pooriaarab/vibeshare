@@ -305,6 +305,9 @@ ${XTERM_BOOT_JS}
     var myViewerId = null;
     var remoteDescSet = false;
     var iceQueue = [];
+    // Host-provided STUN/TURN list (rtc-ice-servers, sent before the offer).
+    // Null until it arrives — startPeer falls back to the default STUN then.
+    var iceServers = null;
     var lastEntrySeq = 0;
     var termApi = null;
 
@@ -352,9 +355,35 @@ ${XTERM_BOOT_JS}
       }).catch(function(){ /* GCM auth failure — drop */ });
     }
 
+    // The host's ICE config (its own STUN/TURN, creds included) applies only
+    // if it lands before the peer connection exists; sanitize before use.
+    function onIceServers(list){
+      if(pc || closed || !Array.isArray(list) || list.length === 0) return;
+      var clean = [];
+      for(var i = 0; i < list.length; i++){
+        var s = list[i];
+        if(!s || typeof s !== "object") continue;
+        var urls = null;
+        if(typeof s.urls === "string" && s.urls) urls = s.urls;
+        else if(Array.isArray(s.urls)){
+          urls = [];
+          for(var j = 0; j < s.urls.length; j++){
+            if(typeof s.urls[j] === "string" && s.urls[j]) urls.push(s.urls[j]);
+          }
+          if(urls.length === 0) urls = null;
+        }
+        if(!urls) continue;
+        var entry = { urls: urls };
+        if(typeof s.username === "string" && s.username) entry.username = s.username;
+        if(typeof s.credential === "string" && s.credential) entry.credential = s.credential;
+        clean.push(entry);
+      }
+      if(clean.length > 0) iceServers = clean;
+    }
+
     function startPeer(){
       if(pc || closed) return;
-      pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      pc = new RTCPeerConnection({ iceServers: iceServers || [{ urls: "stun:stun.l.google.com:19302" }] });
       pc.onicecandidate = function(ev){
         if(ev.candidate) send({ kind: "rtc-ice", candidate: ev.candidate.candidate, mid: ev.candidate.sdpMid || "0" });
       };
@@ -417,8 +446,12 @@ ${XTERM_BOOT_JS}
         if(!msg || typeof msg.kind !== "string") return;
         if(msg.kind === "assigned"){
           myViewerId = msg.viewerId;
-          startPeer();
+          // No startPeer() yet: the pc is created lazily on the first offer so
+          // the host's rtc-ice-servers frame (sent just before it) is applied.
+        } else if(msg.kind === "rtc-ice-servers"){
+          onIceServers(msg.iceServers);
         } else if(msg.kind === "rtc-offer"){
+          startPeer();
           onOffer(msg.sdp);
         } else if(msg.kind === "rtc-ice"){
           onRemoteIce(msg.candidate, msg.mid);
@@ -427,7 +460,6 @@ ${XTERM_BOOT_JS}
       };
       ws.onopen = function(){
         send({ kind: "hello", name: "grid" });
-        if(myViewerId) startPeer();
         if(hooks.onStatus) hooks.onStatus("connecting", "CONNECTING");
       };
       ws.onclose = function(ev){

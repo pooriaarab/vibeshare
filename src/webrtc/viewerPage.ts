@@ -271,6 +271,9 @@ ${XTERM_BOOT_JS}
   var pc = null, dc = null, key = null;
   var remoteDescSet = false;
   var iceQueue = [];
+  // Host-provided STUN/TURN list (rtc-ice-servers, sent before the offer).
+  // Null until it arrives — startPeer falls back to the default STUN then.
+  var iceServers = null;
   var inputSeq = 0;      // per-peer monotonic, inside the encrypted payload
   var pendingHello = null;
 
@@ -457,6 +460,8 @@ ${XTERM_BOOT_JS}
     if(msg.kind === "assigned"){
       myViewerId = msg.viewerId;
       if(joined) startPeer();
+    } else if(msg.kind === "rtc-ice-servers"){
+      onIceServers(msg.iceServers);
     } else if(msg.kind === "rtc-offer"){
       onOffer(msg.sdp);
     } else if(msg.kind === "rtc-ice"){
@@ -534,9 +539,35 @@ ${XTERM_BOOT_JS}
     send({ kind: "join-request" });
   });
 
+  // The host's ICE config (its own STUN/TURN, creds included) applies only if
+  // it lands before the peer connection exists; sanitize before trusting it.
+  function onIceServers(list){
+    if(pc || !Array.isArray(list) || list.length === 0) return;
+    var clean = [];
+    for(var i = 0; i < list.length; i++){
+      var s = list[i];
+      if(!s || typeof s !== "object") continue;
+      var urls = null;
+      if(typeof s.urls === "string" && s.urls) urls = s.urls;
+      else if(Array.isArray(s.urls)){
+        urls = [];
+        for(var j = 0; j < s.urls.length; j++){
+          if(typeof s.urls[j] === "string" && s.urls[j]) urls.push(s.urls[j]);
+        }
+        if(urls.length === 0) urls = null;
+      }
+      if(!urls) continue;
+      var entry = { urls: urls };
+      if(typeof s.username === "string" && s.username) entry.username = s.username;
+      if(typeof s.credential === "string" && s.credential) entry.credential = s.credential;
+      clean.push(entry);
+    }
+    if(clean.length > 0) iceServers = clean;
+  }
+
   function startPeer(){
     if(pc) return;
-    pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    pc = new RTCPeerConnection({ iceServers: iceServers || [{ urls: "stun:stun.l.google.com:19302" }] });
     pc.onicecandidate = function(ev){
       if(ev.candidate) send({ kind: "rtc-ice", candidate: ev.candidate.candidate, mid: ev.candidate.sdpMid || "0" });
     };
