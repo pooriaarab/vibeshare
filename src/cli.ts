@@ -50,7 +50,7 @@ import {
   writeActiveShare,
   type ActiveShareRecord,
 } from './consent.js';
-import { resolveSignaling, resolveTunnel } from './config.js';
+import { resolveIceServersConfig, resolveSignaling, resolveTunnel } from './config.js';
 import { HostControlServer } from './hostControl.js';
 import { LocalHttpTransport } from './localHttp.js';
 import { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare } from './manager.js';
@@ -62,13 +62,6 @@ import { WebRtcTransport } from './webrtc/transport.js';
 import { WsSignaling } from './webrtc/wsSignaling.js';
 import { createTranscriptCaptureSource } from './transcript/source.js';
 import type { TranscriptAgent } from './transcript/types.js';
-
-/**
- * ICE server used for `--public` shares (and baked into the viewer page).
- * Needed for NAT traversal across the internet; local/LAN peers work without
- * it. Loopback tests pass `iceServers: []` and never touch it.
- */
-const DEFAULT_STUN_SERVER = 'stun:stun.l.google.com:19302';
 
 // ---------------------------------------------------------------- parsing
 
@@ -93,6 +86,8 @@ export interface ShareFlags {
   tunnel: boolean | string;
   /** `--signaling <url>` override for the rendezvous (see src/config.ts). */
   signaling?: string;
+  /** `--ice-servers '<json>'` — STUN/TURN list for --public (see src/config.ts). */
+  iceServers?: string;
   /** Feed backlog capacity override (trace shares raise it to keep full history). */
   feedCapacity?: number;
   /**
@@ -165,6 +160,11 @@ options:
                     BYO accounts in ~/.vibeshare/config.json under "tunnel".
   --signaling <url> signaling rendezvous for --public (default wss://getvibe.dev/vibeshare;
                     also VIBESHARE_SIGNALING or ~/.vibeshare/config.json signalingUrl)
+  --ice-servers <json>
+                    STUN/TURN servers for --public as a JSON array, e.g.
+                    '[{"urls":"turn:host:3478","username":"u","credential":"p"}]'
+                    (also VIBESHARE_ICE_SERVERS or ~/.vibeshare/config.json
+                    iceServers; default: Google STUN only)
   --port <n>        port to serve on (default: random; local shares only)
   --host <addr>     bind address (default: 127.0.0.1; 0.0.0.0 shares on LAN; local only)
   --name <label>    what to call the session
@@ -233,6 +233,7 @@ function parseShareFlags(
         opts.tunnel = true;
       }
     } else if (a === '--signaling') opts.signaling = value(a);
+    else if (a === '--ice-servers') opts.iceServers = value(a);
     else if (a === '--expire' || a === '--expiry') opts.expiry = value(a);
     else if (a === '--pass') opts.passphrase = value(a);
     else if (a === '--port') {
@@ -590,7 +591,9 @@ async function mintShareRuntime(
     });
     transport = new WebRtcTransport({
       signaling: publicSignaling,
-      iceServers: [DEFAULT_STUN_SERVER],
+      // flag > env > config file > default Google STUN; TURN is opt-in. The
+      // list is relayed to each viewer so BYO TURN applies at both ends.
+      iceServers: resolveIceServersConfig(options.iceServers, (m) => io.err(`[vibeshare] ${m}`)),
       // The viewer page is served by the rendezvous itself at /vibeshare/s/<id>
       // — the share URL is the ws endpoint with an http(s) scheme.
       baseUrl: signalingUrl.replace(/^ws/, 'http'),

@@ -20,6 +20,8 @@
  * one test process.
  */
 
+import type { RTCIceServer } from '../config.js';
+
 /** Which end of a share/viewer pair a signaling participant sits on. */
 export type SignalingSide = 'host' | 'viewer';
 
@@ -49,7 +51,21 @@ export interface RtcIceFrame {
   readonly from: SignalingSide;
 }
 
-export type SignalingFrame = RtcOfferFrame | RtcAnswerFrame | RtcIceFrame;
+/**
+ * Host → viewer ONLY: the host's ICE server list (STUN/TURN, credentials
+ * included), sent right after a viewer is announced and BEFORE the offer, so
+ * the viewer builds its RTCPeerConnection with the same TURN config — BYO
+ * TURN on the host just works for browser viewers. A viewer that never
+ * receives this frame falls back to its built-in STUN default.
+ */
+export interface RtcIceServersFrame {
+  readonly kind: 'rtc-ice-servers';
+  readonly shareId: string;
+  readonly viewerId: string;
+  readonly iceServers: readonly RTCIceServer[];
+}
+
+export type SignalingFrame = RtcOfferFrame | RtcAnswerFrame | RtcIceFrame | RtcIceServersFrame;
 
 /**
  * A rendezvous for WebRTC handshakes. Delivery is point-to-point per
@@ -147,5 +163,5 @@ function pairKey(shareId: string, viewerId: string): string {
 
 function senderSide(frame: SignalingFrame): SignalingSide {
   if (frame.kind === 'rtc-ice') return frame.from;
-  return frame.kind === 'rtc-offer' ? 'host' : 'viewer';
+  return frame.kind === 'rtc-answer' ? 'viewer' : 'host';
 }

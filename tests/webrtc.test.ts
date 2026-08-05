@@ -189,6 +189,49 @@ describe('WebRtcTransport (real node-datachannel peers over loopback)', () => {
     feed.close();
   });
 
+  it('publishes rtc-ice-servers (the host ICE config) before the offer', async () => {
+    // .invalid hostnames: never resolved — the wire frame is what matters here.
+    transport = new WebRtcTransport({
+      signaling,
+      iceServers: [
+        'stun:stun.l.google.com:19302', // legacy string form passes through
+        { urls: 'turn:turn.invalid:3478', username: 'u', credential: 'p' },
+        'turn:u2:p2@turn2.invalid:3478?transport=tcp', // embedded-credential string
+      ],
+    });
+
+    const share = makeShare();
+    const feed = new SessionFeed();
+    const viewers = new ViewerRegistry(() => share.access);
+    await transport.serve(share, feed, viewers);
+
+    const kinds: string[] = [];
+    let wireServers: unknown;
+    const offerSeen = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out: ${kinds.join(',')}`)), 8000);
+      signaling.subscribe(share.id, 'viewer-ice', 'viewer', (frame) => {
+        kinds.push(frame.kind);
+        if (frame.kind === 'rtc-ice-servers') wireServers = frame.iceServers;
+        if (frame.kind === 'rtc-offer') {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      signaling.announceViewer(share.id, 'viewer-ice');
+    });
+    await offerSeen;
+
+    expect(kinds[0]).toBe('rtc-ice-servers');
+    expect(kinds).toContain('rtc-offer');
+    expect(wireServers).toEqual([
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'turn:turn.invalid:3478', username: 'u', credential: 'p' },
+      // Embedded creds move out of the URL (browsers reject them inside urls).
+      { urls: 'turn:turn2.invalid:3478?transport=tcp', username: 'u2', credential: 'p2' },
+    ]);
+    feed.close();
+  });
+
   it('paces a large backlog: delivers every entry in order without flooding the channel', async () => {
     // A transcript backlog is far bigger than a live-terminal window. Before
     // flow control, blasting it at open overflowed the DataChannel and stalled

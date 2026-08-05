@@ -69,6 +69,34 @@ Opening the URL shows a self-contained spectator page (no install for viewers) s
 
 Read-only is real: there is no route that lets a viewer write — the host is the server of record, and promotion to collaborator goes only through a host-approved request (`ViewerRegistry.canWrite()` is the single gate).
 
+## Reliable connectivity (TURN)
+
+`--public` shares are peer-to-peer with **STUN only** by default (free, no infra) — that works across most NATs. If viewers sit behind symmetric NATs or isolated networks and get stuck on "waiting for host", add a **TURN relay**: ICE config is set on the host and automatically propagated to viewers over signaling, so both ends use it.
+
+Precedence, highest first:
+
+1. `--ice-servers '<json>'` CLI flag — a JSON array of RTCIceServer objects
+2. `VIBESHARE_ICE_SERVERS` env var (same JSON)
+3. `~/.vibeshare/config.json` → `"iceServers"` key
+4. default: `[{ "urls": "stun:stun.l.google.com:19302" }]` (STUN only)
+
+```jsonc
+// ~/.vibeshare/config.json — self-hosted coturn, or a provider
+// (metered.ca, Twilio, Cloudflare Calls TURN, …)
+{
+  "iceServers": [
+    { "urls": "stun:stun.l.google.com:19302" },
+    {
+      "urls": "turn:turn.example.com:3478",
+      "username": "vibeshare",
+      "credential": "long-lived-or-temporary-secret"
+    }
+  ]
+}
+```
+
+The credentials are the host's own (short-lived tokens by convention); they travel over the signaling channel to viewers so the browser can reach the relay. Malformed flag/env JSON is reported and skipped — resolution falls through to the next source, never breaking the share.
+
 ## npm library
 
 ```ts
