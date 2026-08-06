@@ -20,6 +20,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { PeerConnection, type DataChannel } from 'node-datachannel';
+import type { RTCIceServer } from '../config.js';
 
 /**
  * Backlog flow control. A transcript (or long session) backlog can be many MB;
@@ -59,10 +60,15 @@ export interface WebRtcTransportOptions {
   /** The rendezvous used for the offer/answer/ICE handshake. */
   readonly signaling: SignalingChannel;
   /**
-   * STUN/TURN servers for ICE. Default `[]` — host candidates only, which
-   * is enough for loopback/LAN peers and keeps tests fully local.
+   * STUN/TURN servers for ICE. Accepts the browser `RTCIceServer` shape
+   * (`{ urls, username?, credential? }`); plain URL strings pass through
+   * untouched. TURN objects are mapped to the `turn:user:pass@host:port`
+   * string form node-datachannel accepts. The list is also relayed to each
+   * viewer (rtc-ice-servers frame) so browser peers use the same servers.
+   * Default `[]` — host candidates only, which is enough for loopback/LAN
+   * peers and keeps tests fully local.
    */
-  readonly iceServers?: string[];
+  readonly iceServers?: readonly (string | RTCIceServer)[];
   /** Base URL for share links. Default `https://getvibe.dev/vibeshare`. */
   readonly baseUrl?: string;
   /**
@@ -105,7 +111,7 @@ export class WebRtcTransport implements ShareTransport {
   readonly kind = 'webrtc';
 
   readonly #signaling: SignalingChannel;
-  readonly #iceServers: string[];
+  readonly #iceServers: readonly (string | RTCIceServer)[];
   readonly #baseUrl: string;
   readonly #onInput: ((shareId: string, viewerId: string, data: string) => void) | undefined;
   readonly #shares = new Map<string, ShareContext>();
@@ -184,7 +190,17 @@ export class WebRtcTransport implements ShareTransport {
     if (!this.#shares.has(ctx.share.id)) return; // unserved in the meantime
     if (ctx.peers.has(viewerId)) return; // duplicate announce
 
-    const pc = new PeerConnection(`vibeshare-${ctx.share.id}`, { iceServers: this.#iceServers });
+    // Tell the viewer which ICE servers to use BEFORE the offer goes out, so
+    // a BYO TURN config on the host applies on the browser side too. A viewer
+    // that never receives this frame keeps its built-in STUN default.
+    this.#signaling.publish({
+      kind: 'rtc-ice-servers',
+      shareId: ctx.share.id,
+      viewerId,
+      iceServers: iceServersForWire(this.#iceServers),
+    });
+
+    const pc = new PeerConnection(`vibeshare-${ctx.share.id}`, { iceServers: toNodeIceServers(this.#iceServers) });
 
     // Wiring order matters with a synchronous signaling channel:
     //  1. libdatachannel will not queue remote candidates that arrive
@@ -399,4 +415,57 @@ export class WebRtcTransport implements ShareTransport {
     if (!ctx.viewers.canWrite(viewerId)) return; // spectator — drop silently
     this.#onInput?.(ctx.share.id, viewerId, data);
   }
+}
+
+/**
+ * Map host ICE config to the string form node-datachannel accepts
+ * (`stun:host:port` / `turn:user:pass@host:port?transport=tcp` — verified
+ * against node-datachannel 0.32.x, which rejects the browser object shape).
+ * Plain string entries pass through untouched; TURN objects get
+ * `username`/`credential` embedded into each `turn:`/`turns:` URL.
+ */
+function toNodeIceServers(servers: readonly (string | RTCIceServer)[]): string[] {
+  const out: string[] = [];
+  for (const server of servers) {
+    if (typeof server === 'string') {
+      out.push(server);
+      continue;
+    }
+    const urls = typeof server.urls === 'string' ? [server.urls] : server.urls;
+    for (const url of urls) out.push(embedTurnCredentials(url, server.username, server.credential));
+  }
+  return out;
+}
+
+/** Insert `user[:pass]@` into a TURN URL; non-TURN URLs pass through. */
+function embedTurnCredentials(url: string, username?: string, credential?: string): string {
+  if (username === undefined || username.length === 0) return url;
+  if (url.includes('@')) return url; // already carries credentials
+  const m = /^(turns?:)(\/\/)?(.*)$/.exec(url);
+  if (!m) return url; // not a TURN URL — credentials don't apply
+  const [, scheme = '', slashes = '', rest = ''] = m;
+  const cred = credential !== undefined && credential.length > 0 ? `${username}:${credential}` : username;
+  return `${scheme}${slashes}${cred}@${rest}`;
+}
+
+/**
+ * Wire form for the rtc-ice-servers frame: every entry becomes an
+ * RTCIceServer object. A string entry becomes `{ urls }` — except a TURN URL
+ * with embedded credentials (`turn:user:pass@host:port`), which browsers
+ * reject inside `urls`; those are split into username/credential fields.
+ */
+function iceServersForWire(servers: readonly (string | RTCIceServer)[]): RTCIceServer[] {
+  return servers.map((s) => (typeof s === 'string' ? serverStringForWire(s) : s));
+}
+
+function serverStringForWire(url: string): RTCIceServer {
+  const m = /^(turns?:)(\/\/)?([^:/@]+):([^@]*)@(.*)$/.exec(url);
+  if (!m) return { urls: url };
+  const [, scheme = '', slashes = '', username = '', credential = '', rest = ''] = m;
+  const server: { urls: string; username: string; credential?: string } = {
+    urls: `${scheme}${slashes}${rest}`,
+    username,
+  };
+  if (credential.length > 0) server.credential = credential;
+  return server;
 }

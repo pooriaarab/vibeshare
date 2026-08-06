@@ -27,17 +27,25 @@ import type { CreateShareOptions } from './types.js';
 
 export { FileConsentStore, loadLedger, vibeHome } from './consent.js';
 export {
+  DEFAULT_ICE_SERVERS,
   DEFAULT_SIGNALING_URL,
+  ICE_SERVERS_ENV,
   SIGNALING_ENV,
   TUNNEL_PROVIDER_ENV,
   NGROK_AUTHTOKEN_ENV,
   FRP_SERVER_ADDR_ENV,
+  parseIceServersJson,
   readConfigFile,
+  resolveIceServers,
+  resolveIceServersConfig,
   resolveSignaling,
   resolveSignalingUrl,
   resolveTunnel,
   resolveTunnelConfig,
+  sanitizeIceServers,
+  type IceServersSources,
   type ResolvedTunnel,
+  type RTCIceServer,
   type SignalingSources,
   type TunnelAccountConfig,
   type TunnelConfig,
@@ -50,7 +58,7 @@ export { ConsentRequiredError, ShareManager, SHARE_SCOPE, type CreatedShare, typ
 export { ViewerRegistry } from './registry.js';
 export { SPECTATOR_CSS, spectatorPage, type SpectatorPageOptions } from './spectatorPage.js';
 export { XTERM_BOOT_JS, xtermPageStyles, xtermScriptTags } from './xtermClient.js';
-export type { SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
+export type { RtcIceServersFrame, SignalingChannel, SignalingFrame, SignalingSide } from './webrtc/signaling.js';
 export { LoopbackSignaling } from './webrtc/signaling.js';
 export {
   createTunnelRegistry,

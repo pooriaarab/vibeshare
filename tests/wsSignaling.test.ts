@@ -14,8 +14,8 @@ import { WsSignaling } from '../src/webrtc/wsSignaling.js';
  * WsSignaling end-to-end, against a mock rendezvous that mirrors the Cloudflare
  * Worker protocol (worker/src/index.ts) 1:1 — same routes, same TOFU host-secret
  * binding, server-minted viewerIds, connection-stamped relay frames, and the
- * same rtc-offer/rtc-answer/rtc-ice whitelist. The real Worker is verified
- * separately with `wrangler dev`.
+ * same rtc-offer/rtc-answer/rtc-ice/rtc-ice-servers whitelist. The real Worker
+ * is verified separately with `wrangler dev`.
  */
 
 // ------------------------------------------------------------ mock rendezvous
@@ -145,6 +145,23 @@ class MockRendezvous {
       );
       return;
     }
+    // Mirror worker: host→viewer ONLY, ≤8 entries, relayed verbatim.
+    if (
+      msg['kind'] === 'rtc-ice-servers' &&
+      typeof msg['viewerId'] === 'string' &&
+      Array.isArray(msg['iceServers']) &&
+      msg['iceServers'].length <= 8
+    ) {
+      room.viewers.get(msg['viewerId'])?.ws.send(
+        JSON.stringify({
+          kind: 'rtc-ice-servers',
+          shareId,
+          viewerId: msg['viewerId'],
+          iceServers: msg['iceServers'],
+        }),
+      );
+      return;
+    }
     if (
       msg['kind'] === 'rtc-ice' &&
       typeof msg['viewerId'] === 'string' &&
@@ -170,6 +187,9 @@ class MockRendezvous {
     if (!msg) return;
     if (this.#handlePresenceChat(room, att, msg)) return;
     const viewerId = att.viewerId!;
+    // rtc-ice-servers is host→viewer ONLY — a viewer-sent copy is rejected
+    // (mirror worker/src/index.ts relayFromViewer).
+    if (msg['kind'] === 'rtc-ice-servers') return;
     // Stamped with the CONNECTION's own (shareId, viewerId) — client-supplied
     // identity fields are ignored, so a viewer cannot impersonate anyone.
     if (msg['kind'] === 'rtc-answer' && typeof msg['sdp'] === 'string') {
@@ -591,6 +611,10 @@ describe('WsSignaling over a mock rendezvous', () => {
     viewer.ws.send(JSON.stringify({ kind: 'rtc-data', shareId, viewerId, payload: 'session bytes' }));
     viewer.ws.send(JSON.stringify({ kind: 'key', shareId, viewerId, key: 'AES KEY MATERIAL' }));
     viewer.ws.send(JSON.stringify({ kind: 'rtc-offer', sdp: 'viewer may not offer' }));
+    // A viewer may NOT push ICE servers (that frame is host→viewer only).
+    viewer.ws.send(
+      JSON.stringify({ kind: 'rtc-ice-servers', iceServers: [{ urls: 'turn:evil.example.com:3478', username: 'x', credential: 'y' }] }),
+    );
     viewer.ws.send('not even json');
     // …and the host trying to answer (wrong direction) or inject a key.
     host.ws.send(JSON.stringify({ kind: 'rtc-answer', viewerId, sdp: 'host may not answer' }));
@@ -610,6 +634,65 @@ describe('WsSignaling over a mock rendezvous', () => {
     const viewerExtra = viewer.msgs.filter((m) => !allowed.has(String(m['kind'])));
     expect(hostExtra).toEqual([]);
     expect(viewerExtra).toEqual([]);
+  });
+
+  it('relays host rtc-ice-servers to the addressed viewer with iceServers intact', async () => {
+    const shareId = newShareId();
+    const host = rawClient(`${base}/ws/host?share=${shareId}&secret=${'d'.repeat(32)}`);
+    raws.push(host.ws);
+    await waitForMsg(host, 'host-ready');
+
+    const viewer = rawClient(`${base}/ws/viewer?share=${shareId}`);
+    raws.push(viewer.ws);
+    const assigned = await waitForMsg(viewer, 'assigned');
+    const viewerId = assigned['viewerId'] as string;
+    await waitForMsg(host, 'viewer-joined');
+
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
+    ];
+    host.ws.send(JSON.stringify({ kind: 'rtc-ice-servers', viewerId, iceServers }));
+
+    const frame = await waitForMsg(viewer, 'rtc-ice-servers');
+    expect(frame['shareId']).toBe(shareId); // connection-stamped, not payload
+    expect(frame['viewerId']).toBe(viewerId);
+    expect(frame['iceServers']).toEqual(iceServers); // verbatim, creds included
+  });
+
+  it('WebRtcTransport publishes rtc-ice-servers BEFORE the offer (TURN config lands first)', async () => {
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
+    ];
+    const hostSignaling = makeSignaling();
+    const transport = new WebRtcTransport({ signaling: hostSignaling, iceServers });
+    transports.push(transport);
+
+    const share = makeShare();
+    const feed = new SessionFeed();
+    const viewers = new ViewerRegistry(() => share.access);
+    await transport.serve(share, feed, viewers);
+
+    const viewerSignaling = makeSignaling();
+    const kinds: string[] = [];
+    const offerSeen = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out: ${kinds.join(',')}`)), 8000);
+      viewerSignaling.subscribe(share.id, 'v', 'viewer', (frame) => {
+        kinds.push(frame.kind);
+        if (frame.kind === 'rtc-ice-servers') {
+          expect(frame.iceServers).toEqual(iceServers);
+        }
+        if (frame.kind === 'rtc-offer') {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+    viewerSignaling.announceViewer(share.id, 'v');
+    await offerSeen;
+    expect(kinds[0]).toBe('rtc-ice-servers');
+    expect(kinds).toContain('rtc-offer');
   });
 
   it('stamps join-request from the connection and relays host role-update to that viewer', async () => {
