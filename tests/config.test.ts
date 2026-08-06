@@ -2,8 +2,11 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  DEFAULT_ICE_SERVERS,
   DEFAULT_SIGNALING_URL,
+  parseIceServersJson,
   readConfigFile,
+  resolveIceServers,
   resolveSignalingUrl,
   resolveTunnelConfig,
 } from '../src/config.js';
@@ -156,5 +159,115 @@ describe('resolveTunnelConfig', () => {
         processEnv: {},
       }).startOpts.hostname,
     ).toBe('share.example.com');
+  });
+});
+
+describe('parseIceServersJson', () => {
+  it('parses a JSON array of RTCIceServer objects (TURN creds included)', () => {
+    const json = JSON.stringify([
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: ['turn:turn.example.com:3478', 'turn:turn.example.com:3478?transport=tcp'], username: 'u', credential: 'p' },
+    ]);
+    expect(parseIceServersJson(json)).toEqual([
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: ['turn:turn.example.com:3478', 'turn:turn.example.com:3478?transport=tcp'], username: 'u', credential: 'p' },
+    ]);
+  });
+
+  it('returns null on malformed JSON, non-arrays, and lists with no valid entry', () => {
+    expect(parseIceServersJson('not json')).toBeNull();
+    expect(parseIceServersJson('{"urls":"stun:x"}')).toBeNull();
+    expect(parseIceServersJson('[]')).toBeNull();
+    expect(parseIceServersJson('[{"nourls":true}, 42, null]')).toBeNull();
+  });
+
+  it('drops invalid entries but keeps valid ones', () => {
+    expect(parseIceServersJson('[{"nourls":1}, {"urls":"stun:stun.example.com:19302"}]')).toEqual([
+      { urls: 'stun:stun.example.com:19302' },
+    ]);
+  });
+});
+
+describe('resolveIceServers', () => {
+  const turn = [{ urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' }];
+  const turnJson = JSON.stringify(turn);
+
+  it('defaults to STUN-only when nothing is configured (unchanged behaviour)', () => {
+    expect(resolveIceServers({})).toBe(DEFAULT_ICE_SERVERS);
+    expect(resolveIceServers({})).toEqual([{ urls: 'stun:stun.l.google.com:19302' }]);
+  });
+
+  it('precedence: --ice-servers flag > VIBESHARE_ICE_SERVERS env > config file > default', () => {
+    const file = { iceServers: [{ urls: 'stun:file.example.com:19302' }] };
+    const envJson = JSON.stringify([{ urls: 'stun:env.example.com:19302' }]);
+    expect(resolveIceServers({ file })).toEqual([{ urls: 'stun:file.example.com:19302' }]);
+    expect(resolveIceServers({ file, env: envJson })).toEqual([{ urls: 'stun:env.example.com:19302' }]);
+    expect(resolveIceServers({ file, env: envJson, flag: turnJson })).toEqual(turn);
+  });
+
+  it('treats blank flag/env values as unset', () => {
+    const file = { iceServers: [{ urls: 'stun:file.example.com:19302' }] };
+    expect(resolveIceServers({ flag: '  ', env: '', file })).toEqual([{ urls: 'stun:file.example.com:19302' }]);
+    expect(resolveIceServers({ flag: '', env: ' ', file: {} })).toBe(DEFAULT_ICE_SERVERS);
+  });
+
+  it('malformed flag JSON → clear error via onError, falls through to env/file/default', () => {
+    const errors: string[] = [];
+    const onError = (m: string): void => {
+      errors.push(m);
+    };
+    const file = { iceServers: turn };
+    // Malformed flag falls through to the config file…
+    expect(resolveIceServers({ flag: '{oops', file, onError })).toEqual(turn);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('--ice-servers');
+    // …and a malformed flag + no other source lands on the STUN default.
+    expect(resolveIceServers({ flag: '[{"broken":true}]', onError })).toBe(DEFAULT_ICE_SERVERS);
+    expect(errors).toHaveLength(2);
+    // Malformed env behaves the same way.
+    expect(resolveIceServers({ env: 'nope', onError })).toBe(DEFAULT_ICE_SERVERS);
+    expect(errors).toHaveLength(3);
+    expect(errors[2]).toContain('VIBESHARE_ICE_SERVERS');
+  });
+
+  it('an empty array from flag/env/file is treated as unset (falls back)', () => {
+    expect(resolveIceServers({ flag: '[]' })).toBe(DEFAULT_ICE_SERVERS);
+    expect(resolveIceServers({ env: '[]' })).toBe(DEFAULT_ICE_SERVERS);
+    expect(resolveIceServers({ file: { iceServers: [] } })).toBe(DEFAULT_ICE_SERVERS);
+  });
+});
+
+describe('readConfigFile iceServers', () => {
+  let home: ReturnType<typeof tempHome> | undefined;
+  afterEach(() => {
+    home?.cleanup();
+    home = undefined;
+  });
+
+  const write = (contents: string): string => {
+    home = tempHome();
+    const file = join(home.dir, 'config.json');
+    writeFileSync(file, contents);
+    return file;
+  };
+
+  it('parses a valid iceServers key (TURN example)', () => {
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'turn:turn.example.com:3478', username: 'vibeshare', credential: 'secret' },
+    ];
+    const file = write(JSON.stringify({ iceServers }));
+    expect(readConfigFile(file)).toEqual({ iceServers });
+  });
+
+  it('drops malformed entries; a fully-invalid key is treated as unset', () => {
+    const mixed = write(
+      JSON.stringify({ iceServers: [{ urls: '' }, { urls: ['stun:a.example.com:19302', ''] }, 'junk'] }),
+    );
+    expect(readConfigFile(mixed)).toEqual({ iceServers: [{ urls: ['stun:a.example.com:19302'] }] });
+
+    expect(readConfigFile(write('{"iceServers": "stun:not-an-array"}'))).toEqual({});
+    expect(readConfigFile(write('{"iceServers": []}'))).toEqual({});
+    expect(readConfigFile(write('{"iceServers": [{"urls": 42}]}'))).toEqual({});
   });
 });

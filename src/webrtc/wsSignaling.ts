@@ -24,10 +24,12 @@
  *   server → viewer: {kind:'assigned', viewerId}        (server-minted, unforgeable)
  *                    {kind:'rtc-offer', shareId, viewerId, sdp}
  *                    {kind:'rtc-ice', shareId, viewerId, candidate, mid, from:'host'}
+ *                    {kind:'rtc-ice-servers', shareId, viewerId, iceServers}   (host's STUN/TURN config)
  *                    {kind:'presence', viewers:[…]}
  *                    {kind:'chat', viewerId, name, role, text, ts}
  *   host → server:   {kind:'rtc-offer', viewerId, sdp}
  *                    {kind:'rtc-ice', viewerId, candidate, mid}
+ *                    {kind:'rtc-ice-servers', viewerId, iceServers}
  *                    {kind:'hello', name}
  *                    {kind:'chat', text}                (text = ciphertext)
  *   viewer → server: {kind:'rtc-answer', sdp}
@@ -52,6 +54,7 @@
 import { randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
 import type { AnnotationRelayFrame } from '../annotations.js';
+import { sanitizeIceServers } from '../config.js';
 import type {
   ChatRelayFrame,
   JoinRequestFrame,
@@ -266,6 +269,13 @@ export class WsSignaling implements SignalingChannel {
       case 'rtc-answer':
         this.#sendViewer(frame.shareId, frame.viewerId, { kind: 'rtc-answer', sdp: frame.sdp });
         return;
+      case 'rtc-ice-servers':
+        this.#sendHost(frame.shareId, {
+          kind: 'rtc-ice-servers',
+          viewerId: frame.viewerId,
+          iceServers: frame.iceServers,
+        });
+        return;
       case 'rtc-ice':
         if (frame.from === 'host') {
           this.#sendHost(frame.shareId, {
@@ -460,6 +470,12 @@ export class WsSignaling implements SignalingChannel {
           for (const h of conn.viewerSubs) h(frame);
           return;
         }
+        case 'rtc-ice-servers': {
+          const frame = asIceServers(msg);
+          if (!frame) return;
+          for (const h of conn.viewerSubs) h(frame);
+          return;
+        }
         case 'rtc-ice': {
           const frame = asIce(msg, 'host');
           if (!frame) return;
@@ -506,6 +522,18 @@ function asOffer(msg: Record<string, unknown>): SignalingFrame | null {
     return null;
   }
   return { kind: 'rtc-offer', shareId, viewerId, sdp };
+}
+
+function asIceServers(msg: Record<string, unknown>): SignalingFrame | null {
+  const { kind, shareId, viewerId } = msg;
+  if (kind !== 'rtc-ice-servers' || typeof shareId !== 'string' || typeof viewerId !== 'string') {
+    return null;
+  }
+  // Same validation as the config file: garbage entries drop out, and a list
+  // with nothing valid is treated as absent (the viewer keeps its default).
+  const iceServers = sanitizeIceServers(msg['iceServers']);
+  if (!iceServers) return null;
+  return { kind: 'rtc-ice-servers', shareId, viewerId, iceServers };
 }
 
 function asAnswer(msg: Record<string, unknown>): SignalingFrame | null {

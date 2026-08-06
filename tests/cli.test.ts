@@ -54,6 +54,17 @@ describe('parseArgv', () => {
     });
   });
 
+  it('parses --ice-servers as a raw JSON string (validated later by config resolution)', () => {
+    const json = '[{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]';
+    expect(parseArgv(['--public', '--ice-servers', json])).toMatchObject({
+      cmd: 'start',
+      options: { public: true, iceServers: json },
+    });
+    expect(parseArgv(['--ice-servers', json])).toMatchObject({ options: { iceServers: json } });
+    expect(parseArgv(['--public'])).not.toHaveProperty('options.iceServers');
+    expect(() => parseArgv(['--ice-servers'])).toThrow(CliUsageError);
+  });
+
   it('parses --tunnel (cascade) and --tunnel <name>', () => {
     expect(parseArgv(['--tunnel'])).toMatchObject({ cmd: 'start', options: { tunnel: true, public: false } });
     expect(parseArgv(['--tunnel', 'ngrok'])).toMatchObject({
