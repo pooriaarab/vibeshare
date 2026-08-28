@@ -76,6 +76,43 @@ export class HostControlServer {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
+  #handleViewers(params: URLSearchParams, res: ServerResponse): void {
+    const share = this.#must(params.get('share') ?? '');
+    sendJson(res, 200, {
+      viewers: share.viewers.list().map(publicViewer),
+      watching: share.viewers.count(),
+    });
+  }
+
+  async #handleViewerAction(
+    path: string,
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    const share = this.#must(typeof body['share'] === 'string' ? body['share'] : '');
+    const viewerId = typeof body['viewer'] === 'string' ? body['viewer'] : '';
+    const action = path.slice('/control/'.length) as 'approve' | 'deny' | 'kick';
+    const viewer = share.viewers[action](viewerId);
+    sendJson(res, 200, { viewer: publicViewer(viewer) });
+  }
+
+  async #handleStop(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    const shareId = typeof body['share'] === 'string' ? body['share'] : '';
+    this.#must(shareId);
+    sendJson(res, 200, { stopped: shareId });
+    this.#onStop?.(shareId);
+  }
+
   async #route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('cache-control', 'no-store');
@@ -87,32 +124,17 @@ export class HostControlServer {
     const path = url.pathname;
 
     if (path === '/control/viewers') {
-      const share = this.#must(url.searchParams.get('share') ?? '');
-      sendJson(res, 200, {
-        viewers: share.viewers.list().map(publicViewer),
-        watching: share.viewers.count(),
-      });
+      this.#handleViewers(url.searchParams, res);
       return;
     }
 
     if (path === '/control/approve' || path === '/control/deny' || path === '/control/kick') {
-      if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
-      const body = await readJsonBody(req);
-      const share = this.#must(typeof body['share'] === 'string' ? body['share'] : '');
-      const viewerId = typeof body['viewer'] === 'string' ? body['viewer'] : '';
-      const action = path.slice('/control/'.length) as 'approve' | 'deny' | 'kick';
-      const viewer = share.viewers[action](viewerId);
-      sendJson(res, 200, { viewer: publicViewer(viewer) });
+      await this.#handleViewerAction(path, req, res);
       return;
     }
 
     if (path === '/control/stop') {
-      if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
-      const body = await readJsonBody(req);
-      const shareId = typeof body['share'] === 'string' ? body['share'] : '';
-      this.#must(shareId);
-      sendJson(res, 200, { stopped: shareId });
-      this.#onStop?.(shareId);
+      await this.#handleStop(req, res);
       return;
     }
 

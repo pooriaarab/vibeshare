@@ -125,6 +125,19 @@ export function parseAnnotationSend(msg: Record<string, unknown>): AnnotationSen
  * payload is invalid (hub drops it). Client-supplied identity never reaches
  * this function — callers pass connection identity only.
  */
+function isValidStampId(id: string): boolean {
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_ANNOTATION_ID_LEN;
+}
+
+function parseStampText(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  if (text.length === 0 || text.length > MAX_ANNOTATION_CIPHERTEXT_LEN) return null;
+  // Reject obvious non-base64 so we don't fan out garbage (e2e wire format).
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(text)) return null;
+  return text;
+}
+
 export function stampAnnotation(opts: {
   readonly id: string;
   readonly viewerId: string;
@@ -135,16 +148,11 @@ export function stampAnnotation(opts: {
   readonly replyTo?: unknown;
   readonly ts?: number;
 }): AnnotationRelayFrame | null {
-  if (typeof opts.id !== 'string' || opts.id.length === 0 || opts.id.length > MAX_ANNOTATION_ID_LEN) {
-    return null;
-  }
+  if (!isValidStampId(opts.id)) return null;
   const seq = parseAnchorSeq(opts.seq);
   if (seq === null) return null;
-  if (typeof opts.text !== 'string') return null;
-  const text = opts.text.trim();
-  if (text.length === 0 || text.length > MAX_ANNOTATION_CIPHERTEXT_LEN) return null;
-  // Reject obvious non-base64 so we don't fan out garbage (e2e wire format).
-  if (!/^[A-Za-z0-9+/=_-]+$/.test(text)) return null;
+  const text = parseStampText(opts.text);
+  if (text === null) return null;
   const name =
     sanitizePresenceName(opts.name) || defaultPresenceName(opts.role, opts.viewerId);
   const replyTo = normalizeReplyTo(opts.replyTo);
@@ -161,26 +169,38 @@ export function stampAnnotation(opts: {
   };
 }
 
+function isValidAnnotationId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= MAX_ANNOTATION_ID_LEN;
+}
+
+function parseValidatedText(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const text = sanitizePeerText(raw, MAX_ANNOTATION_PLAINTEXT_LEN);
+  if (text.trim().length === 0) return null;
+  return text;
+}
+
+function parseCreatedAt(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+  return Date.now();
+}
+
+function parseAuthorName(raw: unknown, viewerId: string): string {
+  return sanitizePresenceName(raw) || defaultPresenceName('viewer', viewerId);
+}
+
 /** Validate a decrypted annotation for display/storage. Null when invalid. */
 export function validateAnnotation(raw: unknown): Annotation | null {
   if (typeof raw !== 'object' || raw === null) return null;
   const a = raw as Record<string, unknown>;
-  if (typeof a['id'] !== 'string' || a['id'].length === 0 || a['id'].length > MAX_ANNOTATION_ID_LEN) {
-    return null;
-  }
+  if (!isValidAnnotationId(a['id'])) return null;
   const seq = parseAnchorSeq(a['seq']);
   if (seq === null) return null;
   if (typeof a['authorViewerId'] !== 'string' || a['authorViewerId'].length === 0) return null;
-  if (typeof a['text'] !== 'string') return null;
-  const text = sanitizePeerText(a['text'], MAX_ANNOTATION_PLAINTEXT_LEN);
-  if (text.trim().length === 0) return null;
-  const authorName =
-    sanitizePresenceName(a['authorName']) ||
-    defaultPresenceName('viewer', a['authorViewerId']);
-  const createdAt =
-    typeof a['createdAt'] === 'number' && Number.isFinite(a['createdAt'])
-      ? a['createdAt']
-      : Date.now();
+  const text = parseValidatedText(a['text']);
+  if (text === null) return null;
+  const authorName = parseAuthorName(a['authorName'], a['authorViewerId']);
+  const createdAt = parseCreatedAt(a['createdAt']);
   const replyTo = normalizeReplyTo(a['replyTo']);
   return {
     id: a['id'],

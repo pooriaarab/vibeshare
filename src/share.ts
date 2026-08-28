@@ -138,23 +138,28 @@ function participantName(p: Participant, fallback: string): string {
   return p.name && p.name.length > 0 ? p.name : fallback;
 }
 
-export function createShare(options: ShareOptions): ShareHandle {
-  const relay = options.session;
-  const consent = options.consent ?? relay.consent;
-  if (!consent.allows(SHARE_SESSION_SCOPE)) {
-    throw new ConsentError();
+function buildViewer(
+  p: Participant,
+  gate: AccessGate,
+  noteSeen: (pid: string) => number,
+): Viewer {
+  const pid = p.id;
+  // Keep the gate's roster in sync with whoever is actually connected.
+  if (!gate.has(pid)) {
+    gate.admit({ id: pid, name: participantName(p, pid) });
   }
+  const role = gate.role(pid) ?? 'spectator';
+  return {
+    id: pid,
+    name: participantName(p, pid),
+    role,
+    joinedAt: noteSeen(pid),
+  };
+}
 
-  const id = newShareId();
-  const url = buildShareUrl(id);
-  const gate = createAccessGate({
-    arbiter: relay.arbiter,
-    access: options.access,
-    passphrase: options.passphrase,
-  });
-
+function createSeenTracker(): (pid: string) => number {
   const firstSeen = new Map<string, number>();
-  const noteSeen = (pid: string): number => {
+  return (pid: string): number => {
     let t = firstSeen.get(pid);
     if (t === undefined) {
       t = Date.now();
@@ -162,18 +167,46 @@ export function createShare(options: ShareOptions): ShareHandle {
     }
     return t;
   };
+}
 
-  let revoked = false;
-  let revokeReason: RevokeReason | undefined;
-  let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+function collectViewers(
+  relay: RelayHandle,
+  gate: AccessGate,
+  toViewer: (p: Participant) => Viewer,
+): ViewerRoster {
+  const connected: Viewer[] = [];
+  const pending: Viewer[] = [];
+  for (const p of relay.participants) {
+    if (isLocalHostParticipant(p)) continue; // host isn't a viewer
+    const v = toViewer(p);
+    // Pending = invite viewers who haven't been promoted to participant yet.
+    if (gate.access === 'invite' && v.role !== 'participant') {
+      pending.push(v);
+    } else {
+      connected.push(v);
+    }
+  }
+  return { viewers: connected, pending };
+}
 
-  const fireRevoke = (reason: RevokeReason): Promise<void> => {
-    if (revoked) return Promise.resolve();
-    revoked = true;
-    revokeReason = reason;
-    if (expiryTimer !== undefined) {
-      clearTimeout(expiryTimer);
-      expiryTimer = undefined;
+interface RevokeState {
+  revoked: boolean;
+  revokeReason: RevokeReason | undefined;
+  expiryTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+function makeRevoke(
+  state: RevokeState,
+  options: ShareOptions,
+  relay: RelayHandle,
+): (reason: RevokeReason) => Promise<void> {
+  return (reason: RevokeReason): Promise<void> => {
+    if (state.revoked) return Promise.resolve();
+    state.revoked = true;
+    state.revokeReason = reason;
+    if (state.expiryTimer !== undefined) {
+      clearTimeout(state.expiryTimer);
+      state.expiryTimer = undefined;
     }
     try {
       options.onRevoke?.(reason);
@@ -184,33 +217,38 @@ export function createShare(options: ShareOptions): ShareHandle {
       // best-effort: a relay that's already closed is fine
     });
   };
+}
 
-  const expiryMs = parseExpiry(options.expiry);
-  if (expiryMs !== null) {
-    expiryTimer = setTimeout(() => {
-      void fireRevoke('expired');
-    }, expiryMs);
-    // Don't keep the Node event loop alive solely for an expiry timer when the
-    // share is being driven by a long-lived host process anyway — but DO unref so
-    // tests / short-lived callers can exit cleanly.
-    expiryTimer.unref?.();
-  }
+function scheduleExpiryTimer(state: RevokeState, ms: number | null, onExpired: () => void): void {
+  if (ms === null) return;
+  const t = setTimeout(() => {
+    void onExpired();
+  }, ms);
+  // Don't keep the Node event loop alive solely for an expiry timer when the
+  // share is being driven by a long-lived host process anyway — but DO unref so
+  // tests / short-lived callers can exit cleanly.
+  t.unref?.();
+  state.expiryTimer = t;
+}
 
-  const toViewer = (p: Participant): Viewer => {
-    const pid = p.id;
-    // Keep the gate's roster in sync with whoever is actually connected.
-    if (!gate.has(pid)) {
-      gate.admit({ id: pid, name: participantName(p, pid) });
-    }
-    const role = gate.role(pid) ?? 'spectator';
-    return {
-      id: pid,
-      name: participantName(p, pid),
-      role,
-      joinedAt: noteSeen(pid),
-    };
-  };
-
+export function createShare(options: ShareOptions): ShareHandle {
+  const relay = options.session;
+  const consent = options.consent ?? relay.consent;
+  if (!consent.allows(SHARE_SESSION_SCOPE)) throw new ConsentError();
+  const id = newShareId();
+  const url = buildShareUrl(id);
+  const gate = createAccessGate({
+    arbiter: relay.arbiter,
+    access: options.access,
+    passphrase: options.passphrase,
+  });
+  const noteSeen = createSeenTracker();
+  const state: RevokeState = { revoked: false, revokeReason: undefined, expiryTimer: undefined };
+  const fireRevoke = makeRevoke(state, options, relay);
+  scheduleExpiryTimer(state, parseExpiry(options.expiry), () => {
+    void fireRevoke('expired');
+  });
+  const toViewer = (p: Participant): Viewer => buildViewer(p, gate, noteSeen);
   return {
     id,
     url,
@@ -218,22 +256,10 @@ export function createShare(options: ShareOptions): ShareHandle {
     gate,
     relayUrl: relay.url,
     get revoked() {
-      return revoked;
+      return state.revoked;
     },
     viewers() {
-      const connected: Viewer[] = [];
-      const pending: Viewer[] = [];
-      for (const p of relay.participants) {
-        if (isLocalHostParticipant(p)) continue; // host isn't a viewer
-        const v = toViewer(p);
-        // Pending = invite viewers who haven't been promoted to participant yet.
-        if (gate.access === 'invite' && v.role !== 'participant') {
-          pending.push(v);
-        } else {
-          connected.push(v);
-        }
-      }
-      return { viewers: connected, pending };
+      return collectViewers(relay, gate, toViewer);
     },
     approve(viewerId) {
       return gate.promote(viewerId);
@@ -242,7 +268,7 @@ export function createShare(options: ShareOptions): ShareHandle {
       gate.remove(viewerId);
     },
     revoke() {
-      return fireRevoke(revokeReason === 'expired' ? 'expired' : 'manual');
+      return fireRevoke(state.revokeReason === 'expired' ? 'expired' : 'manual');
     },
   };
 }

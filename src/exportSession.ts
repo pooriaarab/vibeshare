@@ -23,14 +23,7 @@ export interface AsciinemaCastHeader {
  */
 export type AsciinemaCastEvent = readonly [number, 'o' | 'i', string];
 
-/**
- * Serialize an asciinema v2 cast (JSON lines).
- * https://docs.asciinema.org/manual/asciicast/v2/
- */
-export function serializeAsciinemaCast(
-  header: AsciinemaCastHeader,
-  events: readonly AsciinemaCastEvent[] = [],
-): string {
+function validateCastHeader(header: AsciinemaCastHeader): void {
   if (header.version !== 2) {
     throw new Error(`unsupported asciinema cast version: ${String(header.version)}`);
   }
@@ -40,22 +33,44 @@ export function serializeAsciinemaCast(
   if (!Number.isFinite(header.height) || header.height < 1) {
     throw new Error('cast height must be a positive number');
   }
+}
+
+/** Validate one event and return the exact triple that gets serialized. */
+function validateCastEvent(ev: AsciinemaCastEvent): AsciinemaCastEvent {
+  if (!Array.isArray(ev) || ev.length !== 3) {
+    throw new Error('cast event must be [time, type, data]');
+  }
+  const [t, type, data] = ev;
+  if (!Number.isFinite(t) || t < 0) {
+    throw new Error('cast event time must be a non-negative number');
+  }
+  if (type !== 'o' && type !== 'i') {
+    throw new Error(`cast event type must be "o" or "i", got ${String(type)}`);
+  }
+  if (typeof data !== 'string') {
+    throw new Error('cast event data must be a string');
+  }
+  // Serialize the destructured triple, never `ev` itself: a caller-supplied
+  // array subclass or a `toJSON` on it would otherwise change the cast bytes.
+  return [t, type, data];
+}
+
+function serializeCastEvent(ev: AsciinemaCastEvent): string {
+  return JSON.stringify(validateCastEvent(ev));
+}
+
+/**
+ * Serialize an asciinema v2 cast (JSON lines).
+ * https://docs.asciinema.org/manual/asciicast/v2/
+ */
+export function serializeAsciinemaCast(
+  header: AsciinemaCastHeader,
+  events: readonly AsciinemaCastEvent[] = [],
+): string {
+  validateCastHeader(header);
   const lines: string[] = [JSON.stringify(header)];
   for (const ev of events) {
-    if (!Array.isArray(ev) || ev.length !== 3) {
-      throw new Error('cast event must be [time, type, data]');
-    }
-    const [t, type, data] = ev;
-    if (!Number.isFinite(t) || t < 0) {
-      throw new Error('cast event time must be a non-negative number');
-    }
-    if (type !== 'o' && type !== 'i') {
-      throw new Error(`cast event type must be "o" or "i", got ${String(type)}`);
-    }
-    if (typeof data !== 'string') {
-      throw new Error('cast event data must be a string');
-    }
-    lines.push(JSON.stringify([t, type, data]));
+    lines.push(serializeCastEvent(ev));
   }
   return lines.join('\n') + '\n';
 }
