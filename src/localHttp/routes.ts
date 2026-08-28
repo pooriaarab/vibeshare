@@ -75,6 +75,10 @@ async function handleRequestJoin(rCtx: RouteContext): Promise<void> {
   sendJson(res, 202, { status: 'pending' });
 }
 
+/**
+ * Identity from the viewer TOKEN — never from the body. canWrite is the single
+ * gate; spectate shares and unapproved invitees get 403.
+ */
 async function handleInput(rCtx: RouteContext): Promise<void> {
   const { req, res, ctx, onInput } = rCtx;
   if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
@@ -87,6 +91,7 @@ async function handleInput(rCtx: RouteContext): Promise<void> {
   }
   const data = typeof body['data'] === 'string' ? body['data'] : '';
   if (data.length === 0) return void sendJson(res, 400, { error: 'empty input' });
+  // Cap a single frame so a runaway client can't flood the PTY.
   const capped = data.length > 4096 ? data.slice(0, 4096) : data;
   onInput?.(ctx.share.id, viewer.id, capped);
   sendJson(res, 202, { ok: true });
@@ -110,6 +115,10 @@ interface ChatPayload {
   displayText: string;
 }
 
+/**
+ * Tunnel path: the client sent ciphertext; relay it opaque and decrypt only
+ * for the host terminal callback.
+ */
 function processE2eChat(
   e2eKey: Buffer,
   viewer: Viewer,
@@ -128,6 +137,7 @@ function processE2eChat(
   return { relayText: stamped.text, displayText };
 }
 
+/** Local plaintext path: sanitize and stamp; no share key on the URL. */
 function processPlainChat(
   viewer: Viewer,
   wireText: string,
@@ -161,6 +171,7 @@ function triggerChatCallback(
   });
 }
 
+/** Identity from the TOKEN / registry — never from the payload. */
 async function handleChat(rCtx: RouteContext): Promise<void> {
   const { req, res, ctx, e2eKey, onChat, broadcastChat } = rCtx;
   if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
@@ -186,6 +197,10 @@ interface E2eAnnotationOpts {
   readonly broadcastAnnotation: (frame: AnnotationRelayFrame) => void;
 }
 
+/**
+ * Tunnel path: the client sent ciphertext; relay it opaque and decrypt only
+ * for the host terminal callback.
+ */
 function processE2eAnnotation(opts: E2eAnnotationOpts): string {
   const { e2eKey, viewer, seq, wireText, replyTo, broadcastAnnotation } = opts;
   const stamped = stampAnnotation({
@@ -211,6 +226,7 @@ interface PlainAnnotationOpts {
   readonly broadcastAnnotation: (frame: AnnotationRelayFrame) => void;
 }
 
+/** Local plaintext path: sanitize and stamp; no share key on the URL. */
 function processPlainAnnotation(opts: PlainAnnotationOpts): string {
   const { viewer, seq, wireText, replyTo, broadcastAnnotation } = opts;
   const displayText = sanitizePeerText(wireText, MAX_ANNOTATION_PLAINTEXT_LEN).trim();
@@ -275,6 +291,11 @@ function parseAnnotateRequest(body: Record<string, unknown>): AnnotateRequest {
   };
 }
 
+/**
+ * A pinned comment anchored to a feed seq. Identity from the viewer TOKEN —
+ * never from the payload; id minted here; only seq (anchor) and replyTo
+ * (threading) pass through from the body.
+ */
 async function handleAnnotate(rCtx: RouteContext): Promise<void> {
   const { req, res, ctx, e2eKey, onAnnotation, broadcastAnnotation } = rCtx;
   if (req.method !== 'POST') return void sendJson(res, 405, { error: 'method not allowed' });
