@@ -35,6 +35,11 @@ interface ShareRoom {
 
 const MAX_FRAME_BYTES = 32 * 1024;
 
+/** True when `value` is neither null nor undefined — what a loose `!= null` meant. */
+function isSet<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
+}
+
 class MockRendezvous {
   readonly server: WebSocketServer;
   readonly rooms = new Map<string, ShareRoom>();
@@ -49,7 +54,10 @@ class MockRendezvous {
           const secret = url.searchParams.get('secret') ?? '';
           const room = this.rooms.get(share);
           // TOFU host-secret binding, same as the Worker's Durable Object.
-          if (secret.length < 16 || (room?.hostSecret != null && room.hostSecret !== secret)) {
+          // `bound` is undefined when the room is unknown and null before the first
+          // host binds, so both cases must fall through to the accept path.
+          const bound = room?.hostSecret;
+          if (secret.length < 16 || (isSet(bound) && bound !== secret)) {
             cb(false, 403, 'Forbidden');
             return;
           }
