@@ -42,7 +42,9 @@ export function iceServersForWire(servers: readonly (string | RTCIceServer)[]): 
 }
 
 export function serverStringForWire(url: string): RTCIceServer {
-  const m = /^(turns?:)(\/\/)?([^:/@]+):([^@]*)@(.*)$/.exec(url);
+  // The credential is optional: embedTurnCredentials emits `user@host` when it
+  // has a username but no credential, and that form has to split back out too.
+  const m = /^(turns?:)(\/\/)?([^:/@]+)(?::([^@]*))?@(.*)$/.exec(url);
   if (!m) return { urls: url };
   const [, scheme = '', slashes = '', username = '', credential = '', rest = ''] = m;
   const server: { urls: string; username: string; credential?: string } = {
