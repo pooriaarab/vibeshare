@@ -35,7 +35,8 @@ function validateCastHeader(header: AsciinemaCastHeader): void {
   }
 }
 
-function validateCastEvent(ev: AsciinemaCastEvent): void {
+/** Validate one event and return the exact triple that gets serialized. */
+function validateCastEvent(ev: AsciinemaCastEvent): AsciinemaCastEvent {
   if (!Array.isArray(ev) || ev.length !== 3) {
     throw new Error('cast event must be [time, type, data]');
   }
@@ -49,11 +50,13 @@ function validateCastEvent(ev: AsciinemaCastEvent): void {
   if (typeof data !== 'string') {
     throw new Error('cast event data must be a string');
   }
+  // Serialize the destructured triple, never `ev` itself: a caller-supplied
+  // array subclass or a `toJSON` on it would otherwise change the cast bytes.
+  return [t, type, data];
 }
 
 function serializeCastEvent(ev: AsciinemaCastEvent): string {
-  validateCastEvent(ev);
-  return JSON.stringify(ev);
+  return JSON.stringify(validateCastEvent(ev));
 }
 
 /**
