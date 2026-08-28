@@ -207,6 +207,73 @@ function asRunner(tmux: TmuxClient): TmuxRunner {
   };
 }
 
+/** Surface vibe-core CaptureError as AttachError so CLI messaging stays stable. */
+function mapCaptureError(err: unknown): never {
+  if (err instanceof CaptureError || (err instanceof Error && err.name === 'CaptureError')) {
+    const msg = err.message;
+    if (/tmux is not installed/i.test(msg)) {
+      throw new AttachError(
+        'tmux is not installed (or not on PATH).\n' +
+          '  `vibeshare attach` shares an already-running tmux pane.\n' +
+          '  Install tmux, or launch a new session wrapped instead:\n' +
+          '    vibeshare -- <cmd>',
+      );
+    }
+    throw new AttachError(msg);
+  }
+  throw err;
+}
+
+function createTmuxHandle(target: string, source: ReturnType<typeof tmuxCapture>): CaptureHandle {
+  let stopped = false;
+  return {
+    label: `tmux:${target}`,
+    writeInput: async (data: string) => {
+      if (stopped || data.length === 0) return;
+      await source.write(data);
+    },
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      await source.stop();
+    },
+  };
+}
+
+async function startTmuxSource(
+  target: string,
+  tmux: TmuxClient,
+  opts: AttachOptions,
+  feed: CaptureFeed,
+): Promise<CaptureHandle> {
+  const source = tmuxCapture(target, {
+    runner: asRunner(tmux),
+    ...(opts.sizePollMs !== undefined ? { sizePollMs: opts.sizePollMs } : {}),
+    ...(opts.tmpDir !== undefined ? { tmpDir: opts.tmpDir } : {}),
+  });
+  try {
+    await source.start(
+      (data) => {
+        try {
+          feed.publishRaw(data);
+        } catch {
+          // feed closed mid-stream
+        }
+      },
+      (cols, rows) => {
+        try {
+          feed.publishResize(cols, rows);
+        } catch {
+          // feed closed mid-stream
+        }
+      },
+    );
+  } catch (err) {
+    mapCaptureError(err);
+  }
+  return createTmuxHandle(target, source);
+}
+
 /**
  * Build a feed-facing CaptureSource that taps a tmux pane via vibe-core
  * `tmuxCapture`. Presents the vibeshare CaptureHandle shape (label +
@@ -217,67 +284,59 @@ export function createTmuxCaptureSource(opts: AttachOptions): CaptureSource {
     opts.tmux ??
     createProcessTmuxClient(opts.tmpDir !== undefined ? { tmpDir: opts.tmpDir } : {});
   const target = opts.target;
-
   return {
-    async start(feed: CaptureFeed): Promise<CaptureHandle> {
-      const source = tmuxCapture(target, {
-        runner: asRunner(tmux),
-        ...(opts.sizePollMs !== undefined ? { sizePollMs: opts.sizePollMs } : {}),
-        ...(opts.tmpDir !== undefined ? { tmpDir: opts.tmpDir } : {}),
-      });
-
-      try {
-        await source.start(
-          (data) => {
-            try {
-              feed.publishRaw(data);
-            } catch {
-              // feed closed mid-stream
-            }
-          },
-          (cols, rows) => {
-            try {
-              feed.publishResize(cols, rows);
-            } catch {
-              // feed closed mid-stream
-            }
-          },
-        );
-      } catch (err) {
-        // Surface vibe-core CaptureError as AttachError so CLI messaging stays stable.
-        if (err instanceof CaptureError || (err instanceof Error && err.name === 'CaptureError')) {
-          const msg = err.message;
-          if (/tmux is not installed/i.test(msg)) {
-            throw new AttachError(
-              'tmux is not installed (or not on PATH).\n' +
-                '  `vibeshare attach` shares an already-running tmux pane.\n' +
-                '  Install tmux, or launch a new session wrapped instead:\n' +
-                '    vibeshare -- <cmd>',
-            );
-          }
-          throw new AttachError(msg);
-        }
-        throw err;
-      }
-
-      let stopped = false;
-      return {
-        label: `tmux:${target}`,
-        writeInput: async (data: string) => {
-          if (stopped || data.length === 0) return;
-          await source.write(data);
-        },
-        stop: async () => {
-          if (stopped) return;
-          stopped = true;
-          await source.stop();
-        },
-      };
+    start(feed: CaptureFeed): Promise<CaptureHandle> {
+      return startTmuxSource(target, tmux, opts, feed);
     },
   };
 }
 
 // ---------------------------------------------------------------- target picker
+
+async function ensureTmuxAvailable(tmux: TmuxClient): Promise<void> {
+  if (await tmux.available()) return;
+  throw new AttachError(
+    'tmux is not installed (or not on PATH).\n' +
+      '  `vibeshare attach` shares an already-running tmux pane.\n' +
+      '  Install tmux, or launch a new session wrapped instead:\n' +
+      '    vibeshare -- <cmd>',
+  );
+}
+
+function throwNoPanes(): never {
+  throw new AttachError(
+    'no tmux panes found.\n' +
+      '  `vibeshare attach` needs an already-running tmux session.\n' +
+      '  Start one (`tmux new -s demo`), or launch wrapped:\n' +
+      '    vibeshare -- <cmd>',
+  );
+}
+
+function throwNonInteractive(list: string): never {
+  throw new AttachError(
+    'attach needs a target pane (non-interactive).\n' +
+      '  Usage: vibeshare attach <session:window.pane>\n' +
+      '  Available panes:\n' +
+      list,
+  );
+}
+
+async function promptForTarget(
+  list: string,
+  input: NodeJS.ReadableStream,
+  output: NodeJS.WritableStream,
+): Promise<string> {
+  output.write(`tmux panes:\n${list}\n`);
+  output.write('Pass one as: vibeshare attach <target>\n');
+  const rl = createInterface({ input, output });
+  try {
+    const answer = (await rl.question('target> ')).trim();
+    if (!answer) throw new AttachError('no target selected');
+    return answer;
+  } finally {
+    rl.close();
+  }
+}
 
 /**
  * Interactive / CLI helper: pick a target when the user didn't pass one.
@@ -297,52 +356,13 @@ export async function pickAttachTarget(
   const env = opts.env ?? process.env;
   const unsupported = detectUnsupportedMultiplexer(env);
   if (unsupported) throw new AttachError(unsupported);
-
-  if (!(await tmux.available())) {
-    throw new AttachError(
-      'tmux is not installed (or not on PATH).\n' +
-        '  `vibeshare attach` shares an already-running tmux pane.\n' +
-        '  Install tmux, or launch a new session wrapped instead:\n' +
-        '    vibeshare -- <cmd>',
-    );
-  }
-
+  await ensureTmuxAvailable(tmux);
   const resolved = resolveAttachTarget(explicit, env);
   if (resolved !== undefined) return resolved;
-
   const panes = await tmux.listPanes();
-  if (panes.length === 0) {
-    throw new AttachError(
-      'no tmux panes found.\n' +
-        '  `vibeshare attach` needs an already-running tmux session.\n' +
-        '  Start one (`tmux new -s demo`), or launch wrapped:\n' +
-        '    vibeshare -- <cmd>',
-    );
-  }
-
+  if (panes.length === 0) throwNoPanes();
   const list = formatPaneList(panes);
   const isTty = opts.isTty ?? Boolean(process.stdin.isTTY);
-  if (!isTty) {
-    throw new AttachError(
-      'attach needs a target pane (non-interactive).\n' +
-        '  Usage: vibeshare attach <session:window.pane>\n' +
-        '  Available panes:\n' +
-        list,
-    );
-  }
-
-  const input = opts.stdin ?? process.stdin;
-  const output = opts.stderr ?? process.stderr;
-  output.write(`tmux panes:\n${list}\n`);
-  output.write('Pass one as: vibeshare attach <target>\n');
-  const rl = createInterface({ input, output });
-  try {
-    const answer = (await rl.question('target> ')).trim();
-    if (!answer) {
-      throw new AttachError('no target selected');
-    }
-    return answer;
-  } finally {
-    rl.close();
-  }
+  if (!isTty) throwNonInteractive(list);
+  return promptForTarget(list, opts.stdin ?? process.stdin, opts.stderr ?? process.stderr);
 }
