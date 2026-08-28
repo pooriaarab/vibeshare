@@ -51,10 +51,7 @@
  * this slice — a dropped rendezvous socket is reported via `onError`; already
  * -established DataChannels are peer-to-peer and unaffected.
  */
-import { randomBytes } from 'node:crypto';
-import WebSocket from 'ws';
 import type { AnnotationRelayFrame } from '../annotations.js';
-import { sanitizeIceServers } from '../config.js';
 import type {
   ChatRelayFrame,
   JoinRequestFrame,
@@ -64,6 +61,20 @@ import type {
 } from '../presenceChat.js';
 import { buildRoleUpdate } from '../presenceChat.js';
 import type { SignalingChannel, SignalingFrame, SignalingSide } from './signaling.js';
+import {
+  pairKey,
+  parseMessage,
+  asOffer,
+  asIceServers,
+  asAnswer,
+  asIce,
+  asPresence,
+  asChat,
+  asJoinRequest,
+  asAnnotation,
+} from './wsSignalingValidation.js';
+import { WsConnectionManager } from './wsSignalingConnection.js';
+import type { HostConn, ViewerConn } from './wsSignalingConnection.js';
 
 export type { AnnotationRelayFrame };
 export type { ChatRelayFrame, JoinRequestFrame, PresenceEntry, PresenceFrame, RoleUpdateFrame };
@@ -86,53 +97,94 @@ export interface WsSignalingOptions {
   readonly onJoinRequest?: (frame: JoinRequestFrame) => void;
 }
 
-interface HostConn {
-  readonly shareId: string;
-  readonly secret: string;
-  readonly ws: WebSocket;
-  open: boolean;
-  closing: boolean;
-  readonly outbox: string[];
-  readonly watchers: Set<(viewerId: string) => void>;
-  readonly hostSubs: Map<string, Set<(frame: SignalingFrame) => void>>;
-  refs: number;
-  /** Host display name announced via hello (default "host"). */
-  name: string;
-}
-
-interface ViewerConn {
-  readonly shareId: string;
-  readonly localViewerId: string;
-  readonly ws: WebSocket;
-  open: boolean;
-  closing: boolean;
-  readonly outbox: string[];
-  assignedViewerId: string | null;
-  readonly viewerSubs: Set<(frame: SignalingFrame) => void>;
-}
-
-/** Cap on frames queued while a socket is connecting (abuse/bug backstop). */
-const OUTBOX_CAP = 256;
-
 export class WsSignaling implements SignalingChannel {
-  readonly #base: string;
   readonly #onError: (error: Error) => void;
   readonly #onPresence: ((frame: PresenceFrame) => void) | undefined;
   readonly #onChat: ((frame: ChatRelayFrame) => void) | undefined;
   readonly #onAnnotation: ((frame: AnnotationRelayFrame) => void) | undefined;
   readonly #onJoinRequest: ((frame: JoinRequestFrame) => void) | undefined;
-  readonly #hosts = new Map<string, HostConn>();
-  readonly #viewers = new Map<string, ViewerConn>();
+  readonly #connMgr: WsConnectionManager;
   /** Viewer-side subscribers registered before their announceViewer call. */
   readonly #pendingViewerSubs = new Map<string, Set<(frame: SignalingFrame) => void>>();
 
+  readonly #hostHandlers: Record<string, ((conn: HostConn, msg: Record<string, unknown>) => void) | undefined> = {
+    'host-ready': () => {}, // informational
+    'viewer-joined': (conn, msg) => {
+      if (typeof msg['viewerId'] !== 'string') return;
+      for (const onViewer of conn.watchers) onViewer(msg['viewerId']);
+    },
+    'rtc-answer': (conn, msg) => {
+      const frame = asAnswer(msg);
+      if (frame) this.#dispatchHost(conn, frame);
+    },
+    'rtc-ice': (conn, msg) => {
+      const frame = asIce(msg, 'viewer');
+      if (frame) this.#dispatchHost(conn, frame);
+    },
+    'presence': (_conn, msg) => {
+      const frame = asPresence(msg);
+      if (frame) this.#onPresence?.(frame);
+    },
+    'chat': (_conn, msg) => {
+      const frame = asChat(msg);
+      if (frame) this.#onChat?.(frame);
+    },
+    'annotation': (_conn, msg) => {
+      const frame = asAnnotation(msg);
+      if (frame) this.#onAnnotation?.(frame);
+    },
+    'join-request': (_conn, msg) => {
+      const frame = asJoinRequest(msg);
+      if (frame) this.#onJoinRequest?.(frame);
+    },
+  };
+
+  readonly #viewerHandlers: Record<string, ((conn: ViewerConn, msg: Record<string, unknown>) => void) | undefined> = {
+    'assigned': (conn, msg) => {
+      // The rendezvous ASSIGNS the viewerId — we never claim one.
+      if (typeof msg['viewerId'] === 'string') {
+        conn.assignedViewerId = msg['viewerId'];
+      }
+    },
+    'rtc-offer': (conn, msg) => {
+      const frame = asOffer(msg);
+      if (frame) {
+        for (const h of conn.viewerSubs) h(frame);
+      }
+    },
+    'rtc-ice-servers': (conn, msg) => {
+      const frame = asIceServers(msg);
+      if (frame) {
+        for (const h of conn.viewerSubs) h(frame);
+      }
+    },
+    'rtc-ice': (conn, msg) => {
+      const frame = asIce(msg, 'host');
+      if (frame) {
+        for (const h of conn.viewerSubs) h(frame);
+      }
+    },
+    // Viewer-side presence/chat/annotations are handled by the browser page
+    // over the same socket; the Node viewer path (tests) ignores them here.
+    // They stay in the table so the accepted-kind set matches the host side's
+    // documented whitelist rather than falling through to the drop branch.
+    'presence': () => {},
+    'chat': () => {},
+    'annotation': () => {},
+  };
+
   constructor(opts: WsSignalingOptions) {
-    this.#base = opts.url.replace(/\/+$/, '');
     this.#onError = opts.onError ?? (() => {});
     this.#onPresence = opts.onPresence;
     this.#onChat = opts.onChat;
     this.#onAnnotation = opts.onAnnotation;
     this.#onJoinRequest = opts.onJoinRequest;
+    this.#connMgr = new WsConnectionManager(
+      opts.url.replace(/\/+$/, ''),
+      this.#onError,
+      (conn, text) => this.#onHostMessage(conn, text),
+      (conn, text) => this.#onViewerMessage(conn, text),
+    );
   }
 
   /**
@@ -140,9 +192,9 @@ export class WsSignaling implements SignalingChannel {
    * Safe to call before or after watchShare — queued until the socket opens.
    */
   setHostName(shareId: string, name: string): void {
-    const conn = this.#hostConn(shareId);
+    const conn = this.#connMgr.hostConn(shareId);
     conn.name = name.trim().length > 0 ? name.trim().slice(0, 32) : 'host';
-    this.#send(conn, { kind: 'hello', name: conn.name });
+    this.#connMgr.send(conn, { kind: 'hello', name: conn.name });
   }
 
   /**
@@ -151,7 +203,7 @@ export class WsSignaling implements SignalingChannel {
    * base64(encryptFrame(shareKey, utf8)) — the host client encrypts first.
    */
   sendChat(shareId: string, ciphertextB64: string): void {
-    this.#sendHost(shareId, { kind: 'chat', text: ciphertextB64 });
+    this.#connMgr.sendHost(shareId, { kind: 'chat', text: ciphertextB64 });
   }
 
   /**
@@ -164,7 +216,7 @@ export class WsSignaling implements SignalingChannel {
   ): void {
     const frame = buildRoleUpdate(opts);
     if (!frame) return;
-    this.#sendHost(shareId, {
+    this.#connMgr.sendHost(shareId, {
       kind: 'role-update',
       viewerId: frame.viewerId,
       role: frame.role,
@@ -175,7 +227,7 @@ export class WsSignaling implements SignalingChannel {
   // ------------------------------------------------------- SignalingChannel
 
   watchShare(shareId: string, onViewer: (viewerId: string) => void): () => void {
-    const conn = this.#hostConn(shareId);
+    const conn = this.#connMgr.hostConn(shareId);
     conn.watchers.add(onViewer);
     conn.refs++;
     let unwatched = false;
@@ -184,41 +236,20 @@ export class WsSignaling implements SignalingChannel {
       unwatched = true;
       conn.watchers.delete(onViewer);
       conn.refs--;
-      if (conn.refs <= 0) this.#closeHost(shareId);
+      if (conn.refs <= 0) this.#connMgr.closeHost(shareId);
     };
   }
 
   announceViewer(shareId: string, viewerId: string): void {
     const key = pairKey(shareId, viewerId);
-    if (this.#viewers.has(key)) return;
-    const ws = new WebSocket(`${this.#base}/ws/viewer?share=${encodeURIComponent(shareId)}`);
-    const conn: ViewerConn = {
-      shareId,
-      localViewerId: viewerId,
-      ws,
-      open: false,
-      closing: false,
-      outbox: [],
-      assignedViewerId: null,
-      viewerSubs: new Set(),
-    };
-    this.#viewers.set(key, conn);
+    if (this.#connMgr.viewers.has(key)) return;
+    const conn = this.#connMgr.viewerConn(shareId, viewerId);
     // Subscribers that pre-registered for this pair move onto the live conn.
     const pending = this.#pendingViewerSubs.get(key);
     if (pending) {
       for (const h of pending) conn.viewerSubs.add(h);
       this.#pendingViewerSubs.delete(key);
     }
-    ws.on('open', () => {
-      conn.open = true;
-      this.#flush(conn);
-    });
-    ws.on('message', (data: WebSocket.RawData) => this.#onViewerMessage(conn, String(data)));
-    ws.on('error', (err: Error) => this.#onError(err));
-    ws.on('close', () => {
-      conn.open = false;
-      if (!conn.closing) this.#onError(new Error(`signaling viewer socket for share ${shareId} closed`));
-    });
   }
 
   subscribe(
@@ -228,7 +259,7 @@ export class WsSignaling implements SignalingChannel {
     handler: (frame: SignalingFrame) => void,
   ): () => void {
     if (side === 'host') {
-      const conn = this.#hostConn(shareId);
+      const conn = this.#connMgr.hostConn(shareId);
       let set = conn.hostSubs.get(viewerId);
       if (!set) {
         set = new Set();
@@ -241,12 +272,12 @@ export class WsSignaling implements SignalingChannel {
       };
     }
     const key = pairKey(shareId, viewerId);
-    const conn = this.#viewers.get(key);
+    const conn = this.#connMgr.viewers.get(key);
     if (conn) {
       conn.viewerSubs.add(handler);
       return () => {
         conn.viewerSubs.delete(handler);
-        this.#closeViewerIfIdle(conn);
+        this.#connMgr.closeViewerIfIdle(conn);
       };
     }
     let set = this.#pendingViewerSubs.get(key);
@@ -264,13 +295,13 @@ export class WsSignaling implements SignalingChannel {
   publish(frame: SignalingFrame): void {
     switch (frame.kind) {
       case 'rtc-offer':
-        this.#sendHost(frame.shareId, { kind: 'rtc-offer', viewerId: frame.viewerId, sdp: frame.sdp });
+        this.#connMgr.sendHost(frame.shareId, { kind: 'rtc-offer', viewerId: frame.viewerId, sdp: frame.sdp });
         return;
       case 'rtc-answer':
-        this.#sendViewer(frame.shareId, frame.viewerId, { kind: 'rtc-answer', sdp: frame.sdp });
+        this.#connMgr.sendViewer(frame.shareId, frame.viewerId, { kind: 'rtc-answer', sdp: frame.sdp });
         return;
       case 'rtc-ice-servers':
-        this.#sendHost(frame.shareId, {
+        this.#connMgr.sendHost(frame.shareId, {
           kind: 'rtc-ice-servers',
           viewerId: frame.viewerId,
           iceServers: frame.iceServers,
@@ -278,14 +309,14 @@ export class WsSignaling implements SignalingChannel {
         return;
       case 'rtc-ice':
         if (frame.from === 'host') {
-          this.#sendHost(frame.shareId, {
+          this.#connMgr.sendHost(frame.shareId, {
             kind: 'rtc-ice',
             viewerId: frame.viewerId,
             candidate: frame.candidate,
             mid: frame.mid,
           });
         } else {
-          this.#sendViewer(frame.shareId, frame.viewerId, {
+          this.#connMgr.sendViewer(frame.shareId, frame.viewerId, {
             kind: 'rtc-ice',
             candidate: frame.candidate,
             mid: frame.mid,
@@ -299,155 +330,21 @@ export class WsSignaling implements SignalingChannel {
 
   /** Close every socket (host + viewer). Not part of the interface; for tests/teardown. */
   close(): void {
-    for (const shareId of [...this.#hosts.keys()]) this.#closeHost(shareId);
-    for (const conn of this.#viewers.values()) {
-      conn.closing = true;
-      try {
-        conn.ws.close();
-      } catch {
-        // already closed
-      }
-    }
-    this.#viewers.clear();
+    this.#connMgr.close();
     this.#pendingViewerSubs.clear();
   }
 
   // ------------------------------------------------------------- internals
 
-  #hostConn(shareId: string): HostConn {
-    const existing = this.#hosts.get(shareId);
-    if (existing) return existing;
-    // The host-secret is minted here — when the share is created — held only
-    // by the host process, and bound by the rendezvous on first sight.
-    const secret = randomBytes(16).toString('hex');
-    const ws = new WebSocket(
-      `${this.#base}/ws/host?share=${encodeURIComponent(shareId)}&secret=${secret}`,
-    );
-    const conn: HostConn = {
-      shareId,
-      secret,
-      ws,
-      open: false,
-      closing: false,
-      outbox: [],
-      watchers: new Set(),
-      hostSubs: new Map(),
-      refs: 0,
-      name: 'host',
-    };
-    this.#hosts.set(shareId, conn);
-    ws.on('open', () => {
-      conn.open = true;
-      this.#flush(conn);
-      // Re-announce name after (re)connect so the roster includes the host label.
-      this.#send(conn, { kind: 'hello', name: conn.name });
-    });
-    ws.on('message', (data: WebSocket.RawData) => this.#onHostMessage(conn, String(data)));
-    ws.on('error', (err: Error) => this.#onError(err));
-    ws.on('close', () => {
-      conn.open = false;
-      if (!conn.closing) this.#onError(new Error(`signaling host socket for share ${shareId} closed`));
-    });
-    return conn;
-  }
-
-  #closeHost(shareId: string): void {
-    const conn = this.#hosts.get(shareId);
-    if (!conn) return;
-    this.#hosts.delete(shareId);
-    conn.closing = true;
-    conn.watchers.clear();
-    conn.hostSubs.clear();
-    try {
-      conn.ws.close();
-    } catch {
-      // already closed
-    }
-  }
-
-  #closeViewerIfIdle(conn: ViewerConn): void {
-    if (conn.viewerSubs.size > 0) return;
-    if (this.#viewers.get(pairKey(conn.shareId, conn.localViewerId)) !== conn) return;
-    this.#viewers.delete(pairKey(conn.shareId, conn.localViewerId));
-    conn.closing = true;
-    try {
-      conn.ws.close();
-    } catch {
-      // already closed
-    }
-  }
-
-  #sendHost(shareId: string, msg: Record<string, unknown>): void {
-    const conn = this.#hosts.get(shareId);
-    if (!conn) return; // not watching this share — drop
-    this.#send(conn, msg);
-  }
-
-  #sendViewer(shareId: string, viewerId: string, msg: Record<string, unknown>): void {
-    const conn = this.#viewers.get(pairKey(shareId, viewerId));
-    if (!conn) return; // not announced — drop
-    this.#send(conn, msg);
-  }
-
-  #send(conn: HostConn | ViewerConn, msg: Record<string, unknown>): void {
-    const text = JSON.stringify(msg);
-    if (conn.open) {
-      conn.ws.send(text);
-    } else if (conn.outbox.length < OUTBOX_CAP) {
-      conn.outbox.push(text);
-    }
-  }
-
-  #flush(conn: HostConn | ViewerConn): void {
-    for (const text of conn.outbox.splice(0)) conn.ws.send(text);
-  }
-
   #onHostMessage(conn: HostConn, text: string): void {
     const msg = parseMessage(text);
     if (!msg) return;
     try {
-      switch (msg['kind']) {
-        case 'host-ready':
-          return; // informational
-        case 'viewer-joined': {
-          if (typeof msg['viewerId'] !== 'string') return;
-          for (const onViewer of conn.watchers) onViewer(msg['viewerId']);
-          return;
-        }
-        case 'rtc-answer': {
-          const frame = asAnswer(msg);
-          if (!frame) return;
-          this.#dispatchHost(conn, frame);
-          return;
-        }
-        case 'rtc-ice': {
-          const frame = asIce(msg, 'viewer');
-          if (!frame) return;
-          this.#dispatchHost(conn, frame);
-          return;
-        }
-        case 'presence': {
-          const frame = asPresence(msg);
-          if (frame) this.#onPresence?.(frame);
-          return;
-        }
-        case 'chat': {
-          const frame = asChat(msg);
-          if (frame) this.#onChat?.(frame);
-          return;
-        }
-        case 'annotation': {
-          const frame = asAnnotation(msg);
-          if (frame) this.#onAnnotation?.(frame);
-          return;
-        }
-        case 'join-request': {
-          const frame = asJoinRequest(msg);
-          if (frame) this.#onJoinRequest?.(frame);
-          return;
-        }
-        default:
-          return; // unknown shape — ignore
+      const kind = msg['kind'];
+      if (typeof kind !== 'string') return;
+      const handler = Object.hasOwn(this.#hostHandlers, kind) ? this.#hostHandlers[kind] : undefined;
+      if (handler) {
+        handler(conn, msg);
       }
     } catch (err) {
       this.#onError(err instanceof Error ? err : new Error(String(err)));
@@ -458,39 +355,11 @@ export class WsSignaling implements SignalingChannel {
     const msg = parseMessage(text);
     if (!msg) return;
     try {
-      switch (msg['kind']) {
-        case 'assigned': {
-          // The rendezvous ASSIGNS the viewerId — we never claim one.
-          if (typeof msg['viewerId'] === 'string') conn.assignedViewerId = msg['viewerId'];
-          return;
-        }
-        case 'rtc-offer': {
-          const frame = asOffer(msg);
-          if (!frame) return;
-          for (const h of conn.viewerSubs) h(frame);
-          return;
-        }
-        case 'rtc-ice-servers': {
-          const frame = asIceServers(msg);
-          if (!frame) return;
-          for (const h of conn.viewerSubs) h(frame);
-          return;
-        }
-        case 'rtc-ice': {
-          const frame = asIce(msg, 'host');
-          if (!frame) return;
-          for (const h of conn.viewerSubs) h(frame);
-          return;
-        }
-        case 'presence':
-        case 'chat':
-        case 'annotation':
-          // Viewer-side presence/chat/annotations are handled by the browser
-          // page over the same socket; the Node viewer path (tests) ignores
-          // them here.
-          return;
-        default:
-          return; // unknown shape — ignore
+      const kind = msg['kind'];
+      if (typeof kind !== 'string') return;
+      const handler = Object.hasOwn(this.#viewerHandlers, kind) ? this.#viewerHandlers[kind] : undefined;
+      if (handler) {
+        handler(conn, msg);
       }
     } catch (err) {
       this.#onError(err instanceof Error ? err : new Error(String(err)));
@@ -501,123 +370,3 @@ export class WsSignaling implements SignalingChannel {
     for (const h of conn.hostSubs.get(frame.viewerId) ?? []) h(frame);
   }
 }
-
-function pairKey(shareId: string, viewerId: string): string {
-  return `${shareId}/${viewerId}`;
-}
-
-function parseMessage(text: string): Record<string, unknown> | null {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (typeof parsed !== 'object' || parsed === null) return null;
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function asOffer(msg: Record<string, unknown>): SignalingFrame | null {
-  const { kind, shareId, viewerId, sdp } = msg;
-  if (kind !== 'rtc-offer' || typeof shareId !== 'string' || typeof viewerId !== 'string' || typeof sdp !== 'string') {
-    return null;
-  }
-  return { kind: 'rtc-offer', shareId, viewerId, sdp };
-}
-
-function asIceServers(msg: Record<string, unknown>): SignalingFrame | null {
-  const { kind, shareId, viewerId } = msg;
-  if (kind !== 'rtc-ice-servers' || typeof shareId !== 'string' || typeof viewerId !== 'string') {
-    return null;
-  }
-  // Same validation as the config file: garbage entries drop out, and a list
-  // with nothing valid is treated as absent (the viewer keeps its default).
-  const iceServers = sanitizeIceServers(msg['iceServers']);
-  if (!iceServers) return null;
-  return { kind: 'rtc-ice-servers', shareId, viewerId, iceServers };
-}
-
-function asAnswer(msg: Record<string, unknown>): SignalingFrame | null {
-  const { kind, shareId, viewerId, sdp } = msg;
-  if (kind !== 'rtc-answer' || typeof shareId !== 'string' || typeof viewerId !== 'string' || typeof sdp !== 'string') {
-    return null;
-  }
-  return { kind: 'rtc-answer', shareId, viewerId, sdp };
-}
-
-function asIce(msg: Record<string, unknown>, from: SignalingSide): SignalingFrame | null {
-  const { kind, shareId, viewerId, candidate, mid } = msg;
-  if (
-    kind !== 'rtc-ice' ||
-    typeof shareId !== 'string' ||
-    typeof viewerId !== 'string' ||
-    typeof candidate !== 'string' ||
-    typeof mid !== 'string'
-  ) {
-    return null;
-  }
-  return { kind: 'rtc-ice', shareId, viewerId, candidate, mid, from };
-}
-
-function asPresence(msg: Record<string, unknown>): PresenceFrame | null {
-  if (msg['kind'] !== 'presence' || !Array.isArray(msg['viewers'])) return null;
-  const viewers: PresenceEntry[] = [];
-  for (const raw of msg['viewers']) {
-    if (typeof raw !== 'object' || raw === null) continue;
-    const row = raw as Record<string, unknown>;
-    if (typeof row['viewerId'] !== 'string' || typeof row['name'] !== 'string') continue;
-    const role = row['role'] === 'host' ? 'host' : row['role'] === 'viewer' ? 'viewer' : null;
-    if (!role) continue;
-    viewers.push({ viewerId: row['viewerId'], name: row['name'], role });
-  }
-  return { kind: 'presence', viewers };
-}
-
-function asChat(msg: Record<string, unknown>): ChatRelayFrame | null {
-  if (msg['kind'] !== 'chat') return null;
-  if (typeof msg['viewerId'] !== 'string') return null;
-  if (typeof msg['name'] !== 'string') return null;
-  if (typeof msg['text'] !== 'string') return null;
-  const role = msg['role'] === 'host' ? 'host' : msg['role'] === 'viewer' ? 'viewer' : null;
-  if (!role) return null;
-  const ts = typeof msg['ts'] === 'number' ? msg['ts'] : Date.now();
-  return {
-    kind: 'chat',
-    viewerId: msg['viewerId'],
-    name: msg['name'],
-    role,
-    text: msg['text'],
-    ts,
-  };
-}
-
-function asJoinRequest(msg: Record<string, unknown>): JoinRequestFrame | null {
-  if (msg['kind'] !== 'join-request') return null;
-  if (typeof msg['viewerId'] !== 'string' || msg['viewerId'].length === 0) return null;
-  if (typeof msg['name'] !== 'string') return null;
-  return { kind: 'join-request', viewerId: msg['viewerId'], name: msg['name'] };
-}
-
-function asAnnotation(msg: Record<string, unknown>): AnnotationRelayFrame | null {
-  if (msg['kind'] !== 'annotation') return null;
-  if (typeof msg['id'] !== 'string' || msg['id'].length === 0) return null;
-  if (typeof msg['seq'] !== 'number' || !Number.isInteger(msg['seq']) || msg['seq'] < 0) return null;
-  if (typeof msg['viewerId'] !== 'string') return null;
-  if (typeof msg['name'] !== 'string') return null;
-  if (typeof msg['text'] !== 'string') return null;
-  const role = msg['role'] === 'host' ? 'host' : msg['role'] === 'viewer' ? 'viewer' : null;
-  if (!role) return null;
-  const replyTo = typeof msg['replyTo'] === 'string' && msg['replyTo'].length > 0 ? msg['replyTo'] : undefined;
-  const ts = typeof msg['ts'] === 'number' ? msg['ts'] : Date.now();
-  return {
-    kind: 'annotation',
-    id: msg['id'],
-    seq: msg['seq'],
-    viewerId: msg['viewerId'],
-    name: msg['name'],
-    role,
-    text: msg['text'],
-    ...(replyTo !== undefined ? { replyTo } : {}),
-    ts,
-  };
-}
-
