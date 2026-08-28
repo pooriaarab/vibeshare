@@ -268,23 +268,21 @@ function triggerAnnotationCallback(opts: AnnotationCallbackOpts): void {
 }
 
 interface AnnotateRequest {
-  readonly token: string;
   readonly seq: number;
   readonly replyTo: string | undefined;
   readonly wireText: string;
 }
 
 /**
- * Read the annotate body. The caller must reject an unknown token BEFORE
- * calling this: the original route validated the anchor only after the token
- * check, so an unauthenticated request must still answer 401, not a
- * bad-request that reveals the anchor was parsed.
+ * Read the annotate body, minus the token: the caller has already rejected an
+ * unknown one. That order matters — the original route validated the anchor
+ * only after the token check, so an unauthenticated request must still answer
+ * 401 rather than a bad-request revealing the anchor was parsed.
  */
 function parseAnnotateRequest(body: Record<string, unknown>): AnnotateRequest {
   const seq = parseAnchorSeq(body['seq']);
   if (seq === null) throw new ShareError('bad-request', 'invalid annotation anchor');
   return {
-    token: typeof body['token'] === 'string' ? body['token'] : '',
     seq,
     replyTo: normalizeReplyTo(body['replyTo']),
     wireText: typeof body['text'] === 'string' ? body['text'] : '',
