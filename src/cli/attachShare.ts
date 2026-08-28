@@ -1,14 +1,19 @@
 import { CaptureError } from '@pooriaarab/vibe-core/capture';
 import { AttachError, createProcessTmuxClient, createTmuxCaptureSource, pickAttachTarget } from '../attach.js';
+import type { TmuxClient } from '../attach.js';
 import type { AttachCliOptions } from './parse.js';
 import { mintShareRuntime } from './runtime.js';
 import type { IO } from './runtimeTypes.js';
 import { setShutdownRef } from './shutdown.js';
 
-async function resolveTarget(options: AttachCliOptions, io: IO): Promise<{ ok: true; target: string } | { ok: false; code: number }> {
-  const tmux = options.tmux ?? createProcessTmuxClient();
+async function resolveTarget(
+  options: AttachCliOptions,
+  tmux: TmuxClient,
+  io: IO,
+): Promise<{ ok: true; target: string } | { ok: false; code: number }> {
   try {
     const target = await pickAttachTarget(options.target, tmux);
+    // Fail closed on bad target BEFORE minting a share URL.
     await tmux.paneSize(target);
     return { ok: true, target };
   } catch (err) {
@@ -17,6 +22,11 @@ async function resolveTarget(options: AttachCliOptions, io: IO): Promise<{ ok: t
     io.err(out);
     return { ok: false, code: 2 };
   }
+}
+
+interface AttachRuntime {
+  readonly created: { feed: { publishRaw: (d: string) => void; publishResize: (c: number, r: number) => void } };
+  setInputSink: (s: (d: string) => void | null) => void;
 }
 
 function waitForAttachExit(): Promise<number> {
@@ -33,13 +43,18 @@ function waitForAttachExit(): Promise<number> {
   });
 }
 
+interface StartCaptureOpts {
+  readonly target: string;
+  readonly options: AttachCliOptions;
+  readonly tmux: TmuxClient;
+  readonly runtime: AttachRuntime;
+  readonly io: IO;
+}
+
 async function startCapture(
-  target: string,
-  options: AttachCliOptions,
-  runtime: { created: { feed: { publishRaw: (d:string)=>void; publishResize:(c:number,r:number)=>void } }; setInputSink: (s: (d:string)=>void|null)=>void },
-  io: IO,
+  opts: StartCaptureOpts,
 ): Promise<{ ok: true; stop: () => Promise<void> } | { ok: false; code: number }> {
-  const tmux = options.tmux ?? createProcessTmuxClient();
+  const { target, options, tmux, runtime, io } = opts;
   try {
     const source = createTmuxCaptureSource({
       target,
@@ -60,7 +75,10 @@ async function startCapture(
 }
 
 export async function attachShare(options: AttachCliOptions, io: IO): Promise<number> {
-  const resolved = await resolveTarget(options, io);
+  // One client for target validation AND the live capture, as before: a second
+  // createProcessTmuxClient() would be a separate process wrapper.
+  const tmux = options.tmux ?? createProcessTmuxClient();
+  const resolved = await resolveTarget(options, tmux, io);
   if (!resolved.ok) return resolved.code;
   const target = resolved.target;
   const sessionLabel = options.name ?? `tmux ${target}`;
@@ -69,7 +87,7 @@ export async function attachShare(options: AttachCliOptions, io: IO): Promise<nu
   const { runtime } = minted;
   const suffix = options.access === 'invite' ? ' (attach · viewers may request to drive)' : ' (attach · read-only)';
   io.out(`  source:   tmux ${target}${suffix}`);
-  const cap = await startCapture(target, options, runtime, io);
+  const cap = await startCapture({ target, options, tmux, runtime, io });
   if (!cap.ok) {
     await runtime.cleanup();
     return cap.code;
