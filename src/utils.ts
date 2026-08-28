@@ -57,8 +57,11 @@ export function hashPassphrase(passphrase: string): string {
 export function verifyPassphrase(passphrase: string, stored: string): boolean {
   const parts = stored.split('$');
   if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
-  const salt = Buffer.from(parts[1]!, 'hex');
-  const expected = Buffer.from(parts[2]!, 'hex');
+  const saltHex = parts[1];
+  const hashHex = parts[2];
+  if (saltHex === undefined || hashHex === undefined) return false;
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(hashHex, 'hex');
   const actual = scryptSync(passphrase, salt, expected.length);
   return timingSafeEqual(actual, expected);
 }

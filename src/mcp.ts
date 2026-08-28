@@ -92,106 +92,137 @@ function toolError(message: string): { content: Array<{ type: 'text'; text: stri
   return { content: [{ type: 'text', text: message }], isError: true };
 }
 
+function resolveShare(manager: ShareManager, shareId: unknown): CreatedShare | string {
+  if (typeof shareId === 'string' && shareId.length > 0) {
+    const s = manager.get(shareId);
+    return s ?? `no live share ${shareId}`;
+  }
+  const live = manager.list();
+  if (live.length === 0) return 'no live shares — call vibeshare_create first';
+  if (live.length > 1) {
+    return `multiple live shares; pass shareId: ${live.map((s) => s.share.id).join(', ')}`;
+  }
+  const single = live[0];
+  if (single === undefined) return 'no live shares — call vibeshare_create first';
+  return single;
+}
+
+async function handleCreateTool(
+  manager: ShareManager,
+  consent: ConsentLedger,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  // The MCP client's tool-approval prompt is the user's consent act.
+  if (!consent.allows(SHARE_SCOPE)) {
+    consent.grant(SHARE_SCOPE, 'granted via MCP tool approval');
+  }
+  const created = await manager.createShare({
+    ...(typeof args['session'] === 'string' ? { session: args['session'] } : {}),
+    ...(args['access'] === 'invite' || args['access'] === 'spectate' ? { access: args['access'] } : {}),
+    ...(typeof args['expiry'] === 'string' ? { expiry: args['expiry'] } : {}),
+    ...(typeof args['passphrase'] === 'string' ? { passphrase: args['passphrase'] } : {}),
+    ...(typeof args['name'] === 'string' ? { name: args['name'] } : {}),
+  });
+  created.feed.system('share created by agent via MCP');
+  return toolText({
+    id: created.share.id,
+    url: created.url,
+    access: created.share.access,
+    expiresAt: created.share.expiresAt,
+    note: 'read-only stream served from this machine; manage join requests with `vibeshare viewers`',
+  });
+}
+
+function handleViewersTool(manager: ShareManager, args: Record<string, unknown>): unknown {
+  const share = resolveShare(manager, args['shareId']);
+  if (typeof share === 'string') return toolError(share);
+  return toolText({
+    share: { id: share.share.id, url: share.url, access: share.share.access, state: share.share.state },
+    viewers: share.viewers.list().map((v) => ({
+      id: v.id, name: v.name, role: v.role, joinRequest: v.joinRequest, joinedAt: v.joinedAt,
+    })),
+  });
+}
+
+async function handleStopTool(manager: ShareManager, args: Record<string, unknown>): Promise<unknown> {
+  const share = resolveShare(manager, args['shareId']);
+  if (typeof share === 'string') return toolError(share);
+  const id = share.share.id;
+  await share.revoke();
+  return toolText({ stopped: id });
+}
+
+type ToolHandler = (args: Record<string, unknown>) => Promise<unknown> | unknown;
+
+function getToolHandlers(manager: ShareManager, consent: ConsentLedger): Record<string, ToolHandler> {
+  return {
+    vibeshare_create: (args) => handleCreateTool(manager, consent, args),
+    vibeshare_viewers: (args) => handleViewersTool(manager, args),
+    vibeshare_stop: (args) => handleStopTool(manager, args),
+  };
+}
+
+async function callTool(
+  handlers: Record<string, ToolHandler>,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const fn = Object.hasOwn(handlers, name) ? handlers[name] : undefined;
+  if (fn !== undefined) return fn(args);
+  return toolError(`unknown tool: ${name}`);
+}
+
+function handleInitialize(id: string | number | null, params: Record<string, unknown> | undefined): JsonRpcResponse {
+  const requested = params?.['protocolVersion'];
+  return {
+    jsonrpc: '2.0',
+    id,
+    result: {
+      protocolVersion: typeof requested === 'string' ? requested : PROTOCOL_VERSION,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'vibeshare', version: VERSION },
+    },
+  };
+}
+
+async function handleToolsCall(
+  id: string | number | null,
+  params: Record<string, unknown> | undefined,
+  handlers: Record<string, ToolHandler>,
+): Promise<JsonRpcResponse> {
+  const name = params?.['name'];
+  const args = params?.['arguments'];
+  if (typeof name !== 'string') {
+    return { jsonrpc: '2.0', id, error: { code: -32602, message: 'tools/call needs a tool name' } };
+  }
+  try {
+    const result = await callTool(handlers, name, (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>);
+    return { jsonrpc: '2.0', id, result };
+  } catch (err) {
+    return { jsonrpc: '2.0', id, result: toolError(err instanceof Error ? err.message : String(err)) };
+  }
+}
+
 export function createMcpServer(deps: McpServerDeps): McpServer {
   const { manager, consent } = deps;
+  const handlers = getToolHandlers(manager, consent);
 
-  const resolveShare = (shareId: unknown): CreatedShare | string => {
-    if (typeof shareId === 'string' && shareId.length > 0) {
-      const s = manager.get(shareId);
-      return s ?? `no live share ${shareId}`;
-    }
-    const live = manager.list();
-    if (live.length === 0) return 'no live shares — call vibeshare_create first';
-    if (live.length > 1) {
-      return `multiple live shares; pass shareId: ${live.map((s) => s.share.id).join(', ')}`;
-    }
-    return live[0]!;
-  };
-
-  const callTool = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
-    switch (name) {
-      case 'vibeshare_create': {
-        // The MCP client's tool-approval prompt is the user's consent act.
-        if (!consent.allows(SHARE_SCOPE)) {
-          consent.grant(SHARE_SCOPE, 'granted via MCP tool approval');
-        }
-        const created = await manager.createShare({
-          ...(typeof args['session'] === 'string' ? { session: args['session'] } : {}),
-          ...(args['access'] === 'invite' || args['access'] === 'spectate' ? { access: args['access'] } : {}),
-          ...(typeof args['expiry'] === 'string' ? { expiry: args['expiry'] } : {}),
-          ...(typeof args['passphrase'] === 'string' ? { passphrase: args['passphrase'] } : {}),
-          ...(typeof args['name'] === 'string' ? { name: args['name'] } : {}),
-        });
-        created.feed.system('share created by agent via MCP');
-        return toolText({
-          id: created.share.id,
-          url: created.url,
-          access: created.share.access,
-          expiresAt: created.share.expiresAt,
-          note: 'read-only stream served from this machine; manage join requests with `vibeshare viewers`',
-        });
-      }
-      case 'vibeshare_viewers': {
-        const share = resolveShare(args['shareId']);
-        if (typeof share === 'string') return toolError(share);
-        return toolText({
-          share: { id: share.share.id, url: share.url, access: share.share.access, state: share.share.state },
-          viewers: share.viewers.list().map((v) => ({
-            id: v.id, name: v.name, role: v.role, joinRequest: v.joinRequest, joinedAt: v.joinedAt,
-          })),
-        });
-      }
-      case 'vibeshare_stop': {
-        const share = resolveShare(args['shareId']);
-        if (typeof share === 'string') return toolError(share);
-        const id = share.share.id;
-        await share.revoke();
-        return toolText({ stopped: id });
-      }
-      default:
-        return toolError(`unknown tool: ${name}`);
-    }
+  const rpcHandlers: Record<string, (msg: JsonRpcRequest, id: string | number | null) => Promise<JsonRpcResponse | null>> = {
+    initialize: async (msg, id) => handleInitialize(id, msg.params),
+    ping: async (_msg, id) => ({ jsonrpc: '2.0', id, result: {} }),
+    'tools/list': async (_msg, id) => ({ jsonrpc: '2.0', id, result: { tools: TOOLS } }),
+    'tools/call': async (msg, id) => handleToolsCall(id, msg.params, handlers),
   };
 
   return {
     async handleMessage(msg: JsonRpcRequest): Promise<JsonRpcResponse | null> {
       const id = msg.id ?? null;
       const isNotification = msg.id === undefined;
-
-      switch (msg.method) {
-        case 'initialize': {
-          const requested = msg.params?.['protocolVersion'];
-          return {
-            jsonrpc: '2.0',
-            id,
-            result: {
-              protocolVersion: typeof requested === 'string' ? requested : PROTOCOL_VERSION,
-              capabilities: { tools: {} },
-              serverInfo: { name: 'vibeshare', version: VERSION },
-            },
-          };
-        }
-        case 'ping':
-          return { jsonrpc: '2.0', id, result: {} };
-        case 'tools/list':
-          return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
-        case 'tools/call': {
-          const name = msg.params?.['name'];
-          const args = msg.params?.['arguments'];
-          if (typeof name !== 'string') {
-            return { jsonrpc: '2.0', id, error: { code: -32602, message: 'tools/call needs a tool name' } };
-          }
-          try {
-            const result = await callTool(name, (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>);
-            return { jsonrpc: '2.0', id, result };
-          } catch (err) {
-            return { jsonrpc: '2.0', id, result: toolError(err instanceof Error ? err.message : String(err)) };
-          }
-        }
-        default:
-          if (isNotification) return null;
-          return { jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${String(msg.method)}` } };
-      }
+      const method = msg.method ?? '';
+      const fn = Object.hasOwn(rpcHandlers, method) ? rpcHandlers[method] : undefined;
+      if (fn !== undefined) return fn(msg, id);
+      if (isNotification) return null;
+      return { jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${String(msg.method)}` } };
     },
   };
 }

@@ -63,13 +63,9 @@ export class ShareManager {
    *
    * @throws ConsentRequiredError when the ledger has no `share:session` grant.
    */
-  async createShare(opts: CreateShareOptions = {}): Promise<CreatedShare> {
-    if (!this.#consent.allows(SHARE_SCOPE)) throw new ConsentRequiredError();
-
-    const access: ShareAccess = opts.access ?? 'spectate';
-    const expiryMs = opts.expiryMs ?? parseExpiry(opts.expiry ?? 'stop');
+  #buildShare(opts: CreateShareOptions, access: ShareAccess, expiryMs: number | null): Share {
     const now = Date.now();
-    const share: Share = {
+    return {
       id: newShareId(),
       name: opts.name ?? opts.session ?? 'agent session',
       access,
@@ -81,11 +77,26 @@ export class ShareManager {
           ? hashPassphrase(opts.passphrase)
           : null,
     };
+  }
 
+  #scheduleExpiry(shareId: string, expiryMs: number | null): void {
+    if (expiryMs === null) return;
+    const timer = setTimeout(() => {
+      void this.revokeShare(shareId, 'expired');
+    }, expiryMs);
+    // Never hold the process open just for an expiry timer.
+    timer.unref?.();
+    this.#timers.set(shareId, timer);
+  }
+
+  async createShare(opts: CreateShareOptions = {}): Promise<CreatedShare> {
+    if (!this.#consent.allows(SHARE_SCOPE)) throw new ConsentRequiredError();
+    const access: ShareAccess = opts.access ?? 'spectate';
+    const expiryMs = opts.expiryMs ?? parseExpiry(opts.expiry ?? 'stop');
+    const share = this.#buildShare(opts, access, expiryMs);
     const feed = opts.feedCapacity !== undefined ? new SessionFeed(opts.feedCapacity) : new SessionFeed();
     const viewers = new ViewerRegistry(() => share.access);
     const url = await this.#transport.serve(share, feed, viewers);
-
     const created: CreatedShare = {
       share,
       url,
@@ -94,16 +105,7 @@ export class ShareManager {
       revoke: () => this.revokeShare(share.id),
     };
     this.#live.set(share.id, created);
-
-    if (expiryMs !== null) {
-      const timer = setTimeout(() => {
-        void this.revokeShare(share.id, 'expired');
-      }, expiryMs);
-      // Never hold the process open just for an expiry timer.
-      timer.unref?.();
-      this.#timers.set(share.id, timer);
-    }
-
+    this.#scheduleExpiry(share.id, expiryMs);
     feed.system(`share opened · access=${access} · ${share.expiresAt ?? 'until stopped'}`);
     return created;
   }
