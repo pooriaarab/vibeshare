@@ -21,6 +21,7 @@
 import { randomBytes } from 'node:crypto';
 import { PeerConnection, type DataChannel } from 'node-datachannel';
 import type { RTCIceServer } from '../config.js';
+import { toNodeIceServers, iceServersForWire } from './transportIce.js';
 
 /**
  * Backlog flow control. A transcript (or long session) backlog can be many MB;
@@ -185,6 +186,41 @@ export class WebRtcTransport implements ShareTransport {
 
   // ------------------------------------------------------------- peers
 
+  #subscribeSignaling(ctx: ShareContext, viewerId: string, pc: PeerConnection): () => void {
+    let remoteDescSet = false;
+    const queuedCandidates: Array<{ candidate: string; mid: string }> = [];
+    return this.#signaling.subscribe(ctx.share.id, viewerId, 'host', (frame) => {
+      try {
+        if (frame.kind === 'rtc-answer') {
+          pc.setRemoteDescription(frame.sdp, 'answer');
+          remoteDescSet = true;
+          for (const c of queuedCandidates) pc.addRemoteCandidate(c.candidate, c.mid);
+          queuedCandidates.length = 0;
+        } else if (frame.kind === 'rtc-ice') {
+          if (remoteDescSet) pc.addRemoteCandidate(frame.candidate, frame.mid);
+          else queuedCandidates.push(frame);
+        }
+      } catch {
+        // Peer torn down mid-handshake — dropPeer owns the cleanup.
+      }
+    });
+  }
+
+  #wireLocalOffer(ctx: ShareContext, viewerId: string, pc: PeerConnection): (sdp: string) => void {
+    let offerPublished = false;
+    const publishOffer = (sdp: string): void => {
+      if (offerPublished) return;
+      offerPublished = true;
+      this.#signaling.publish({ kind: 'rtc-offer', shareId: ctx.share.id, viewerId, sdp });
+    };
+    pc.onLocalDescription((sdp) => publishOffer(sdp));
+    pc.onLocalCandidate((candidate, mid) => {
+      if (candidate === '') return; // end-of-gathering marker, not a candidate
+      this.#signaling.publish({ kind: 'rtc-ice', shareId: ctx.share.id, viewerId, candidate, mid, from: 'host' });
+    });
+    return publishOffer;
+  }
+
   /** A viewer announced itself: open a peer connection and publish an offer. */
   #acceptViewer(ctx: ShareContext, viewerId: string): void {
     if (!this.#shares.has(ctx.share.id)) return; // unserved in the meantime
@@ -204,41 +240,15 @@ export class WebRtcTransport implements ShareTransport {
 
     // Wiring order matters with a synchronous signaling channel:
     //  1. libdatachannel will not queue remote candidates that arrive
-    //     before the remote description — hold them until the answer lands.
+    //     before the remote description — #subscribeSignaling holds them
+    //     until the answer lands.
     //  2. The answer/ice subscription must be installed BEFORE any offer
     //     can be published, or a synchronous answer is published to nobody.
     //  3. libdatachannel can generate the local description synchronously
-    //     inside createDataChannel, so onLocalDescription must be
-    //     registered before that call (localDescription() covers it too).
-    let remoteDescSet = false;
-    const queuedCandidates: Array<{ candidate: string; mid: string }> = [];
-    const unsubscribeSignaling = this.#signaling.subscribe(ctx.share.id, viewerId, 'host', (frame) => {
-      try {
-        if (frame.kind === 'rtc-answer') {
-          pc.setRemoteDescription(frame.sdp, 'answer');
-          remoteDescSet = true;
-          for (const c of queuedCandidates) pc.addRemoteCandidate(c.candidate, c.mid);
-          queuedCandidates.length = 0;
-        } else if (frame.kind === 'rtc-ice') {
-          if (remoteDescSet) pc.addRemoteCandidate(frame.candidate, frame.mid);
-          else queuedCandidates.push(frame);
-        }
-      } catch {
-        // Peer torn down mid-handshake — dropPeer owns the cleanup.
-      }
-    });
-
-    let offerPublished = false;
-    const publishOffer = (sdp: string): void => {
-      if (offerPublished) return;
-      offerPublished = true;
-      this.#signaling.publish({ kind: 'rtc-offer', shareId: ctx.share.id, viewerId, sdp });
-    };
-    pc.onLocalDescription((sdp) => publishOffer(sdp));
-    pc.onLocalCandidate((candidate, mid) => {
-      if (candidate === '') return; // end-of-gathering marker, not a candidate
-      this.#signaling.publish({ kind: 'rtc-ice', shareId: ctx.share.id, viewerId, candidate, mid, from: 'host' });
-    });
+    //     inside createDataChannel, so #wireLocalOffer registers
+    //     onLocalDescription before that call (localDescription() covers it too).
+    const unsubscribeSignaling = this.#subscribeSignaling(ctx, viewerId, pc);
+    const publishOffer = this.#wireLocalOffer(ctx, viewerId, pc);
 
     const dc = pc.createDataChannel('feed');
     const local = pc.localDescription();
@@ -387,24 +397,10 @@ export class WebRtcTransport implements ShareTransport {
    * then the write-arbitration gate: only `canWrite()` viewers reach `onInput`.
    */
   #handleInbound(ctx: ShareContext, viewerId: string, msg: string | Buffer | ArrayBuffer): void {
-    let plaintext: Buffer;
-    try {
-      const frame =
-        typeof msg === 'string' ? Buffer.from(msg, 'utf8') : msg instanceof ArrayBuffer ? Buffer.from(msg) : msg;
-      plaintext = decryptFrame(ctx.key, frame);
-    } catch {
-      return; // tampered or malformed frame
-    }
-    let input: unknown;
-    try {
-      input = JSON.parse(plaintext.toString('utf8'));
-    } catch {
-      return; // not an input frame
-    }
-    if (typeof input !== 'object' || input === null) return;
-    const { kind, data, seq } = input as Record<string, unknown>;
-    if (kind !== 'input' || typeof data !== 'string') return;
-    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) return; // seq is mandatory
+    const parsed = parseInboundInput(msg, ctx.key);
+    if (!parsed) return;
+    const { data, seq } = parsed;
+
     const peer = ctx.peers.get(viewerId);
     if (!peer) return; // peer already torn down
     // Anti-replay: drop a re-sent or out-of-order frame BEFORE any gating
@@ -417,55 +413,31 @@ export class WebRtcTransport implements ShareTransport {
   }
 }
 
+function toBuffer(msg: string | Buffer | ArrayBuffer): Buffer {
+  if (typeof msg === 'string') return Buffer.from(msg, 'utf8');
+  if (msg instanceof ArrayBuffer) return Buffer.from(msg);
+  return msg;
+}
+
 /**
- * Map host ICE config to the string form node-datachannel accepts
- * (`stun:host:port` / `turn:user:pass@host:port?transport=tcp` — verified
- * against node-datachannel 0.32.x, which rejects the browser object shape).
- * Plain string entries pass through untouched; TURN objects get
- * `username`/`credential` embedded into each `turn:`/`turns:` URL.
+ * Decrypt and validate one inbound frame. Null on anything that is not a
+ * well-formed input frame: a tampered or malformed ciphertext, a payload that
+ * is not JSON, or a frame missing the mandatory monotonic `seq`.
  */
-function toNodeIceServers(servers: readonly (string | RTCIceServer)[]): string[] {
-  const out: string[] = [];
-  for (const server of servers) {
-    if (typeof server === 'string') {
-      out.push(server);
-      continue;
-    }
-    const urls = typeof server.urls === 'string' ? [server.urls] : server.urls;
-    for (const url of urls) out.push(embedTurnCredentials(url, server.username, server.credential));
+function parseInboundInput(msg: string | Buffer | ArrayBuffer, key: Buffer): { data: string; seq: number } | null {
+  let input: unknown;
+  try {
+    const frame = toBuffer(msg);
+    const plaintext = decryptFrame(key, frame);
+    input = JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    return null; // tampered, malformed, or not JSON
   }
-  return out;
+  if (typeof input !== 'object' || input === null) return null;
+  const { kind, data, seq } = input as Record<string, unknown>;
+  if (kind !== 'input' || typeof data !== 'string') return null;
+  if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) return null; // seq is mandatory
+  return { data, seq };
 }
 
-/** Insert `user[:pass]@` into a TURN URL; non-TURN URLs pass through. */
-function embedTurnCredentials(url: string, username?: string, credential?: string): string {
-  if (username === undefined || username.length === 0) return url;
-  if (url.includes('@')) return url; // already carries credentials
-  const m = /^(turns?:)(\/\/)?(.*)$/.exec(url);
-  if (!m) return url; // not a TURN URL — credentials don't apply
-  const [, scheme = '', slashes = '', rest = ''] = m;
-  const cred = credential !== undefined && credential.length > 0 ? `${username}:${credential}` : username;
-  return `${scheme}${slashes}${cred}@${rest}`;
-}
 
-/**
- * Wire form for the rtc-ice-servers frame: every entry becomes an
- * RTCIceServer object. A string entry becomes `{ urls }` — except a TURN URL
- * with embedded credentials (`turn:user:pass@host:port`), which browsers
- * reject inside `urls`; those are split into username/credential fields.
- */
-function iceServersForWire(servers: readonly (string | RTCIceServer)[]): RTCIceServer[] {
-  return servers.map((s) => (typeof s === 'string' ? serverStringForWire(s) : s));
-}
-
-function serverStringForWire(url: string): RTCIceServer {
-  const m = /^(turns?:)(\/\/)?([^:/@]+):([^@]*)@(.*)$/.exec(url);
-  if (!m) return { urls: url };
-  const [, scheme = '', slashes = '', username = '', credential = '', rest = ''] = m;
-  const server: { urls: string; username: string; credential?: string } = {
-    urls: `${scheme}${slashes}${rest}`,
-    username,
-  };
-  if (credential.length > 0) server.credential = credential;
-  return server;
-}
