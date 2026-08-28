@@ -8,6 +8,16 @@ export interface SseEvent {
   data: string;
 }
 
+/** Parse one `\n\n`-delimited SSE frame into an event, defaulting like the spec. */
+function parseSseFrame(raw: string): SseEvent {
+  const ev: SseEvent = { event: 'message', data: '' };
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('event: ')) ev.event = line.slice(7);
+    else if (line.startsWith('data: ')) ev.data = line.slice(6);
+  }
+  return ev;
+}
+
 /**
  * Read SSE events from a fetch Response until `done` says stop, the stream
  * ends, or the timeout hits (timeout → throw so failures show what arrived).
@@ -36,12 +46,7 @@ export async function readSse(
       while ((idx = buf.indexOf('\n\n')) !== -1) {
         const raw = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
-        const ev: SseEvent = { event: 'message', data: '' };
-        for (const line of raw.split('\n')) {
-          if (line.startsWith('event: ')) ev.event = line.slice(7);
-          else if (line.startsWith('data: ')) ev.data = line.slice(6);
-        }
-        events.push(ev);
+        events.push(parseSseFrame(raw));
       }
     }
   } finally {

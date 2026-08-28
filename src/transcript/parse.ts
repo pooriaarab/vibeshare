@@ -38,15 +38,17 @@ function timestamp(value: unknown): number | undefined {
   return undefined;
 }
 
-function event(
-  agent: TranscriptAgent,
-  seq: number,
-  role: TranscriptEvent['role'],
-  kind: TranscriptEvent['kind'],
-  text: string,
-  ts: number | undefined,
-  tool?: TranscriptEvent['tool'],
-): TranscriptEvent {
+interface EventInput {
+  agent: TranscriptAgent;
+  seq: number;
+  role: TranscriptEvent['role'];
+  kind: TranscriptEvent['kind'];
+  text: string;
+  ts: number | undefined;
+  tool?: TranscriptEvent['tool'];
+}
+
+function event({ agent, seq, role, kind, text, ts, tool }: EventInput): TranscriptEvent {
   return {
     seq,
     ...(ts !== undefined ? { ts } : {}),
@@ -82,7 +84,9 @@ function parseClaudeLine(
     text: string,
     tool?: TranscriptEvent['tool'],
   ): void => {
-    events.push(event('claude', nextSeq + events.length, role, kind, text, ts, tool));
+    events.push(
+      event({ agent: 'claude', seq: nextSeq + events.length, role, kind, text, ts, tool }),
+    );
   };
 
   if (line['type'] === 'user') {
