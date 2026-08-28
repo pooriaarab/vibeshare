@@ -3,9 +3,9 @@
   "plugins": ["typescript", "import", "unicorn", "oxc"],
   "categories": { "correctness": "warn", "suspicious": "warn", "perf": "warn", "pedantic": "off", "style": "off", "restriction": "off", "nursery": "off" },
   "rules": {
-    "complexity": ["warn", { "max": 10 }],
-    "max-lines": ["warn", { "max": 300, "skipBlankLines": true, "skipComments": true }],
-    "max-lines-per-function": ["warn", { "max": 50, "skipBlankLines": true, "skipComments": true }],
+    "complexity": ["error", { "max": 10 }],
+    "max-lines": ["error", { "max": 300, "skipBlankLines": true, "skipComments": true }],
+    "max-lines-per-function": ["error", { "max": 50, "skipBlankLines": true, "skipComments": true }],
     "max-params": ["error", { "max": 4 }],
     "max-depth": ["error", { "max": 4 }],
     "max-nested-callbacks": ["error", { "max": 4 }],
