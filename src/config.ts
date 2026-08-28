@@ -123,6 +123,41 @@ export interface VibeShareConfig {
   readonly iceServers?: readonly RTCIceServer[];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function trimmedString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const t = value.trim();
+  return t.length > 0 ? t : undefined;
+}
+
+function parseRawConfig(file: string): Record<string, unknown> | null {
+  const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+  if (!isRecord(parsed)) return null;
+  return parsed;
+}
+
+function buildConfig(raw: Record<string, unknown>): VibeShareConfig {
+  const config: {
+    signalingUrl?: string;
+    tunnel?: TunnelConfig;
+    iceServers?: readonly RTCIceServer[];
+  } = {};
+  // Guard on the trimmed value but store the raw string: the original did
+  // exactly this, and trimming here would change the resolved endpoint.
+  const rawSignaling = raw['signalingUrl'];
+  if (typeof rawSignaling === 'string' && rawSignaling.trim().length > 0) {
+    config.signalingUrl = rawSignaling;
+  }
+  const tunnel = parseTunnelConfig(raw['tunnel']);
+  if (tunnel !== undefined) config.tunnel = tunnel;
+  const iceServers = sanitizeIceServers(raw['iceServers']);
+  if (iceServers !== undefined) config.iceServers = iceServers;
+  return config;
+}
+
 /**
  * Read `~/.vibeshare/config.json` (or `file`), tolerating everything: a
  * missing file, invalid JSON, or wrong-typed fields all yield `{}` rather
@@ -133,29 +168,25 @@ export interface VibeShareConfig {
 export function readConfigFile(file = join(vibeHome(), 'config.json')): VibeShareConfig {
   try {
     if (!existsSync(file)) return {};
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {};
-    const raw = parsed as Record<string, unknown>;
-    const config: {
-      signalingUrl?: string;
-      tunnel?: TunnelConfig;
-      iceServers?: readonly RTCIceServer[];
-    } = {};
-    if (typeof raw['signalingUrl'] === 'string' && raw['signalingUrl'].trim().length > 0) {
-      config.signalingUrl = raw['signalingUrl'];
-    }
-    const tunnel = parseTunnelConfig(raw['tunnel']);
-    if (tunnel) config.tunnel = tunnel;
-    const iceServers = sanitizeIceServers(raw['iceServers']);
-    if (iceServers) config.iceServers = iceServers;
-    return config;
+    const raw = parseRawConfig(file);
+    if (raw === null) return {};
+    return buildConfig(raw);
   } catch {
     return {};
   }
 }
 
+function assignTrimmed(
+  out: { provider?: string; endpoint?: string; hostname?: string },
+  key: 'provider' | 'endpoint' | 'hostname',
+  value: unknown,
+): void {
+  const v = trimmedString(value);
+  if (v !== undefined) out[key] = v;
+}
+
 function parseTunnelConfig(raw: unknown): TunnelConfig | undefined {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  if (!isRecord(raw)) return undefined;
   const t = raw as Record<string, unknown>;
   const out: {
     provider?: string;
@@ -163,16 +194,10 @@ function parseTunnelConfig(raw: unknown): TunnelConfig | undefined {
     endpoint?: string;
     hostname?: string;
   } = {};
-  if (typeof t['provider'] === 'string' && t['provider'].trim().length > 0) {
-    out.provider = t['provider'].trim();
-  }
-  if (typeof t['endpoint'] === 'string' && t['endpoint'].trim().length > 0) {
-    out.endpoint = t['endpoint'].trim();
-  }
-  if (typeof t['hostname'] === 'string' && t['hostname'].trim().length > 0) {
-    out.hostname = t['hostname'].trim();
-  }
-  if (typeof t['account'] === 'object' && t['account'] !== null && !Array.isArray(t['account'])) {
+  assignTrimmed(out, 'provider', t['provider']);
+  assignTrimmed(out, 'endpoint', t['endpoint']);
+  assignTrimmed(out, 'hostname', t['hostname']);
+  if (isRecord(t['account'])) {
     // Passed through as a string→string map bag; providers pull what they need.
     out.account = t['account'] as TunnelAccountConfig;
   }
@@ -206,6 +231,35 @@ export function resolveSignaling(flag?: string): string {
   return resolveSignalingUrl({ flag, env: process.env[SIGNALING_ENV], file: readConfigFile() });
 }
 
+function extractUrls(value: unknown): string | string[] | undefined {
+  const single = trimmedString(value);
+  if (single !== undefined) return single;
+  if (!Array.isArray(value)) return undefined;
+  const list = value
+    .filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
+    .map((u) => u.trim());
+  if (list.length > 0) return list;
+  return undefined;
+}
+
+function nonEmptyStringField(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.length > 0) return value;
+  return undefined;
+}
+
+function toCleanIceServer(entry: unknown): RTCIceServer | undefined {
+  if (!isRecord(entry)) return undefined;
+  const e = entry;
+  const cleanUrls = extractUrls(e['urls']);
+  if (cleanUrls === undefined) return undefined;
+  const server: { urls: string | string[]; username?: string; credential?: string } = { urls: cleanUrls };
+  const username = nonEmptyStringField(e['username']);
+  if (username !== undefined) server.username = username;
+  const credential = nonEmptyStringField(e['credential']);
+  if (credential !== undefined) server.credential = credential;
+  return server;
+}
+
 /**
  * Coerce an unknown value into a clean RTCIceServer list. Entries without a
  * usable `urls` are dropped; `username`/`credential` pass through only as
@@ -216,23 +270,8 @@ export function sanitizeIceServers(raw: unknown): RTCIceServer[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out: Array<{ urls: string | string[]; username?: string; credential?: string }> = [];
   for (const entry of raw) {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
-    const e = entry as Record<string, unknown>;
-    const urls = e['urls'];
-    let cleanUrls: string | string[] | undefined;
-    if (typeof urls === 'string' && urls.trim().length > 0) {
-      cleanUrls = urls.trim();
-    } else if (Array.isArray(urls)) {
-      const list = urls
-        .filter((u): u is string => typeof u === 'string' && u.trim().length > 0)
-        .map((u) => u.trim());
-      if (list.length > 0) cleanUrls = list;
-    }
-    if (cleanUrls === undefined) continue;
-    const server: { urls: string | string[]; username?: string; credential?: string } = { urls: cleanUrls };
-    if (typeof e['username'] === 'string' && e['username'].length > 0) server.username = e['username'];
-    if (typeof e['credential'] === 'string' && e['credential'].length > 0) server.credential = e['credential'];
-    out.push(server);
+    const server = toCleanIceServer(entry);
+    if (server !== undefined) out.push(server);
   }
   return out.length > 0 ? out : undefined;
 }
@@ -328,6 +367,96 @@ export interface ResolvedTunnel {
   readonly startOpts: TunnelStartOpts;
 }
 
+function resolveTunnelProvider(sources: TunnelSources, fileTunnel: TunnelConfig | undefined): string | undefined {
+  if (sources.flag === true || sources.flag === '') return undefined; // explicit cascade
+  const flagVal = trimmedString(sources.flag);
+  if (flagVal !== undefined) return flagVal;
+  const envVal = trimmedString(sources.env);
+  if (envVal !== undefined) return envVal;
+  const fileVal = trimmedString(fileTunnel?.provider);
+  if (fileVal !== undefined) return fileVal;
+  return undefined;
+}
+
+/** hostname: file-level first, then per-provider account. */
+function resolveTunnelHostname(
+  fileTunnel: TunnelConfig | undefined,
+  account: TunnelAccountConfig | undefined,
+): string | undefined {
+  const candidates = [
+    fileTunnel?.hostname,
+    account?.cloudflared?.hostname,
+    account?.cloudflare?.hostname,
+    account?.tailscale?.hostname,
+  ];
+  for (const candidate of candidates) {
+    const v = nonEmpty(candidate);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+/** Server addresses declared under the account bag, in precedence order. */
+function accountServerAddrs(account: TunnelAccountConfig | undefined): (string | undefined)[] {
+  return [
+    account?.frp?.serverAddr,
+    account?.frp?.hostname,
+    account?.['self-hosted']?.serverAddr,
+    account?.['self-hosted']?.endpoint,
+  ];
+}
+
+/** frp / self-hosted server: env > file endpoint > account.frp > account.self-hosted. */
+function resolveTunnelServerAddr(
+  env: NodeJS.ProcessEnv,
+  fileTunnel: TunnelConfig | undefined,
+  account: TunnelAccountConfig | undefined,
+): string | undefined {
+  const candidates = [env[FRP_SERVER_ADDR_ENV], fileTunnel?.endpoint, ...accountServerAddrs(account)];
+  for (const candidate of candidates) {
+    const v = nonEmpty(candidate);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+/** ngrok authtoken: env > account.ngrok.authtoken|token. */
+function resolveTunnelNgrokToken(
+  env: NodeJS.ProcessEnv,
+  account: TunnelAccountConfig | undefined,
+): string | undefined {
+  const candidates = [env[NGROK_AUTHTOKEN_ENV], account?.ngrok?.authtoken, account?.ngrok?.token];
+  for (const candidate of candidates) {
+    const v = nonEmpty(candidate);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+function collectRawStartOpts(
+  fileTunnel: TunnelConfig | undefined,
+  account: TunnelAccountConfig | undefined,
+  env: NodeJS.ProcessEnv,
+): { hostname?: string; serverAddr?: string; env?: NodeJS.ProcessEnv } {
+  const startOpts: { hostname?: string; serverAddr?: string; env?: NodeJS.ProcessEnv } = {};
+  const hostname = resolveTunnelHostname(fileTunnel, account);
+  if (hostname !== undefined) startOpts.hostname = hostname;
+  const serverAddr = resolveTunnelServerAddr(env, fileTunnel, account);
+  if (serverAddr !== undefined) startOpts.serverAddr = serverAddr;
+  const ngrokToken = resolveTunnelNgrokToken(env, account);
+  if (ngrokToken !== undefined) startOpts.env = { NGROK_AUTHTOKEN: ngrokToken };
+  return startOpts;
+}
+
+/** Only include startOpts keys that actually got set. */
+function cleanStartOpts(raw: { hostname?: string; serverAddr?: string; env?: NodeJS.ProcessEnv }): TunnelStartOpts {
+  const cleanOpts: TunnelStartOpts = {};
+  if (raw.hostname !== undefined) (cleanOpts as { hostname: string }).hostname = raw.hostname;
+  if (raw.serverAddr !== undefined) (cleanOpts as { serverAddr: string }).serverAddr = raw.serverAddr;
+  if (raw.env !== undefined) (cleanOpts as { env: NodeJS.ProcessEnv }).env = raw.env;
+  return cleanOpts;
+}
+
 /**
  * Resolve tunnel provider + start opts from flag > env > file > defaults.
  * Pure w.r.t. the sources object — secrets in `startOpts.env` are never
@@ -342,60 +471,15 @@ export interface ResolvedTunnel {
 export function resolveTunnelConfig(sources: TunnelSources): ResolvedTunnel {
   const env = sources.processEnv ?? process.env;
   const fileTunnel = sources.file?.tunnel;
-
-  let provider: string | undefined;
-  if (sources.flag === true || sources.flag === '') {
-    provider = undefined; // explicit cascade
-  } else if (typeof sources.flag === 'string' && sources.flag.trim().length > 0) {
-    provider = sources.flag.trim();
-  } else if (typeof sources.env === 'string' && sources.env.trim().length > 0) {
-    provider = sources.env.trim();
-  } else if (typeof fileTunnel?.provider === 'string' && fileTunnel.provider.trim().length > 0) {
-    provider = fileTunnel.provider.trim();
-  }
-
   const account = fileTunnel?.account;
-  const startOpts: {
-    hostname?: string;
-    serverAddr?: string;
-    env?: NodeJS.ProcessEnv;
-  } = {};
-
-  // hostname: file-level first, then per-provider account.
-  const hostname =
-    nonEmpty(fileTunnel?.hostname) ??
-    nonEmpty(account?.cloudflared?.hostname) ??
-    nonEmpty(account?.cloudflare?.hostname) ??
-    nonEmpty(account?.tailscale?.hostname);
-  if (hostname) startOpts.hostname = hostname;
-
-  // frp / self-hosted server: env > file endpoint > account.frp > account.self-hosted
-  const serverAddr =
-    nonEmpty(env[FRP_SERVER_ADDR_ENV]) ??
-    nonEmpty(fileTunnel?.endpoint) ??
-    nonEmpty(account?.frp?.serverAddr) ??
-    nonEmpty(account?.frp?.hostname) ??
-    nonEmpty(account?.['self-hosted']?.serverAddr) ??
-    nonEmpty(account?.['self-hosted']?.endpoint);
-  if (serverAddr) startOpts.serverAddr = serverAddr;
-
-  // ngrok authtoken: env > account.ngrok.authtoken|token
-  const ngrokToken =
-    nonEmpty(env[NGROK_AUTHTOKEN_ENV]) ??
-    nonEmpty(account?.ngrok?.authtoken) ??
-    nonEmpty(account?.ngrok?.token);
-  if (ngrokToken) {
-    startOpts.env = { NGROK_AUTHTOKEN: ngrokToken };
-  }
-
-  const resolved: ResolvedTunnel = { startOpts };
+  const provider = resolveTunnelProvider(sources, fileTunnel);
+  const rawOpts = collectRawStartOpts(fileTunnel, account, env);
+  const cleanOpts = cleanStartOpts(rawOpts);
+  // Build startOpts-first, then attach provider, so the key order on the
+  // returned object matches what callers serialized before.
+  const resolved: ResolvedTunnel = { startOpts: cleanOpts };
   if (provider !== undefined) (resolved as { provider: string }).provider = provider;
-  // Only include startOpts keys that actually got set.
-  const cleanOpts: TunnelStartOpts = {};
-  if (startOpts.hostname !== undefined) (cleanOpts as { hostname: string }).hostname = startOpts.hostname;
-  if (startOpts.serverAddr !== undefined) (cleanOpts as { serverAddr: string }).serverAddr = startOpts.serverAddr;
-  if (startOpts.env !== undefined) (cleanOpts as { env: NodeJS.ProcessEnv }).env = startOpts.env;
-  return { ...resolved, startOpts: cleanOpts };
+  return resolved;
 }
 
 /** Convenience for the CLI: resolve from real flag/env/config-file inputs. */
