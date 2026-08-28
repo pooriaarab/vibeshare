@@ -27,7 +27,9 @@ export async function readSse(
   done: (events: SseEvent[]) => boolean,
   timeoutMs = 6000,
 ): Promise<SseEvent[]> {
-  const reader = res.body!.getReader();
+  const body = res.body;
+  if (body === null) throw new Error('readSse: response has no body to read');
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
   const events: SseEvent[] = [];
