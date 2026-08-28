@@ -1,5 +1,3 @@
-import { xtermPageStyles } from './xtermClient.js';
-import { spectatorBody } from './spectatorPage/page.js';
 /**
  * The web spectator view: a minimal, self-contained read-only client served
  * straight from the host machine — no install, no build, no external assets
@@ -22,7 +20,10 @@ import { spectatorBody } from './spectatorPage/page.js';
  * Terminal rendering uses inlined xterm.js (CSP-safe, no CDN) so raw PTY
  * bytes reconstruct colors/cursor/full-screen TUI redraws faithfully.
  */
+
 import type { Share } from './types.js';
+import { xtermPageStyles } from './xtermClient.js';
+import { spectatorBody } from './spectatorPage/page.js';
 
 /**
  * @deprecated Prefer the shared xterm chrome via `xtermPageStyles()`. Kept as
