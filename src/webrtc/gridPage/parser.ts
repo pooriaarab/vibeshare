@@ -30,7 +30,15 @@ export function formatGridFragment(shares: readonly GridShareRef[]): string {
   return shares.map((s) => `${s.id}~${s.key}`).join(',');
 }
 
-function parseSharePasteUrl(text: string): { id: string; key: string } | null {
+/**
+ * Result of trying to read a pasted string as a URL. `threw` distinguishes a
+ * string the URL constructor rejected outright from one that parsed but simply
+ * carried no `/s/<id>` — the original code fell back to a fragment-only paste
+ * ONLY in the first case, and a URL that parsed without an id is a rejection.
+ */
+type PastedUrl = { readonly threw: true } | { readonly threw: false; readonly id: string | null; readonly key: string };
+
+function parseSharePasteUrl(text: string): PastedUrl {
   try {
     const url = text.includes('://')
       ? new URL(text)
@@ -38,36 +46,37 @@ function parseSharePasteUrl(text: string): { id: string; key: string } | null {
     const m =
       /\/(?:vibeshare\/)?s\/([A-Za-z0-9_-]+)/.exec(url.pathname) ??
       /\/s\/([A-Za-z0-9_-]+)/.exec(url.pathname);
-    if (!m) return null;
-    const id = m[1];
-    if (!id) return null;
     const key = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
-    return { id, key };
+    return { threw: false, id: m?.[1] ?? null, key };
   } catch {
-    return null;
+    return { threw: true };
   }
 }
 
-/**
- * Pull `{id, key}` from a pasted single-share viewer URL or a bare `id~key`.
- * Accepts `/vibeshare/s/<id>#<key>`, `/s/<id>#<key>`, full origins, or `id~key`.
- */
-export function parseSharePaste(input: string): GridShareRef | null {
-  const text = input.trim();
-  if (!text) return null;
-  // Bare id~key (same as one fragment pair).
+/** A bare `id~key` paste — one pair, and no URL punctuation anywhere. */
+function bareRef(text: string): GridShareRef | null {
   const bare = parseGridFragment(text);
   if (bare.length === 1 && !text.includes('/') && !text.includes('#')) {
     return bare[0] ?? null;
   }
+  return null;
+}
+
+/** The id+key a pasted URL yielded, or null when either is absent or malformed. */
+function validRef(id: string | null, key: string): GridShareRef | null {
+  if (!id || !key) return null;
+  if (!SHARE_ID_RE.test(id) || !KEY_RE.test(key)) return null;
+  return { id, key };
+}
+
+export function parseSharePaste(input: string): GridShareRef | null {
+  const text = input.trim();
+  if (!text) return null;
+  const bare = bareRef(text);
+  if (bare) return bare;
   const parsed = parseSharePasteUrl(text);
-  if (parsed) {
-    const { id, key } = parsed;
-    if (SHARE_ID_RE.test(id) && KEY_RE.test(key)) {
-      return { id, key };
-    }
-    return null;
-  }
-  const pair = parseGridFragment(text);
-  return pair[0] ?? null;
+  // Fall through to a fragment-only paste of id~key with junk only when the
+  // URL constructor threw.
+  if (parsed.threw) return parseGridFragment(text)[0] ?? null;
+  return validRef(parsed.id, parsed.key);
 }
