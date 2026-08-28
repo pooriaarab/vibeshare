@@ -17,6 +17,21 @@ const KNOWN_TOKEN_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
 ];
 const BLOB = /(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9+/=_-])/g;
 
+/**
+ * Rebuild a redacted `KEY=value` assignment from the SENSITIVE_ASSIGNMENT capture
+ * groups, keeping whichever quote style the original used. `String.replace` appends
+ * the match offset and the whole subject after the groups, so read positionally and
+ * ignore anything that is not a string.
+ */
+function maskAssignment(groups: readonly unknown[]): string {
+  const group = (index: number): string | undefined => {
+    const value = groups[index];
+    return typeof value === 'string' ? value : undefined;
+  };
+  const quote = group(2) !== undefined ? '"' : group(3) !== undefined ? "'" : group(4) !== undefined ? '`' : '';
+  return `${group(0) ?? ''}${group(1) ?? ''}${quote}${marker('secret')}${quote}`;
+}
+
 function marker(label: string): string {
   return `«redacted:‹${label}›»`;
 }
@@ -48,19 +63,8 @@ export function redact(text: string): string {
   let output = text
     .replace(PEM_BLOCK, marker('pem'))
     .replace(BEARER_TOKEN, (match) => `Bearer ${marker('bearer-token')}`)
-    .replace(
-      SENSITIVE_ASSIGNMENT,
-      (
-        _match: string,
-        key: string,
-        separator: string,
-        doubleQuoted: string | undefined,
-        singleQuoted: string | undefined,
-        backtickQuoted: string | undefined,
-      ) => {
-        const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : backtickQuoted !== undefined ? '`' : '';
-        return `${key}${separator}${quote}${marker('secret')}${quote}`;
-      },
+    .replace(SENSITIVE_ASSIGNMENT, (_match: string, ...groups: unknown[]) =>
+      maskAssignment(groups),
     );
 
   for (const [pattern, label] of KNOWN_TOKEN_PATTERNS) {
