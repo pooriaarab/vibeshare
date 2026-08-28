@@ -60,11 +60,68 @@ function event({ agent, seq, role, kind, text, ts, tool }: EventInput): Transcri
   };
 }
 
+type AddFn = (role: TranscriptEvent['role'], kind: TranscriptEvent['kind'], text: string, tool?: TranscriptEvent['tool']) => void;
+
+function handleUserContent(content: unknown, add: AddFn): void {
+  if (typeof content === 'string') {
+    add('user', 'prompt', content);
+    return;
+  }
+  if (!Array.isArray(content)) return;
+  for (const rawBlock of content) {
+    const block = record(rawBlock);
+    if (!block) continue;
+    if (block['type'] === 'text' && typeof block['text'] === 'string') {
+      add('user', 'prompt', block['text']);
+    } else if (block['type'] === 'tool_result') {
+      add('tool', 'tool_result', contentText(block['content']));
+    }
+  }
+}
+
+function toolInputText(input: unknown): string | undefined {
+  if (input === undefined) return undefined;
+  try {
+    return redact(JSON.stringify(input));
+  } catch {
+    return redact(String(input));
+  }
+}
+
+function handleAssistantToolUse(block: JsonRecord, add: AddFn): void {
+  if (block['type'] !== 'tool_use' || typeof block['name'] !== 'string') return;
+  const input = toolInputText(block['input']);
+  add('assistant', 'tool_use', '', {
+    name: redact(block['name']),
+    ...(input !== undefined ? { input } : {}),
+  });
+}
+
+function handleAssistantContent(content: unknown, add: AddFn): void {
+  if (!Array.isArray(content)) return;
+  for (const rawBlock of content) {
+    const block = record(rawBlock);
+    if (!block) continue;
+    if (block['type'] === 'text' && typeof block['text'] === 'string') {
+      add('assistant', 'response', block['text']);
+    } else if (block['type'] === 'thinking' && typeof block['thinking'] === 'string') {
+      add('assistant', 'thinking', block['thinking']);
+    } else {
+      handleAssistantToolUse(block, add);
+    }
+  }
+}
+
+function parseUserLine(message: JsonRecord, add: AddFn): void {
+  handleUserContent(message['content'], add);
+}
+
+function parseAssistantLine(message: JsonRecord, add: AddFn): void {
+  handleAssistantContent(message['content'], add);
+}
+
 /** Parse one Claude JSONL line. Invalid or unsupported lines are ignored. */
-function parseClaudeLine(
-  rawJsonLine: string,
-  nextSeq: number,
-): TranscriptEvent[] {
+function parseClaudeLine(rawJsonLine: string, nextSeq: number): TranscriptEvent[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJsonLine) as unknown;
@@ -73,65 +130,20 @@ function parseClaudeLine(
   }
   const line = record(parsed);
   if (!line || (line['type'] !== 'user' && line['type'] !== 'assistant')) return [];
-
   const message = record(line['message']);
   if (!message) return [];
   const ts = timestamp(line['timestamp']);
   const events: TranscriptEvent[] = [];
-  const add = (
-    role: TranscriptEvent['role'],
-    kind: TranscriptEvent['kind'],
-    text: string,
-    tool?: TranscriptEvent['tool'],
-  ): void => {
+  const add: AddFn = (role, kind, text, tool) => {
     events.push(
       event({ agent: 'claude', seq: nextSeq + events.length, role, kind, text, ts, tool }),
     );
   };
-
   if (line['type'] === 'user') {
-    const content = message['content'];
-    if (typeof content === 'string') {
-      add('user', 'prompt', content);
-      return events;
-    }
-    if (!Array.isArray(content)) return events;
-    for (const rawBlock of content) {
-      const block = record(rawBlock);
-      if (!block) continue;
-      if (block['type'] === 'text' && typeof block['text'] === 'string') {
-        add('user', 'prompt', block['text']);
-      } else if (block['type'] === 'tool_result') {
-        add('tool', 'tool_result', contentText(block['content']));
-      }
-    }
+    parseUserLine(message, add);
     return events;
   }
-
-  const content = message['content'];
-  if (!Array.isArray(content)) return events;
-  for (const rawBlock of content) {
-    const block = record(rawBlock);
-    if (!block) continue;
-    if (block['type'] === 'text' && typeof block['text'] === 'string') {
-      add('assistant', 'response', block['text']);
-    } else if (block['type'] === 'thinking' && typeof block['thinking'] === 'string') {
-      add('assistant', 'thinking', block['thinking']);
-    } else if (block['type'] === 'tool_use' && typeof block['name'] === 'string') {
-      let input: string | undefined;
-      if (block['input'] !== undefined) {
-        try {
-          input = redact(JSON.stringify(block['input']));
-        } catch {
-          input = redact(String(block['input']));
-        }
-      }
-      add('assistant', 'tool_use', '', {
-        name: redact(block['name']),
-        ...(input !== undefined ? { input } : {}),
-      });
-    }
-  }
+  parseAssistantLine(message, add);
   return events;
 }
 
