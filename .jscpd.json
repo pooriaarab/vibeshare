@@ -2,16 +2,15 @@
   "min-tokens": 100,
   "threshold": 5,
   "mode": "mild",
-  "format": ["typescript", "tsx", "javascript", "jsx"],
+  "format": ["typescript", "tsx"],
   "ignore": [
     "**/__tests__/**",
-    "**/*.{test,spec}.{ts,tsx,js,jsx}",
+    "**/*.{test,spec}.{ts,tsx}",
     "**/node_modules/**",
     "**/.next/**",
     "**/dist/**",
     "**/build/**",
     "**/coverage/**",
-    "**/vendor/**",
-    "**/*.min.js"
+    "**/vendor/**"
   ]
 }
