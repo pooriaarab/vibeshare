@@ -5,6 +5,7 @@
   "format": ["typescript", "tsx"],
   "ignore": [
     "**/__tests__/**",
+    "**/tests/**",
     "**/*.{test,spec}.{ts,tsx}",
     "**/node_modules/**",
     "**/.next/**",
