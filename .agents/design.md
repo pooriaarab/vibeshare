@@ -69,8 +69,8 @@ and controls reach `44px` height on phones.
 The grid uses one column by default. It uses two columns from `640px`, three
 from `1100px`, and four from `1600px`.
 
-The canvas uses a pannable viewport. A card becomes viewport-width below
-`640px` while retaining a `340px` maximum.
+The canvas uses a pannable viewport. Below `640px`, a card is the viewport width
+minus `48px`, capped at `340px`.
 
 CLI summaries put one field on each line. Keep `sharing`, `url`, `access`,
 `expires`, `mode`, and `manage` aligned.

@@ -2,9 +2,8 @@
 
 ## Brand and design
 
-Read `.agents/brand.md` before changing public copy or product claims.
-
-Read `.agents/design.md` before changing CLI output, web views, or media.
+Read both `.agents/brand.md` and `.agents/design.md` before changing public
+copy, product claims, CLI output, web views, or media.
 
 <!-- pr-standards:start -->
 ## Pull requests

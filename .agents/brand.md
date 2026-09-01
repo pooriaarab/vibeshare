@@ -23,7 +23,7 @@ Use this primary message: **Share your live agent coding session by URL.**
 Support it with these verified points:
 
 - The default local share is served from the host machine.
-- Public mode sends session frames directly over encrypted WebRTC.
+- Public mode sends session frames over an encrypted WebRTC DataChannel.
 - The public rendezvous handles signaling, not session plaintext.
 - Tunnel mode encrypts content before it crosses the tunnel provider.
 - Spectators cannot write until the host approves them.
@@ -53,7 +53,8 @@ Do not replace security details with broad trust claims.
 Treat current source and tests as the authority for shipped behavior.
 
 The share URL is a capability. Anyone with a valid link can request the access
-that its mode permits. A passphrase adds a second factor when configured.
+that its mode permits. Local and tunnel modes enforce a passphrase when one is
+configured. Public mode does not currently enforce that passphrase.
 
 Public mode puts the encryption key in the URL fragment. Browsers do not send
 that fragment to the signaling service.
