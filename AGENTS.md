@@ -1,5 +1,10 @@
 # AGENTS.md
 
+## Brand and design
+
+Read both `.agents/brand.md` and `.agents/design.md` before changing public
+copy, product claims, CLI output, web views, or media.
+
 <!-- pr-standards:start -->
 
 ## Pull requests
