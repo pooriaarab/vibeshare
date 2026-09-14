@@ -1,88 +1,172 @@
 # vibeshare
 
-Share your live agent coding session by URL — traces.com-style, open source, CLI-first. Spectators watch read-only; invite links let viewers request to join as collaborators (host approves, live).
+<p align="center">Share a live agent coding session by URL, for developers who pair in a browser.</p>
 
-Part of the **Vibe Suite** — companion tools for agentic coding CLIs (Claude Code, Codex, Gemini, Grok/pi, Kimi). Ships as **CLI + npm package + MCP server**, built on [`@pooriaarab/vibe-core`](https://www.npmjs.com/package/@pooriaarab/vibe-core) (consent ledger, hooks bus, badges).
+<p align="center">
+  <a href="https://www.npmjs.com/package/vibeshare-live"><img src="https://img.shields.io/npm/v/vibeshare-live" alt="npm v0.4.1"/></a>
+  <a href="https://github.com/pooriaarab/vibeshare/actions/workflows/oxlint.yml"><img src="https://github.com/pooriaarab/vibeshare/actions/workflows/oxlint.yml/badge.svg" alt="oxlint"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License MIT"/></a>
+  <a href="assets/bench.md"><img src="https://img.shields.io/badge/tunnels-12_providers-informational" alt="12 tunnel providers"/></a>
+</p>
 
-**Local-first: the share runs on your machine.** The consent ledger gates every share (`share:session` scope), the stream is served straight from your host, and nothing is stored on a server.
-
-## Works with any harness
-
-vibeshare shares a LIVE TERMINAL SESSION. It wraps a PTY, so the program inside is irrelevant — any agent CLI, shell, or TUI renders faithfully (colors, cursor, full-screen) via xterm.js in the browser.
-
-**Two ways to share a session:**
-- **Wrap at launch (no tmux):** `vibeshare --public -- <harness>` — vibeshare is the parent, PTY-captures. Examples: `vibeshare --public -- claude`, `-- codex`, `-- gemini`, `-- aider`, `-- opencode`, `-- kimi`, `-- amp`, or any shell/command.
-- **Attach to an already-running session (needs tmux):** run the harness inside tmux, then `vibeshare attach <pane>` taps it live. Harness-agnostic — it captures the terminal, not the app.
-
-**Verified harnesses** (all render the real TUI live): Claude Code (`claude`), OpenAI Codex (`codex`), Gemini CLI (`gemini`), aider (requires `pip install aider-chat`), opencode, Moonshot Kimi (`kimi`), pi (grok/glm), Sourcegraph amp (requires its own PATH setup). Others (Continue, Goose, Crush, Qwen, Cursor Agent, Warp, Zed, …) wrap identically — they're just terminal programs.
-
-| Need | Command |
-| :--- | :--- |
-| Share a new claude session | `vibeshare --public -- claude` |
-| Share a running session | Run it in tmux + `vibeshare attach <pane>` |
-| Local-only sharing | `vibeshare -- <cmd>` |
-
-*Modes:* `--public` (WebRTC P2P + e2e via getvibe.dev), `--tunnel <provider>` (12 providers, e2e), or local loopback/LAN. Presence + attributed chat included.
-
-## Demo
-
-[▶ Watch the launch video](branding/launch-video.mp4) — claude is multiplayer now.
-
-https://github.com/pooriaarab/vibeshare/raw/main/branding/launch-video.mp4
-
-## Install & build
-
-```sh
-npm install
-npm run build      # tsup → dist/ (cli.js, index.js, mcp.js + types)
-npm run typecheck  # tsc --noEmit
-npm test           # vitest
-```
-
-## CLI
-
-```sh
-vibeshare                        # share your shell, spectate read-only
-vibeshare --invite --expire 1h   # viewers may request to join; auto-expires
-vibeshare --pass hunter2         # passphrase second factor
-vibeshare -- npm test            # share a specific command
-vibeshare --host 0.0.0.0         # share on your LAN (default: loopback only)
-
-vibeshare viewers                # who's watching, pending join requests
-vibeshare viewers --approve <id> # promote a viewer to collaborator
-vibeshare viewers --kick <id>    # remove a viewer, live
-vibeshare stop                   # end the share (works from another terminal)
-```
-
-Running `vibeshare` prints the link:
-
-```
+```text
+$ npx vibeshare-live --yes --name demo -- sh -c 'echo hello from vibeshare; sleep 90'
 ● local · no data out
-  sharing:  npm test
-  url:      http://127.0.0.1:50613/s/KKxzdjLpr_km
+  sharing:  demo
+  url:      http://127.0.0.1:58265/s/TkGE_RWN1kVT
   access:   spectate (read-only)
   expires:  until you stop
   manage:   vibeshare viewers · vibeshare stop
+hello from vibeshare
 ```
 
-Opening the URL shows a self-contained spectator page (no install for viewers) streaming the session live over SSE, with a "Request to join" button on invite links. First run asks for consent (`--yes` to skip); the grant is recorded locally in `~/.vibeshare/consent.json` and can be revoked any time.
+<p align="center"><em>A local share printing its spectator URL.</em></p>
 
-Read-only is real: there is no route that lets a viewer write — the host is the server of record, and promotion to collaborator goes only through a host-approved request (`ViewerRegistry.canWrite()` is the single gate).
+## Contents
 
-## Reliable connectivity (TURN)
+[Install](#install) · [Quick start](#quick-start) · [Why](#why) · [Share a public session](#share-a-public-session) · [List viewers](#list-viewers) · [Stop the share](#stop-the-share) · [How it works](#how-it-works) · [Configuration](#configuration) · [FAQ](#faq) · [Contributing](#contributing) · [License](#license)
 
-`--public` shares are peer-to-peer with **STUN only** by default (free, no infra) — that works across most NATs. If viewers sit behind symmetric NATs or isolated networks and get stuck on "waiting for host", add a **TURN relay**: ICE config is set on the host and automatically propagated to viewers over signaling, so both ends use it.
+## Install
+
+```bash
+npx -y vibeshare-live --version
+npx vibeshare-live --yes --name demo -- sh -c 'echo hello from vibeshare; sleep 90'
+```
+
+One line to install (npx fetches `vibeshare-live`), one line to run. Node.js 18 or newer. `--yes` writes a `share:session` grant to `~/.vibeshare/consent.json`. A TTY prompt asks the first time if you omit it.
+
+The npm package is `vibeshare-live`. The executable is `vibeshare`. Bins also include `vibeshare-mcp`.
+
+From a clone the package scripts are `build` (tsup to `dist/`), `typecheck`, and `test` (vitest).
+
+## Quick start
+
+```bash
+npx vibeshare-live --yes --name demo -- sh -c 'echo hello from vibeshare; sleep 90'
+```
+
+```
+● local · no data out
+  sharing:  demo
+  url:      http://127.0.0.1:58265/s/TkGE_RWN1kVT
+  access:   spectate (read-only)
+  expires:  until you stop
+  manage:   vibeshare viewers · vibeshare stop
+hello from vibeshare
+```
+
+Open the URL on this machine. The spectator page is self-contained. No install for viewers. The default bind is loopback. Use `--host 0.0.0.0` to share on a LAN.
+
+vibeshare wraps a PTY, so the program inside does not matter. Any agent CLI, shell, or TUI renders through xterm.js (colors, cursor, full screen).
+
+Two ways to share:
+
+- Wrap at launch (no tmux): `npx vibeshare-live --yes -- <harness>`
+- Attach to a running tmux pane: `npx vibeshare-live attach demo:1.1 --yes`
+
+Verified harnesses: Claude Code (`claude`), OpenAI Codex (`codex`), Gemini CLI (`gemini`), aider, opencode, Moonshot Kimi (`kimi`), pi, Sourcegraph amp. Others (Continue, Goose, Crush, Qwen, Cursor Agent, Warp, Zed) wrap the same way. They are terminal programs.
+
+[Watch the launch video](branding/launch-video.mp4).
+
+## Why
+
+For developers who share a live agent CLI. Today that is traces.com, tmate, or a desktop screen-share. Not for a static log, a gist, or a persistent tmux session on one machine. GNU screen is not supported.
+
+## Share a public session
+
+Viewers off this machine need `--public`. Session frames go over a WebRTC DataChannel. Only the handshake crosses getvibe.dev. The stream is end-to-end encrypted.
+
+```bash
+npx vibeshare-live --public --yes --name demo -- sh -c 'echo hello; sleep 25'
+```
+
+```
+● p2p · nothing stored on a server
+  sharing:  demo
+  url:      https://getvibe.dev/vibeshare/s/25TbnGWV6LEU#dTl8rp6w10xzDBqwtqO7WJ6lvmlRxwJwUpHPlWdBNtQ
+  access:   spectate (read-only)
+  expires:  until you stop
+  mode:     public · end-to-end encrypted p2p (only the handshake crosses the rendezvous)
+  manage:   vibeshare viewers · vibeshare stop
+hello
+```
+
+`--invite` lets viewers request to join as collaborators. The host approves live. `--expire 1h` (or `24h`, `7d`, `stop`) tears the share down. `--pass` is a passphrase second factor on local and tunnel shares. Public mode does not currently enforce that passphrase.
+
+`--tunnel` (or `--tunnel <provider>`) exposes the local server through one of [12 providers](assets/bench.md). Frames are encrypted before they cross the provider. `--public` and `--tunnel` are mutually exclusive.
+
+## List viewers
+
+```bash
+npx vibeshare-live viewers
+```
+
+```
+http://127.0.0.1:59338/s/nGCH04a5RKOi
+  no viewers yet
+```
+
+`--approve <id>`, `--deny <id>`, and `--kick <id>` act on a join request or a viewer.
+
+Read-only is real. There is no route that lets a spectator write. Promotion to collaborator goes only through a host-approved request. `ViewerRegistry.canWrite()` is the single gate.
+
+## Stop the share
+
+```bash
+npx vibeshare-live stop
+```
+
+```
+✓ stopped http://127.0.0.1:59338/s/nGCH04a5RKOi
+```
+
+Works from another terminal. Pass a share id when more than one share is live.
+
+## How it works
+
+vibeshare owns the link and the gate. It is part of the Vibe Suite. It ships as a CLI, an npm package, and an MCP server. It uses [`@pooriaarab/vibe-core`](https://www.npmjs.com/package/@pooriaarab/vibe-core) for the consent ledger, hooks, and tunnels.
+
+Three transports:
+
+- **Local** (default): spectator page plus SSE, served from this machine. Nothing stored on a server.
+- **Public** (`--public`): WebRTC DataChannel. Signaling default `wss://getvibe.dev/vibeshare` (`--signaling`, `VIBESHARE_SIGNALING`, or `~/.vibeshare/config.json`). Point it at your own Worker. See [`worker/`](worker/README.md).
+- **Tunnel** (`--tunnel`): local HTTP with an extra encryption layer, then a tunnel provider.
+
+The host is the server of record. Consent scope `share:session` is recorded in `~/.vibeshare/consent.json` and can be revoked.
+
+Attach taps an already-running tmux pane. It needs tmux.
+
+```bash
+npx vibeshare-live attach demo:1.1 --yes
+```
+
+```
+● local · no data out
+  sharing:  tmux demo:1.1
+  url:      http://127.0.0.1:54669/s/2woHShoc5sPE
+  access:   spectate (read-only)
+  expires:  until you stop
+  manage:   vibeshare viewers · vibeshare stop
+  source:   tmux demo:1.1 (attach · read-only)
+```
+
+The `trace` subcommand shares a Claude Code or Codex transcript. It is read-only. It redacts likely secrets on a best-effort basis.
+
+The original UX prototype (no build, no network): [`docs/prototype.html`](docs/prototype.html). Draft spec: [`docs/spec.md`](docs/spec.md). Treat the spec as history. Current public links use getvibe.dev, not a vanity domain from that draft.
+
+## Configuration
+
+`--public` shares are peer-to-peer with STUN only by default. If viewers sit behind symmetric NATs and get stuck on "waiting for host", add a TURN relay. ICE config is set on the host and sent to viewers over signaling.
 
 Precedence, highest first:
 
-1. `--ice-servers '<json>'` CLI flag — a JSON array of RTCIceServer objects
-2. `VIBESHARE_ICE_SERVERS` env var (same JSON)
-3. `~/.vibeshare/config.json` → `"iceServers"` key
-4. default: `[{ "urls": "stun:stun.l.google.com:19302" }]` (STUN only)
+1. `--ice-servers '<json>'`
+2. `VIBESHARE_ICE_SERVERS`
+3. `~/.vibeshare/config.json` → `"iceServers"`
+4. default: `[{ "urls": "stun:stun.l.google.com:19302" }]`
 
 ```jsonc
-// ~/.vibeshare/config.json — self-hosted coturn, or a provider
-// (metered.ca, Twilio, Cloudflare Calls TURN, …)
+// ~/.vibeshare/config.json
 {
   "iceServers": [
     { "urls": "stun:stun.l.google.com:19302" },
@@ -95,18 +179,23 @@ Precedence, highest first:
 }
 ```
 
-The credentials are the host's own (short-lived tokens by convention); they travel over the signaling channel to viewers so the browser can reach the relay. Malformed flag/env JSON is reported and skipped — resolution falls through to the next source, never breaking the share.
+Malformed flag or env JSON is reported and skipped. Resolution falls through. It does not break the share.
 
-## npm library
+MCP setup, including the Windows `cmd /c npx` wrap, is in [`docs/SETUP.md`](docs/SETUP.md).
+
+## FAQ
+
+<details>
+<summary>How do I share from an npm library?</summary>
 
 ```ts
-import { createShare, grantConsent } from 'vibeshare';
+import { createShare, grantConsent } from 'vibeshare-live';
 
-grantConsent('share from my tool');              // once; local ledger
+grantConsent('share from my tool');
 const { url, feed, viewers, revoke } = await createShare({
   session: 'npm test',
-  access: 'spectate',                            // or 'invite'
-  expiry: '1h',                                  // or 'stop'
+  access: 'spectate',
+  expiry: '1h',
 });
 
 feed.publish('tests starting…');
@@ -116,7 +205,10 @@ await revoke();
 
 `createShare` throws `ConsentRequiredError` without a `share:session` grant. Bring your own plumbing with `ShareManager`, `LocalHttpTransport`, and `FileConsentStore`.
 
-## MCP server
+</details>
+
+<details>
+<summary>How does the MCP server work?</summary>
 
 ```json
 {
@@ -126,17 +218,14 @@ await revoke();
 }
 ```
 
-Tools: `vibeshare_create`, `vibeshare_viewers`, `vibeshare_stop` — so an agent can offer "share this session?". Your MCP client's tool-approval prompt is the consent act (recorded with that note). Approving *join requests* stays human-only, via the CLI.
+Tools: `vibeshare_create`, `vibeshare_viewers`, `vibeshare_stop`. An agent can offer "share this session?". The MCP client's tool-approval prompt is the consent act. Approving join requests stays human-only, via the CLI.
 
-## Architecture & the vibelive seam
+</details>
 
-vibeshare owns the **link + gate**; session content is an ordered feed served to spectators. The one deliberate seam is transport (`src/transport.ts`):
+## Contributing
 
-- **`LocalHttpTransport`** (implemented, default): spectator page + SSE stream + loopback host-control API, served from your machine. Nothing stored on a server.
-- **`RelayTransport`** (lands with vibelive): a dumb e2e relay / p2p mesh handing out public `vibeshare.io` URLs — same `ShareTransport` interface, swap-in only. Collaborator input routing is part of that seam and must pass `ViewerRegistry.canWrite()`.
+See [CONTRIBUTING.md](https://github.com/pooriaarab/.github/blob/main/CONTRIBUTING.md).
 
-Everything else — consent, access policy, passphrase gate, expiry teardown, viewer registry, revocation — is fully implemented and tested.
+## License
 
-## Prototype
-
-The original UX prototype (no build, no network): open [`docs/prototype.html`](docs/prototype.html). Spec: [`docs/spec.md`](docs/spec.md).
+[MIT](LICENSE)
